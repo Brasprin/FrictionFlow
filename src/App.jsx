@@ -221,19 +221,39 @@ function TaskInitScreen() {
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
 function ActiveMonitoringScreen() {
-  const [wpm, setWpm] = useState(42);
-  const [words, setWords] = useState(318);
-  const [elapsed, setElapsed] = useState(1247);
+  const [wpm, setWpm] = useState(0);
+  const [words, setWords] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const [totalPauses, setTotalPauses] = useState(0);
+  const [longestPause, setLongestPause] = useState(0);
+  const [lastPause, setLastPause] = useState(0);
+
+  // Poll chrome.storage.local every 2s to get current metrics 
   useEffect(() => {
-    const t = setInterval(() => {
-      setElapsed(e => e + 1);
-      if (Math.random() > 0.6) setWpm(w => Math.max(20, Math.min(70, w + Math.round((Math.random()-0.5)*4))));
-      if (Math.random() > 0.7) setWords(w => w + Math.round(Math.random()*3));
-    }, 1000);
+    function readStorage() {
+      if (typeof chrome !== "undefined" && chrome.storage) {
+        chrome.storage.local.get("ff_session", (result) => {
+          const s = result.ff_session;
+          if (!s) return;
+          setWpm(s.wpm ?? 0);
+          setWords(s.wordCount ?? 0);
+          setElapsed(s.elapsedSeconds ?? 0);
+          setTotalPauses(s.totalPauses ?? 0);
+          setLongestPause(s.longestPauseMs ?? 0);
+          setLastPause(s.lastPauseMs ?? 0);
+        })
+      }
+    } 
+    readStorage();
+    const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
   }, []);
+
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
+  const longestPauseSec = (longestPause / 1000).toFixed(1);
+  const lastPauseSec = (lastPause / 1000).toFixed(1);
+ 
   const phases = [
     { label: "Planning", pct: 15, color: TEAL[100] },
     { label: "Translating", pct: 72, color: TEAL[400] },
@@ -249,7 +269,9 @@ function ActiveMonitoringScreen() {
             { label: "Time", value: `${mins}:${secs}` },
             { label: "Words", value: words },
             { label: "WPM", value: wpm },
-            { label: "Focus", value: "High" },
+            { label: "Pauses", value: totalPauses },
+            { label: "Longest Pause", value: `${longestPauseSec}s` },
+            { label: "Last Pause", value: lastPause > 0 ? `${lastPauseSec}s` : "—" },
           ].map(s => (
             <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 10px 8px", border: `1px solid ${TEAL[50]}` }}>
               <p style={{ margin: 0, fontSize: 10, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.label}</p>
