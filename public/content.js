@@ -8,7 +8,7 @@ const CHARS_PER_WORD = 5;             // Standard WPM definition
  
 //------------------- State --------------------------//
 let keyStrokeTimeStamps = [];         // Timestamps of keystrokes for WPM calculation
-let wordCount = 0;                    // spaces pressed = words typed (with exceptions)
+let netChars = 0;                    
 let sessionStartTime = Date.now();    
 let lastKeyTime = null;              
 let lastActivityTime = Date.now();   
@@ -35,6 +35,10 @@ function elapsedSeconds() {
   return Math.round((Date.now() - sessionStartTime) / 1000);
 }
 
+function getLiveWordCount() {
+  return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
+}
+
 //------------------ Event Listeners ------------------------//
 // Google docs swallows events before they reach the document
 function attachListener() {
@@ -43,12 +47,15 @@ function attachListener() {
     setTimeout(attachListener, 500);
     return;
   }
+
   docsInput.contentDocument.addEventListener("keydown", (e) => {
     const now = Date.now();
 
     if (isPrintable(e.key)) {
       keyStrokeTimeStamps.push(now);
-      if (e.key === " ") wordCount++;
+      netChars++;
+    } else if (e.key === "Backspace" || e.key === "Delete") {
+      netChars = Math.max(0, netChars - 1);
     }
 
     // Pause detection if gap exceeds threshold
@@ -76,7 +83,7 @@ setInterval(() => {
 
   const payLoad = {
     wpm: rollingWPM(),
-    wordCount,
+    wordCount: getLiveWordCount(),
     elapsedSeconds: elapsedSeconds(),
     totalPauses,
     longestPauseMs,
@@ -96,6 +103,7 @@ setInterval(() => {
   }
 }, 60000);
 
+// Console log for debugging
 console.log("FrictionFlow content script active — logging typing speed & pauses.");
 
 
