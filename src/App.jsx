@@ -226,7 +226,8 @@ function ActiveMonitoringScreen() {
   const [elapsed, setElapsed] = useState(0);
   const [totalPauses, setTotalPauses] = useState(0);
   const [longestPause, setLongestPause] = useState(0);
-  const [lastPause, setLastPause] = useState(0);
+  const [scrollFrequency, setScrollFrequency] = useState(0);
+  const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
 
   // Poll chrome.storage.local every 2s to get current metrics 
   useEffect(() => {
@@ -240,7 +241,8 @@ function ActiveMonitoringScreen() {
           setElapsed(s.elapsedSeconds ?? 0);
           setTotalPauses(s.totalPauses ?? 0);
           setLongestPause(s.longestPauseMs ?? 0);
-          setLastPause(s.lastPauseMs ?? 0);
+          setScrollFrequency(s.scrollFrequency ?? 0);
+          setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
         })
       }
     } 
@@ -252,8 +254,8 @@ function ActiveMonitoringScreen() {
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
   const longestPauseSec = (longestPause / 1000).toFixed(1);
-  const lastPauseSec = (lastPause / 1000).toFixed(1);
- 
+  const scrollFrequencyValue = scrollFrequency;
+
   const phases = [
     { label: "Planning", pct: 15, color: TEAL[100] },
     { label: "Translating", pct: 72, color: TEAL[400] },
@@ -271,7 +273,7 @@ function ActiveMonitoringScreen() {
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: `${longestPauseSec}s` },
-            { label: "Last Pause", value: lastPause > 0 ? `${lastPauseSec}s` : "—" },
+            { label: "Scroll Frequency", value: `${scrollFrequencyLabel} (${scrollFrequency}/min)` },
           ].map(s => (
             <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 10px 8px", border: `1px solid ${TEAL[50]}` }}>
               <p style={{ margin: 0, fontSize: 10, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.label}</p>

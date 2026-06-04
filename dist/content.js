@@ -7,16 +7,24 @@ const STORAGE_FLUSH_MS = 2000;        // 2s interval to write to storage
 const CHARS_PER_WORD = 5;             // Standard WPM definition
  
 //------------------- State --------------------------//
+// KeyStroke Variables
 let keyStrokeTimeStamps = [];         // Timestamps of keystrokes for WPM calculation
 let netChars = 0;                    
 let sessionStartTime = Date.now();    
 let lastKeyTime = null;              
 let lastActivityTime = Date.now();   
 
+// Pause Variables
 let totalPauses = 0;
 let longestPauseMs = 0; 
 let lastPauseMs = 0;
 let isTyping = false;                  // when state change since last flush
+
+// Scrolling Variables
+let scrollTimeStamps = [];
+let lastScrollTop = 0;
+let scrollUpCount = 0;
+let scrollDownCount = 0;
 
 //------------------- Helper -----------------------------//
 function isPrintable(key) {
@@ -31,6 +39,14 @@ function rollingWPM() {
   return Math.round(keyStrokeTimeStamps.length / CHARS_PER_WORD);
 }
 
+function rollingScrollFrequency() {
+  const cutOff = Date.now() - 60000; // 60s window for scroll speed calculation
+  while (scrollTimeStamps.length > 0 && scrollTimeStamps[0] < cutOff) {
+    scrollTimeStamps.shift();
+  }
+  return scrollTimeStamps.length;
+}
+
 function elapsedSeconds() {
   return Math.round((Date.now() - sessionStartTime) / 1000);
 }
@@ -41,10 +57,10 @@ function getLiveWordCount() {
 
 //------------------ Event Listeners ------------------------//
 // Google docs swallows events before they reach the document
-function attachListener() {
+function attachTypingListener() {
   const docsInput = document.querySelector("iframe.docs-texteventtarget-iframe");
   if (!docsInput) {
-    setTimeout(attachListener, 500);
+    setTimeout(attachTypingListener, 500);
     return;
   }
 
@@ -74,7 +90,37 @@ function attachListener() {
   });
 }
 
-attachListener(); // call attach listener function
+function attachScrollListener() {
+  const editor = document.querySelector(".kix-appview-editor");
+  if (!editor) {
+    setTimeout(attachScrollListener, 500);
+    return;
+  }
+  
+  let scrollDebounceTimer = null;
+
+  editor.addEventListener("scroll", () => {
+    const currentScrollTop = editor.scrollTop;
+    const delta = currentScrollTop - lastScrollTop;
+
+    // may use in the future, for now just log total scroll distance and counts
+    if (delta > 0) {
+      scrollDownCount++;
+    } else if (delta < 0) {
+      scrollUpCount++;
+    }
+
+    lastScrollTop = currentScrollTop;
+    lastActivityTime = Date.now();
+    isTyping = true; // treat scrolling as activity for idle detection
+ 
+    // Only push timestamp once per scroll burst, not on every raw event
+    clearTimeout(scrollDebounceTimer);
+    scrollDebounceTimer = setTimeout(() => {
+      scrollTimeStamps.push(Date.now());  
+    }, 150); // waits 150ms after last scroll before counting
+  });
+}
 
 // Periodic flush to chrome.local.storage
 setInterval(() => {
@@ -88,6 +134,14 @@ setInterval(() => {
     totalPauses,
     longestPauseMs,
     lastUpdated: Date.now(),
+    scrollFrequency: rollingScrollFrequency(),
+    scrollFrequencyLabel: (() => {
+      const count = scrollTimeStamps.length;
+      if (count === 0)  return "None";
+      if (count < 5)   return "Low";
+      if (count < 15)  return "Medium";
+      return "High";
+    })(),
   };
 
   chrome.storage.local.set({ff_session: payLoad});
@@ -103,8 +157,9 @@ setInterval(() => {
   }
 }, 60000);
 
-// Console log for debugging
-console.log("FrictionFlow content script active — logging typing speed & pauses.");
+console.log("FrictionFlow content script active — logging typing speed & pauses."); // console log for debugging
+attachTypingListener(); // call attach typing listener function
+attachScrollListener(); // call attach scroll listener function
 
 
 // console.log("FrictionFlow behavioral logging active");
