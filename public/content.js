@@ -26,6 +26,12 @@ let lastScrollTop = 0;
 let scrollUpCount = 0;
 let scrollDownCount = 0;
 
+// Tab Switch Varibales
+let tabSwicthCount = 0; 
+let lastTabSwitchTime = null;
+let totalTabAwayMs = 0;
+let tabHiddenAt = null; 
+
 //------------------- Helper -----------------------------//
 function isPrintable(key) {
   return key.length === 1;
@@ -122,6 +128,22 @@ function attachScrollListener() {
   });
 }
 
+function attachTabSwitchListener() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      tabSwicthCount++;
+      tabHiddenAt = Date.now();
+      lastTabSwitchTime = Date.now();
+    } else {
+      if (tabHiddenAt !== null) {
+        totalTabAwayMs += Date.now() - tabHiddenAt;
+        tabHiddenAt = null;
+      }
+      isTyping = true; // treat returning to tab as activity for idle detection
+    }
+  })
+}
+
 // Periodic flush to chrome.local.storage
 setInterval(() => {
   if (!isTyping) return; // Only log if there was activity since last flush
@@ -142,6 +164,8 @@ setInterval(() => {
       if (count < 15)  return "Medium";
       return "High";
     })(),
+    tabSwitchCount,
+    totalTabAwayMs,
   };
 
   chrome.storage.local.set({ff_session: payLoad});
@@ -160,6 +184,7 @@ setInterval(() => {
 console.log("FrictionFlow content script active — logging typing speed & pauses."); // console log for debugging
 attachTypingListener(); // call attach typing listener function
 attachScrollListener(); // call attach scroll listener function
+attachTabSwitchListener(); // call attach tab switch listener function
 
 
 // console.log("FrictionFlow behavioral logging active");
