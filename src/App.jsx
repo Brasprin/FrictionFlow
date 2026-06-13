@@ -228,6 +228,7 @@ function ActiveMonitoringScreen() {
   const [longestPause, setLongestPause] = useState(0);
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
+  const [currentPhase, setCurrentPhase] = useState("Planning");
 
   // Poll chrome.storage.local every 2s to get current metrics 
   useEffect(() => {
@@ -243,6 +244,7 @@ function ActiveMonitoringScreen() {
           setLongestPause(s.longestPauseMs ?? 0);
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
+          setCurrentPhase(s.currentPhase ?? "Planning");
         })
       }
     } 
@@ -256,14 +258,18 @@ function ActiveMonitoringScreen() {
   const longestPauseSec = (longestPause / 1000).toFixed(1);
   const scrollFrequencyValue = scrollFrequency;
 
-  const phases = [
-    { label: "Planning", pct: 15, color: TEAL[100] },
-    { label: "Translating", pct: 72, color: TEAL[400] },
-    { label: "Reviewing", pct: 13, color: TEAL[200] },
-  ];
+  const phaseConfig = {
+  Planning:    { color: TEAL[100], desc: "thinking..." },
+  Translating: { color: TEAL[400], desc: "drafting..." },
+  Reviewing:   { color: TEAL[200], desc: "re-reading...." },
+  Distracted:  { color: "#F4A261", desc: "away..." },
+  };
+
+  const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <SidePanelHeader title="FrictionFlow" subtitle="Research Essay Draft" status="In Flow" />
+      <SidePanelHeader title="FrictionFlow" subtitle="Research Essay Draft" status={currentPhase} />
       <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
         {/* Live stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
@@ -285,22 +291,12 @@ function ActiveMonitoringScreen() {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Detected writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-            <div style={{ width: 8, height: 8, borderRadius: 999, background: TEAL[400] }} />
-            <span style={{ fontSize: 13, fontWeight: 700, color: TEAL[800] }}>Translating</span>
-            <span style={{ fontSize: 11, color: "#717182" }}>— active drafting</span>
+            <div style={{ width: 8, height: 8, borderRadius: 999, background: activePhase.color }} />
+            <span style={{ fontSize: 13, fontWeight: 700, color: TEAL[800] }}>{currentPhase}</span>
+            <span style={{ fontSize: 11, color: "#717182" }}>— {activePhase.desc}</span>
           </div>
-          <div style={{ display: "flex", height: 6, borderRadius: 99, overflow: "hidden", gap: 2 }}>
-            {phases.map(p => (
-              <div key={p.label} style={{ flex: p.pct, background: p.color, transition: "flex 0.5s" }} />
-            ))}
-          </div>
-          <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-            {phases.map(p => (
-              <div key={p.label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <div style={{ width: 8, height: 8, borderRadius: 2, background: p.color }} />
-                <span style={{ fontSize: 10, color: "#717182" }}>{p.label}</span>
-              </div>
-            ))}
+          <div style={{ display: "flex", height: 6, borderRadius: 99, overflow: "hidden" }}>
+            <div style={{ flex: 1, background: activePhase.color, transition: "background 0.5s" }} />
           </div>
         </div>
         {/* Task context */}
