@@ -170,49 +170,129 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
 
 // ─── Screen 1: Task Initialization ───────────────────────────────────────────
 
-function TaskInitScreen() {
+function TaskInitScreen({ onStart }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
+  const [isActive, setIsActive] = useState(false);
+
   const templates = [
     { name: "Research Essay", obj: "Write a 500-word essay on the impact of AI in education." },
     { name: "Lab Report", obj: "Summarize findings from Experiment 3 with discussion." },
     { name: "Reflection Paper", obj: "Reflect on this week's readings on cognitive load theory." },
   ];
+
+  useEffect(() => {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        const t = result.ff_task;
+        if (!t) return;
+        setTaskName(t.taskName ?? "");
+        setObjective(t.objective ?? "");
+        setIsActive(true); 
+      })
+    }
+  }, []);
+
+  function handleStartTask() {
+    if (!taskName.trim()) return;
+
+    const taskMetadata = {
+      taskName, 
+      objective,
+      sessionStartTime: Date.now(),
+    };
+
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      // save metadata and clear previous data sessions
+      chrome.storage.local.set({ ff_task: taskMetadata });
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+
+      // Tell content script to start tracking
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_START_TASK" });
+        }
+      });
+    }
+
+    setIsActive(true);
+    onStart();  // navigates to active monitoring screen
+  }
+
+  function handleCancelTask() {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.remove("ff_task");
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+    
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]?.id) {
+        chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
+      }
+      });
+    }
+    
+    setTaskName("");
+    setObjective("");
+    setIsActive(false);
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <SidePanelHeader title="FrictionFlow" subtitle="Set up your writing session" />
+      <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
       <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0" }}>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
-          onChange={e => setTaskName(e.target.value)}
+          onChange={e => !isActive && setTaskName(e.target.value)}
           placeholder="e.g. Research Essay Draft"
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: 12, background: "#FAFAFA" }}
+          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
         />
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Objective</p>
         <textarea
           value={objective}
-          onChange={e => setObjective(e.target.value)}
+          onChange={e => !isActive && setObjective(e.target.value)}
           placeholder="Briefly describe what you aim to accomplish in this session…"
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: 12, background: "#FAFAFA", fontFamily: "inherit" }}
+          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
-        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Quick templates</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
-          {templates.map(t => (
-            <button key={t.name} onClick={() => { setTaskName(t.name); setObjective(t.obj); }}
-              style={{ textAlign: "left", background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>
-              <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{t.name}</p>
-              <p style={{ margin: 0, fontSize: 11, color: "#717182", marginTop: 2, lineHeight: 1.4 }}>{t.obj.slice(0, 50)}…</p>
-            </button>
-          ))}
-        </div>
+        {!isActive && (
+          <>
+            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Quick templates</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+              {templates.map(t => (
+                <button key={t.name} onClick={() => { setTaskName(t.name); setObjective(t.obj); }}
+                  style={{ textAlign: "left", background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>
+                  <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{t.name}</p>
+                  <p style={{ margin: 0, fontSize: 11, color: "#717182", marginTop: 2, lineHeight: 1.4 }}>{t.obj.slice(0, 50)}…</p>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        {isActive && (
+          <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
+            <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>Session is active. Cancel to start a new task.</p>
+          </div>
+        )}
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }}>
-          <svg width="14" height="14" fill="none" viewBox="0 0 14 14"><path d="M7 1v12M1 7h12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
-          Start Task
-        </Btn>
+      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        {isActive ? (
+          <>
+            <Btn variant="primary" style={{ width: "100%" }} onClick={onStart}>
+              Resume session →
+            </Btn>
+            <Btn variant="danger" style={{ width: "100%" }} onClick={handleCancelTask}>
+              Cancel session
+            </Btn>
+          </>
+        ) : (
+          <Btn variant="primary" style={{ width: "100%" }} onClick={handleStartTask}>
+            <svg width="14" height="14" fill="none" viewBox="0 0 14 14"><path d="M7 1v12M1 7h12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
+            Start Task
+          </Btn>
+        )}
       </div>
     </div>
   );
@@ -221,6 +301,7 @@ function TaskInitScreen() {
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
 function ActiveMonitoringScreen() {
+  const [taskName, setTaskName] = useState("Research Essay Draft");
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
   const [elapsed, setElapsed] = useState(0);
@@ -234,8 +315,12 @@ function ActiveMonitoringScreen() {
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.get("ff_session", (result) => {
+        chrome.storage.local.get(["ff_session", "ff_task"], (result) => {
           const s = result.ff_session;
+          const t = result.ff_task;
+
+          if(t) setTaskName(t.taskName ?? "");
+
           if (!s) return;
           setWpm(s.wpm ?? 0);
           setWords(s.wordCount ?? 0);
@@ -269,7 +354,7 @@ function ActiveMonitoringScreen() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <SidePanelHeader title="FrictionFlow" subtitle="Research Essay Draft" status={currentPhase} />
+      <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
       <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
         {/* Live stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
@@ -302,7 +387,7 @@ function ActiveMonitoringScreen() {
         {/* Task context */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active context</p>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
-          <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>Research Essay Draft</p>
+          <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{taskName}</p>
           <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>Write a 500-word essay on the impact of AI in education.</p>
         </div>
         {/* Recent activity */}
@@ -502,7 +587,7 @@ function AnalyticsScreen() {
 function PopupView({ screen, setScreen }) {
   const [distractionAction, setDistractionAction] = useState(null);
   const screenMap = {
-    init: <TaskInitScreen />,
+    init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
     monitoring: <ActiveMonitoringScreen />,
     recovery: <RecoveryScreen />,
     break: <BreakScreen />,

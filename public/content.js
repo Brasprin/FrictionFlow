@@ -8,6 +8,7 @@ const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
 const BURST_MIN_DURATION_MS = 10000;     // Minimum 10s of activity to consider a burst 
 
+
 //------------------- State --------------------------//
 // KeyStroke Variables
 let keyStrokeTimeStamps = [];         // Timestamps of keystrokes for WPM calculation
@@ -16,11 +17,13 @@ let sessionStartTime = Date.now();
 let lastKeyTime = null;              
 let lastActivityTime = Date.now();   
 
-// Pause Variables
+// Pause/State Variables
 let totalPauses = 0;
 let longestPauseMs = 0; 
 let lastPauseMs = 0;
-let isTyping = false;   // when state change since last flush
+let isTyping = false;               // when state change since last flush
+let isTracking = false;             // whether tracking is currently active
+let listenerAttached = false;       // whether event listeners have been attached
 
 // Scrolling Variables
 let scrollTimeStamps = [];
@@ -39,6 +42,7 @@ let burstStartTime = null;
 let burstCount = 0;
 let totalBurstDurationMs = 0; 
 let lastCompletedBurstMs = 0;
+
 
 //------------------- Helper -----------------------------//
 function isPrintable(key) {
@@ -69,6 +73,7 @@ function getLiveWordCount() {
   return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
 }
 
+
 //------------------ Phase Detection -------------------//
 function classifyPhase(scrollFreq) {
   const now = Date.now();
@@ -91,6 +96,7 @@ function classifyPhase(scrollFreq) {
   // Default fallback
   return "Planning";
 }
+
 
 //------------------ Event Listeners ------------------------//
 // Google docs swallows events before they reach the document
@@ -200,6 +206,7 @@ function attachTabSwitchListener() {
 
 // Periodic flush to chrome.local.storage
 setInterval(() => {
+  if (!isTracking) return;
   if (!isTyping) return; // Only log if there was activity since last flush
   isTyping = false;
 
@@ -245,6 +252,7 @@ setInterval(() => {
 
 // Interval specifically for currentPauseSec, runs regardless of activity
 setInterval(() => {
+  if (!isTracking) return;
   if (!lastKeyTime) return;
 
   const currentPauseSec = Math.round((Date.now() - lastKeyTime) / 1000);
@@ -261,6 +269,7 @@ setInterval(() => {
 
 // Idle watcher
 setInterval(() => {
+  if (!isTracking) return;
   const idleTime = Date.now() - lastActivityTime;
   if (idleTime >= 120000) {
     chrome.storage.local.set({
@@ -269,7 +278,73 @@ setInterval(() => {
   }
 }, 60000);
 
-console.log("FrictionFlow content script active — logging typing speed & pauses."); // console log for debugging
-attachTypingListener(); // call attach typing listener function
-attachScrollListener(); // call attach scroll listener function
-attachTabSwitchListener(); // call attach tab switch listener function
+
+//------------------ Initialization ----------------//
+console.log("FrictionFlow content script active."); // console log for debugging
+
+// Reset all state before starting
+function startTracking() {
+  isTracking = true;
+  keyStrokeTimeStamps = [];
+  netChars = 0;
+  sessionStartTime = Date.now();
+  lastKeyTime = null;
+  lastActivityTime = Date.now();
+  totalPauses = 0;
+  longestPauseMs = 0;
+  lastPauseMs = 0;
+  isTyping = false;
+  scrollTimeStamps = [];
+  lastScrollTop = 0;
+  scrollUpCount = 0;
+  scrollDownCount = 0;
+  tabSwitchCount = 0;
+  totalTabAwayMs = 0;
+  tabHiddenAt = null;
+  burstStartTime = null;
+  burstCount = 0;
+  totalBurstDurationMs = 0;
+  lastCompletedBurstMs = 0;
+
+  if (!listenerAttached) {
+    attachTypingListener(); // call attach typing listener function
+    attachScrollListener(); // call attach scroll listener function
+    attachTabSwitchListener(); // call attach tab switch listener function
+    listenerAttached = true;
+  }
+  console.log("FrictionFlow tracking started.");
+}
+
+// Check if a task is already active on load (e.g. page refresh mid-session)
+chrome.storage.local.get("ff_task", (result) => {
+  if (result.ff_task) {
+    startTracking();
+  }
+});
+
+// Listen for task start/cancel messages from the popup
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "FF_START_TASK") {
+    startTracking();
+  }
+
+  if (message.type === "FF_CANCEL_TASK") {
+    isTracking = false;  // stops all intervals from writing
+    // reset all state so nothing bleeds into next session
+    keyStrokeTimeStamps = [];
+    netChars = 0;
+    lastKeyTime = null;
+    lastActivityTime = Date.now();
+    isTyping = false;
+    totalPauses = 0;
+    longestPauseMs = 0;
+    scrollTimeStamps = [];
+    tabSwitchCount = 0;
+    totalTabAwayMs = 0;
+    burstStartTime = null;
+    burstCount = 0;
+    totalBurstDurationMs = 0;
+    lastCompletedBurstMs = 0;
+    console.log("FrictionFlow tracking cancelled.");
+  }
+});
