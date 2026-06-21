@@ -5,6 +5,10 @@ let lastRecoveryTime = null;
 let isCallingClaude = false; // prevent concurrent API calls
 
 //------------------ Message Listener ------------------//
+chrome.runtime.onInstalled.addListener(() => {
+  console.log("FrictionFlow installed");
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "FF_CHECK_STUCK") {
     handleStuckCheck();

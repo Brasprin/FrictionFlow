@@ -267,9 +267,9 @@ setInterval(() => {
   });
 
   // Tell background to check if user is stuck
-  if (currentPauseSec >= 90) {
-    chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK" });
-  }
+  // if (currentPauseSec >= 90) {
+  //   chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK" });
+  // }
 }, 2000);
 
 // Idle watcher
