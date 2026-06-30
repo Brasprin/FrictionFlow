@@ -123,7 +123,7 @@ function TaskInitScreen({ onStart }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 0" }}>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
@@ -159,7 +159,7 @@ function TaskInitScreen({ onStart }) {
           </div>
         )}
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
         {isActive ? (
           <>
             <Btn variant="primary" style={{ width: "100%" }} onClick={onStart}>
@@ -182,7 +182,7 @@ function TaskInitScreen({ onStart }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-function ActiveMonitoringScreen() {
+function ActiveMonitoringScreen({ setScreen }) {
   const [taskName, setTaskName] = useState("Research Essay Draft");
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
@@ -237,7 +237,7 @@ function ActiveMonitoringScreen() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Live stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
@@ -279,8 +279,11 @@ function ActiveMonitoringScreen() {
           <span style={{ display: "inline-block", width: 2, height: 12, background: TEAL[400], marginLeft: 2, verticalAlign: "middle", animation: "blink 1s infinite" }} />
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }}>Take a break</Btn>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 6 }}>
+        <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
+        <button onClick={() => setScreen("recovery")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: "2px 0" }}>
+          View last recovery summary
+        </button>
       </div>
     </div>
   );
@@ -288,7 +291,7 @@ function ActiveMonitoringScreen() {
 
 // ─── Screen 4: Recovery Interface ────────────────────────────────────────────
 
-function RecoveryScreen() {
+function RecoveryScreen({ setScreen }) {
   const suggestions = [
     "Continue the sentence you were drafting about AI's personalization capabilities.",
     "Expand on the point about student engagement metrics from paragraph 2.",
@@ -298,7 +301,7 @@ function RecoveryScreen() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Welcome back!" />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Context summary */}
         <div style={{ background: TEAL[50], borderRadius: 12, padding: "12px 13px", marginBottom: 14, border: `1px solid ${TEAL[100]}` }}>
           <p style={{ margin: "0 0 3px", fontSize: 12, fontWeight: 700, color: TEAL[800] }}>Research Essay Draft</p>
@@ -326,8 +329,8 @@ function RecoveryScreen() {
           ))}
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
-        <Btn variant="primary" style={{ width: "100%" }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("monitoring")}>
           Continue where I left off →
         </Btn>
       </div>
@@ -337,7 +340,7 @@ function RecoveryScreen() {
 
 // ─── Screen 5: Break Mode ─────────────────────────────────────────────────────
 
-function BreakScreen() {
+function BreakScreen({ setScreen }) {
   const [secs, setSecs] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
@@ -345,8 +348,8 @@ function BreakScreen() {
   }, []);
   const activities = ["🧘 Breathe slowly", "🚶 Take a short walk", "💧 Drink some water", "👁 Rest your eyes"];
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", alignItems: "center", justifyContent: "center", padding: "24px 16px" }}>
-      <div style={{ textAlign: "center", marginBottom: 20 }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <div style={{ textAlign: "center", padding: "20px 16px 4px" }}>
         <div style={{ width: 56, height: 56, borderRadius: 16, background: TEAL[50], border: `2px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
           <svg width="26" height="26" fill="none" viewBox="0 0 26 26">
             <circle cx="13" cy="13" r="10" stroke={TEAL[400]} strokeWidth="1.8" />
@@ -356,13 +359,13 @@ function BreakScreen() {
         <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 700, color: "#030213" }}>Taking a break</p>
         <p style={{ margin: 0, fontSize: 12, color: "#717182" }}>Your session is paused</p>
       </div>
-      <div style={{ background: "#F7FAF9", borderRadius: 12, padding: "14px 28px", textAlign: "center", marginBottom: 20, border: `1px solid ${TEAL[50]}` }}>
-        <p style={{ margin: 0, fontSize: 11, color: "#717182", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Break duration</p>
-        <p style={{ margin: 0, fontSize: 30, fontWeight: 700, color: TEAL[800], fontVariantNumeric: "tabular-nums" }}>
-          {String(Math.floor(secs/60)).padStart(2,"0")}:{String(secs%60).padStart(2,"0")}
-        </p>
-      </div>
-      <div style={{ width: "100%", marginBottom: 20 }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+        <div style={{ background: "#F7FAF9", borderRadius: 12, padding: "14px 28px", textAlign: "center", marginBottom: 18, border: `1px solid ${TEAL[50]}` }}>
+          <p style={{ margin: 0, fontSize: 11, color: "#717182", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Break duration</p>
+          <p style={{ margin: 0, fontSize: 30, fontWeight: 700, color: TEAL[800], fontVariantNumeric: "tabular-nums" }}>
+            {String(Math.floor(secs/60)).padStart(2,"0")}:{String(secs%60).padStart(2,"0")}
+          </p>
+        </div>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8, textAlign: "center" }}>Suggested activities</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {activities.map(a => (
@@ -370,9 +373,11 @@ function BreakScreen() {
           ))}
         </div>
       </div>
-      <Btn variant="primary" style={{ width: "100%" }}>
-        I'm ready to continue →
-      </Btn>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("recovery")}>
+          I'm ready to continue →
+        </Btn>
+      </div>
     </div>
   );
 }
@@ -404,7 +409,7 @@ function AnalyticsScreen() {
         <p style={{ margin: "0 0 2px", fontSize: 13, fontWeight: 700, color: "#030213" }}>Session complete!</p>
         <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>Research Essay Draft</p>
       </div>
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
           {stats.map(s => (
             <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
@@ -433,7 +438,7 @@ function AnalyticsScreen() {
           <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>You recovered focus quickly after each distraction. You spent most of your time in the translating phase — a sign of productive flow.</p>
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
         <Btn variant="primary" style={{ width: "100%" }}>Start new task</Btn>
       </div>
     </div>
@@ -445,13 +450,13 @@ function AnalyticsScreen() {
 function PopupView({ screen, setScreen }) {
   const screenMap = {
     init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
-    monitoring: <ActiveMonitoringScreen />,
-    recovery: <RecoveryScreen />,
-    break: <BreakScreen />,
+    monitoring: <ActiveMonitoringScreen setScreen={setScreen} />,
+    recovery: <RecoveryScreen setScreen={setScreen} />,
+    break: <BreakScreen setScreen={setScreen} />,
     analytics: <AnalyticsScreen />,
   };
   return (
-    <div style={{ width: 260, height: 460, display: "flex", flexDirection: "column", overflow: "hidden", borderRadius: 16, border: "1px solid rgba(0,0,0,0.07)" }}>
+    <div style={{ width: 280, height: 500, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {screenMap[screen]}
     </div>
   );
