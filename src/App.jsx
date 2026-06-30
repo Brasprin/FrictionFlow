@@ -627,59 +627,9 @@ function PopupView({ screen, setScreen }) {
   );
 }
 
-// ─── Distraction Overlay Demo ─────────────────────────────────────────────────
-
-function DistractionDemo() {
-  const [show, setShow] = useState(false);
-  const [action, setAction] = useState(null);
-  return (
-    <div>
-      <p style={styles.screenLabel}>Distraction overlay</p>
-      <div style={{ ...styles.card, overflow: "visible" }}>
-        <ExtensionShell sidePanel={
-          <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-            <SidePanelHeader title="FrictionFlow" subtitle="Research Essay Draft" status="Active" />
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 16, gap: 12 }}>
-              {action ? (
-                <div style={{ textAlign: "center" }}>
-                  <p style={{ fontSize: 13, fontWeight: 700, color: TEAL[800], marginBottom: 6 }}>
-                    {action === "resume" ? "Welcome back! 👋" : action === "break" ? "Enjoy your break ☕" : "Dismissed"}
-                  </p>
-                  <p style={{ fontSize: 11, color: "#717182", margin: "0 0 16px" }}>
-                    {action === "resume" ? "Recovery context loaded." : action === "break" ? "Break timer started." : "Monitoring continues."}
-                  </p>
-                  <Btn variant="outline" onClick={() => { setAction(null); setShow(false); }} style={{ fontSize: 11 }}>Reset demo</Btn>
-                </div>
-              ) : (
-                <>
-                  <p style={{ fontSize: 12, color: "#717182", textAlign: "center", margin: 0 }}>Monitoring active. Idle threshold: 45s</p>
-                  <Btn variant="danger" onClick={() => setShow(true)} style={{ width: "100%", fontSize: 12 }}>
-                    Simulate distraction
-                  </Btn>
-                </>
-              )}
-            </div>
-          </div>
-        }>
-          {show && !action && (
-            <DistractionPromptScreen onAction={a => { setAction(a); setShow(false); }} />
-          )}
-        </ExtensionShell>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main App ────────────────────────────────────────────────────────────────
 
-const TABS = [
-  { key: "popup", label: "Extension popup" },
-  { key: "overlay", label: "Distraction overlay" },
-  { key: "inline", label: "Inline monitoring" },
-];
-
 export default function App() {
-  const [tab, setTab] = useState("popup");
   const [screen, setScreen] = useState("init");
 
   return (
@@ -689,34 +639,9 @@ export default function App() {
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
         button:hover { opacity: 0.85; }
       `}</style>
-      {/* Nav */}
-      <div style={styles.nav}>
-        <div style={styles.logo}>
-          <div style={styles.logoMark}>FF</div>
-          <span style={styles.logoText}>FrictionFlow</span>
-        </div>
-        {TABS.map(t => (
-          <button key={t.key} style={styles.tab(tab === t.key)} onClick={() => setTab(t.key)}>
-            {t.label}
-          </button>
-        ))}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 8, height: 8, borderRadius: 999, background: TEAL[400] }} />
-          <span style={{ fontSize: 11, color: "#717182" }}>Browser Extension UI</span>
-        </div>
-      </div>
       {/* Content */}
       <div style={styles.content}>
-        {tab === "popup" && <PopupView screen={screen} setScreen={setScreen} />}
-        {tab === "overlay" && <DistractionDemo />}
-        {tab === "inline" && (
-          <div>
-            <p style={styles.screenLabel}>Full inline view — active session</p>
-            <div style={styles.card}>
-              <ExtensionShell sidePanel={<ActiveMonitoringScreen />} />
-            </div>
-          </div>
-        )}
+        <PopupView screen={screen} setScreen={setScreen} />
       </div>
     </div>
   );
