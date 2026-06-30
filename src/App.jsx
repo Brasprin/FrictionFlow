@@ -182,7 +182,7 @@ function TaskInitScreen({ onStart }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-function ActiveMonitoringScreen({ setScreen }) {
+function ActiveMonitoringScreen({ setScreen, setSummary }) {
   const [taskName, setTaskName] = useState("Research Essay Draft");
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
@@ -234,6 +234,38 @@ function ActiveMonitoringScreen({ setScreen }) {
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
+  function handleFinishSession() {
+    // Snapshot the current live stats into a summary object before storage is cleared.
+    const finishedSummary = {
+      taskName,
+      elapsedSeconds: elapsed,
+      wordCount: words,
+      wpm,
+      totalPauses,
+      longestPauseMs: longestPause,
+      scrollFrequency,
+      scrollFrequencyLabel,
+    };
+    setSummary(finishedSummary);
+
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      // Session is truly over — clear stored task/session/idle data so the
+      // init screen starts blank next time, not in a "Resume session" state.
+      chrome.storage.local.remove("ff_task");
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+
+      // Tell content script to stop tracking
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
+        }
+      });
+    }
+
+    setScreen("analytics");
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
@@ -280,6 +312,7 @@ function ActiveMonitoringScreen({ setScreen }) {
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 6 }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={handleFinishSession}>Finish session</Btn>
         <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
         <button onClick={() => setScreen("recovery")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: "2px 0" }}>
           View last recovery summary
@@ -384,14 +417,22 @@ function BreakScreen({ setScreen }) {
 
 // ─── Screen 6: Session Analytics ─────────────────────────────────────────────
 
-function AnalyticsScreen() {
+function AnalyticsScreen({ setScreen, summary }) {
+  const s = summary ?? {};
+
+  const mins = Math.floor((s.elapsedSeconds ?? 0) / 60);
+  const secs = (s.elapsedSeconds ?? 0) % 60;
+  const sessionTimeStr = `${mins}m ${secs}s`;
+
+  // Stats backed by real tracked data from content.js
   const stats = [
-    { label: "Session time", value: "47m 12s", icon: "⏱" },
-    { label: "Words written", value: "624", icon: "📝" },
-    { label: "Avg. WPM", value: "38", icon: "⚡" },
-    { label: "Distractions", value: "4", icon: "🔔" },
-    { label: "Breaks taken", value: "1", icon: "☕" },
-    { label: "Recovery rate", value: "100%", icon: "✅" },
+    { label: "Session time", value: sessionTimeStr, icon: "⏱" },
+    { label: "Words written", value: s.wordCount ?? 0, icon: "📝" },
+    { label: "Avg. WPM", value: s.wpm ?? 0, icon: "⚡" },
+    { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸" },
+    // NOTE: distraction count, breaks taken, and recovery rate aren't tracked
+    // by content.js yet (only current phase is logged, not a running tally
+    // of distraction events or break usage) — left out until that's added.
   ];
   const phases = [
     { label: "Planning", pct: 18, color: TEAL[100] },
@@ -407,15 +448,15 @@ function AnalyticsScreen() {
           </svg>
         </div>
         <p style={{ margin: "0 0 2px", fontSize: 13, fontWeight: 700, color: "#030213" }}>Session complete!</p>
-        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>Research Essay Draft</p>
+        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>{s.taskName || "Untitled task"}</p>
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
-          {stats.map(s => (
-            <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
-              <p style={{ margin: 0, fontSize: 16 }}>{s.icon}</p>
-              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{s.value}</p>
-              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{s.label}</p>
+          {stats.map(st => (
+            <div key={st.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
+              <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
+              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
+              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
             </div>
           ))}
         </div>
@@ -439,7 +480,7 @@ function AnalyticsScreen() {
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }}>Start new task</Btn>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
       </div>
     </div>
   );
@@ -447,16 +488,16 @@ function AnalyticsScreen() {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen }) {
+function PopupView({ screen, setScreen, summary, setSummary }) {
   const screenMap = {
     init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
-    monitoring: <ActiveMonitoringScreen setScreen={setScreen} />,
+    monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
     break: <BreakScreen setScreen={setScreen} />,
-    analytics: <AnalyticsScreen />,
+    analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
-    <div style={{ width: 280, height: 500, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div style={{ width: 320, height: 500, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {screenMap[screen]}
     </div>
   );
@@ -466,6 +507,7 @@ function PopupView({ screen, setScreen }) {
 
 export default function App() {
   const [screen, setScreen] = useState("init");
+  const [summary, setSummary] = useState(null); // snapshot of session stats captured when a session finishes
 
   return (
     <div style={styles.root}>
@@ -476,7 +518,7 @@ export default function App() {
       `}</style>
       {/* Content */}
       <div style={styles.content}>
-        <PopupView screen={screen} setScreen={setScreen} />
+        <PopupView screen={screen} setScreen={setScreen} summary={summary} setSummary={setSummary} />
       </div>
     </div>
   );
