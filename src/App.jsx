@@ -103,45 +103,6 @@ const styles = {
 
 // ─── Shared Components ────────────────────────────────────────────────────────
 
-function ExtensionShell({ children, sidePanel }) {
-  return (
-    <div style={{ display: "flex", gap: 0, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(0,0,0,0.08)", boxShadow: "0 4px 24px rgba(29,158,117,0.08)", background: "#fff", minHeight: 460 }}>
-      <div style={{ flex: 1, background: "#F0F4F2", position: "relative", overflow: "hidden", minHeight: 460 }}>
-        {/* Fake browser chrome */}
-        <div style={{ background: "#E8EEEC", borderBottom: "1px solid rgba(0,0,0,0.08)", padding: "8px 12px", display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ display: "flex", gap: 5 }}>
-            {["#FF5F57","#FEBC2E","#28C840"].map((c,i) => <div key={i} style={{ width: 10, height: 10, borderRadius: 999, background: c }} />)}
-          </div>
-          <div style={{ flex: 1, background: "#fff", borderRadius: 6, padding: "3px 10px", fontSize: 11, color: "#888", border: "1px solid rgba(0,0,0,0.1)" }}>
-            docs.google.com/document/d/1a2B3c…
-          </div>
-          <div style={{ fontSize: 13, color: TEAL[400], fontWeight: 600, cursor: "pointer" }}>FF</div>
-        </div>
-        {/* Google Docs mock */}
-        <div style={{ padding: "20px 32px", height: "calc(100% - 37px)", overflowY: "auto" }}>
-          <div style={{ maxWidth: 480, margin: "0 auto" }}>
-            <div style={{ height: 16, background: "rgba(0,0,0,0.08)", borderRadius: 4, width: "60%", marginBottom: 12 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "100%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "92%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "85%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "97%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "78%", marginBottom: 20 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "100%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "88%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "70%", marginBottom: 8 }} />
-          </div>
-        </div>
-        {children}
-      </div>
-      {sidePanel && (
-        <div style={{ width: 256, borderLeft: "1px solid rgba(0,0,0,0.07)", background: "#fff", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-          {sidePanel}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function SidePanelHeader({ title, subtitle, status }) {
   return (
     <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid rgba(0,0,0,0.06)" }}>
@@ -399,30 +360,6 @@ function ActiveMonitoringScreen() {
       </div>
       <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
         <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }}>Take a break</Btn>
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen 3: Distraction Prompt ────────────────────────────────────────────
-
-function DistractionPromptScreen({ onAction }) {
-  return (
-    <div style={{ position: "absolute", inset: 0, background: "rgba(3,2,19,0.38)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 20, backdropFilter: "blur(1px)" }}>
-      <div style={{ background: "#fff", borderRadius: 16, padding: "24px 22px", width: 260, boxShadow: "0 8px 32px rgba(0,0,0,0.18)", textAlign: "center" }}>
-        <div style={{ width: 40, height: 40, borderRadius: 12, background: TEAL[50], display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
-          <svg width="20" height="20" fill="none" viewBox="0 0 20 20">
-            <circle cx="10" cy="10" r="8" stroke={TEAL[400]} strokeWidth="1.5" />
-            <path d="M10 6v4M10 13h.01" stroke={TEAL[400]} strokeWidth="1.8" strokeLinecap="round" />
-          </svg>
-        </div>
-        <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 700, color: "#030213" }}>Gentle reminder</p>
-        <p style={{ margin: "0 0 18px", fontSize: 12, color: "#717182", lineHeight: 1.5 }}>You've been away from your writing for a while. Ready to get back on track?</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <Btn variant="primary" onClick={() => onAction("resume")} style={{ width: "100%" }}>Get back to work</Btn>
-          <Btn variant="outline" onClick={() => onAction("break")} style={{ width: "100%" }}>Take a break</Btn>
-          <Btn variant="ghost" onClick={() => onAction("dismiss")} style={{ width: "100%", fontSize: 12, color: "#aaa", border: "none" }}>Dismiss</Btn>
-        </div>
       </div>
     </div>
   );
