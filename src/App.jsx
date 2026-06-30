@@ -37,7 +37,7 @@ function SidePanelHeader({ title, subtitle, status }) {
         <span style={{ fontSize: 13, fontWeight: 700, color: "#030213", letterSpacing: "-0.2px" }}>FrictionFlow</span>
         {status && <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 600, color: TEAL[600], background: TEAL[50], padding: "2px 7px", borderRadius: 99 }}>{status}</span>}
       </div>
-      {subtitle && <p style={{ fontSize: 11, color: "#717182", margin: 0, paddingLeft: 32 }}>{subtitle}</p>}
+      {subtitle && <p style={{ fontSize: 11, color: "#717182", margin: 0 }}>{subtitle}</p>}
     </div>
   );
 }
@@ -182,7 +182,7 @@ function TaskInitScreen({ onStart }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-function ActiveMonitoringScreen({ setScreen, setSummary }) {
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const [taskName, setTaskName] = useState("Research Essay Draft");
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
@@ -311,12 +311,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary }) {
           <span style={{ display: "inline-block", width: 2, height: 12, background: TEAL[400], marginLeft: 2, verticalAlign: "middle", animation: "blink 1s infinite" }} />
         </div>
       </div>
-      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 6 }}>
-        <Btn variant="primary" style={{ width: "100%" }} onClick={handleFinishSession}>Finish session</Btn>
-        <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
-        <button onClick={() => setScreen("recovery")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: "2px 0" }}>
-          View last recovery summary
-        </button>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
+          <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
+        </div>
+        {hasRecoverySummary && (
+          <button onClick={() => setScreen("recovery")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: 0, alignSelf: "center" }}>
+            View last recovery summary
+          </button>
+        )}
       </div>
     </div>
   );
@@ -373,7 +377,7 @@ function RecoveryScreen({ setScreen }) {
 
 // ─── Screen 5: Break Mode ─────────────────────────────────────────────────────
 
-function BreakScreen({ setScreen }) {
+function BreakScreen({ setScreen, setHasRecoverySummary }) {
   const [secs, setSecs] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
@@ -407,7 +411,7 @@ function BreakScreen({ setScreen }) {
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("recovery")}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => { setHasRecoverySummary(true); setScreen("recovery"); }}>
           I'm ready to continue →
         </Btn>
       </div>
@@ -488,12 +492,12 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary }) {
   const screenMap = {
-    init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
-    monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} />,
+    init: <TaskInitScreen onStart={() => { setHasRecoverySummary(false); setScreen("monitoring"); }}/>,
+    monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} hasRecoverySummary={hasRecoverySummary} />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
-    break: <BreakScreen setScreen={setScreen} />,
+    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
@@ -508,6 +512,7 @@ function PopupView({ screen, setScreen, summary, setSummary }) {
 export default function App() {
   const [screen, setScreen] = useState("init");
   const [summary, setSummary] = useState(null); // snapshot of session stats captured when a session finishes
+  const [hasRecoverySummary, setHasRecoverySummary] = useState(false); // true once a real recovery moment has happened this task
 
   return (
     <div style={styles.root}>
@@ -518,7 +523,14 @@ export default function App() {
       `}</style>
       {/* Content */}
       <div style={styles.content}>
-        <PopupView screen={screen} setScreen={setScreen} summary={summary} setSummary={setSummary} />
+        <PopupView
+          screen={screen}
+          setScreen={setScreen}
+          summary={summary}
+          setSummary={setSummary}
+          hasRecoverySummary={hasRecoverySummary}
+          setHasRecoverySummary={setHasRecoverySummary}
+        />
       </div>
     </div>
   );
