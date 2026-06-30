@@ -14,90 +14,11 @@ const styles = {
   root: {
     fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
     background: "#F7FAF9",
-    minHeight: "100vh",
     display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "flex-start",
-    padding: "0",
     color: "#030213",
   },
-  // Nav tabs
-  nav: {
-    width: "100%",
-    background: "#fff",
-    borderBottom: "1px solid rgba(0,0,0,0.08)",
-    display: "flex",
-    alignItems: "center",
-    gap: "0",
-    padding: "0 16px",
-    position: "sticky",
-    top: 0,
-    zIndex: 100,
-    boxShadow: "0 1px 4px rgba(29,158,117,0.06)",
-  },
-  logo: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    padding: "12px 16px 12px 0",
-    borderRight: "1px solid rgba(0,0,0,0.08)",
-    marginRight: "8px",
-  },
-  logoMark: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-    background: TEAL[400],
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    color: "#fff",
-    fontSize: 14,
-    fontWeight: 700,
-    letterSpacing: "-0.5px",
-  },
-  logoText: {
-    fontSize: 14,
-    fontWeight: 600,
-    color: "#030213",
-    letterSpacing: "-0.3px",
-  },
-  tab: (active) => ({
-    padding: "14px 16px",
-    fontSize: 13,
-    fontWeight: active ? 600 : 400,
-    color: active ? TEAL[600] : "#717182",
-    borderBottom: active ? `2px solid ${TEAL[400]}` : "2px solid transparent",
-    cursor: "pointer",
-    background: "none",
-    border: "none",
-    borderBottom: active ? `2px solid ${TEAL[400]}` : "2px solid transparent",
-    transition: "color 0.15s",
-    whiteSpace: "nowrap",
-  }),
   content: {
-    width: "100%",
-    maxWidth: 900,
-    padding: "24px 16px 48px",
     display: "flex",
-    flexDirection: "column",
-    gap: "24px",
-  },
-  screenLabel: {
-    fontSize: 11,
-    fontWeight: 600,
-    letterSpacing: "0.08em",
-    textTransform: "uppercase",
-    color: TEAL[600],
-    marginBottom: 8,
-  },
-  card: {
-    background: "#fff",
-    borderRadius: 16,
-    border: "1px solid rgba(0,0,0,0.07)",
-    overflow: "hidden",
-    boxShadow: "0 2px 12px rgba(29,158,117,0.06)",
   },
 };
 
@@ -519,10 +440,9 @@ function AnalyticsScreen() {
   );
 }
 
-// ─── Full Popup Mode (no side panel) ─────────────────────────────────────────
+// ─── Popup ────────────────────────────────────────────────────────────────────
 
 function PopupView({ screen, setScreen }) {
-  const [distractionAction, setDistractionAction] = useState(null);
   const screenMap = {
     init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
     monitoring: <ActiveMonitoringScreen />,
@@ -531,35 +451,8 @@ function PopupView({ screen, setScreen }) {
     analytics: <AnalyticsScreen />,
   };
   return (
-    <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
-      {/* Extension popup */}
-      <div style={{ flex: "0 0 260px" }}>
-        <p style={styles.screenLabel}>Extension popup</p>
-        <div style={{ ...styles.card, width: 260, minHeight: 460, display: "flex", flexDirection: "column", overflow: "visible" }}>
-          <div style={{ display: "flex", flexDirection: "column", height: 460, overflow: "hidden", borderRadius: 16 }}>
-            {screenMap[screen]}
-          </div>
-        </div>
-      </div>
-      {/* Screen selector */}
-      <div style={{ flex: 1, minWidth: 220 }}>
-        <p style={styles.screenLabel}>Select screen</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {[
-            { key: "init", label: "Task initialization", desc: "Set task name & objective" },
-            { key: "monitoring", label: "Active monitoring", desc: "Live stats & phase detection" },
-            { key: "recovery", label: "Recovery interface", desc: "Context summary + next steps" },
-            { key: "break", label: "Break mode", desc: "Break timer & activities" },
-            { key: "analytics", label: "Session analytics", desc: "End-of-session summary" },
-          ].map(s => (
-            <button key={s.key} onClick={() => setScreen(s.key)}
-              style={{ textAlign: "left", background: screen === s.key ? TEAL[50] : "#fff", border: screen === s.key ? `1.5px solid ${TEAL[200]}` : "1px solid rgba(0,0,0,0.08)", borderRadius: 10, padding: "10px 13px", cursor: "pointer", transition: "all 0.15s" }}>
-              <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: screen === s.key ? TEAL[800] : "#030213" }}>{s.label}</p>
-              <p style={{ margin: 0, fontSize: 11, color: "#717182", marginTop: 2 }}>{s.desc}</p>
-            </button>
-          ))}
-        </div>
-      </div>
+    <div style={{ width: 260, height: 460, display: "flex", flexDirection: "column", overflow: "hidden", borderRadius: 16, border: "1px solid rgba(0,0,0,0.07)" }}>
+      {screenMap[screen]}
     </div>
   );
 }
