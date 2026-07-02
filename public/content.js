@@ -157,7 +157,7 @@ function classifyPhase(scrollFreq) {
   // Distracted — away from tab or long idle
   // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
   if (document.hidden) return "Distracted";
-  if (currentPauseSec > 5) return "Distracted";
+  if (currentPauseSec > 2) return "Distracted";
 
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
@@ -370,6 +370,38 @@ function startTracking() {
   console.log("FrictionFlow: tracking started.");
 }
 
+// Resumes tracking in a freshly injected content script (tab refresh,
+// extension reload, or doc reopened after an interruption) by restoring
+// accumulated counters from the last ff_session snapshot, so the session
+// continues instead of restarting from zero. Callers must check isTracking
+// first — if tracking is already alive, resuming would be a data-losing reset.
+function resumeTracking(snapshot, task) {
+  resetSessionState();
+
+  // Keep the original session anchor so elapsed time stays continuous.
+  if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
+
+  if (snapshot) {
+    netChars = (snapshot.wordCount ?? 0) * CHARS_PER_WORD;
+    totalPauses = snapshot.totalPauses ?? 0;
+    longestPauseMs = snapshot.longestPauseMs ?? 0;
+    tabSwitchCount = snapshot.tabSwitchCount ?? 0;
+    totalTabAwayMs = snapshot.totalTabAwayMs ?? 0;
+    burstCount = snapshot.burstCount ?? 0;
+    totalBurstDurationMs = (snapshot.avgBurstDurationSec ?? 0) * 1000 * burstCount;
+    lastCompletedBurstMs = (snapshot.lastCompletedBurstSec ?? 0) * 1000;
+    totalBreakMs = snapshot.totalBreakMs ?? 0;
+    if (snapshot.phaseDurationsMs) {
+      phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
+    }
+  }
+
+  isTracking = true;
+  attachListenersOnce();
+  startIntervals();
+  console.log("FrictionFlow: tracking resumed from stored session snapshot.");
+}
+
 function stopTracking() {
   stopAllTracking();
   console.log("FrictionFlow: tracking cancelled.");
@@ -486,6 +518,14 @@ if (isExtensionContextValid()) {
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "FF_START_TASK") {
       startTracking();
+    } else if (message?.type === "FF_RESUME_TASK") {
+      // No-op if tracking is already alive — only a freshly injected script
+      // (which starts with isTracking = false) needs to restore and restart.
+      if (!isTracking) {
+        safeStorageGet(["ff_session", "ff_task"], (result) => {
+          resumeTracking(result?.ff_session, result?.ff_task);
+        });
+      }
     } else if (message?.type === "FF_CANCEL_TASK") {
       stopTracking();
     } else if (message?.type === "FF_UPDATE_BREAK_MS") {

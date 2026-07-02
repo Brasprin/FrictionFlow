@@ -18,6 +18,32 @@ function sendToTaskTab(message) {
   });
 }
 
+// Re-establishes tracking when a session is resumed. The content script may
+// have been re-injected since the session started (tab refresh, extension
+// reload, or the doc reopened in a new tab after an interruption), in which
+// case its in-memory tracking state is gone even though the UI shows an
+// active session. FF_RESUME_TASK is a no-op in a script that's still
+// tracking, so this is always safe to send. If the doc was reopened in a
+// different tab, the stored tabId is stale — adopt the active Docs tab as
+// the new session tab first so background.js watches the right one.
+function resumeTaskTracking() {
+  if (typeof chrome === "undefined" || !chrome.storage || !chrome.tabs) return;
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const active = tabs[0];
+    const isDocsTab = !!active?.url?.startsWith("https://docs.google.com/");
+    chrome.storage.local.get("ff_task", (result) => {
+      const task = result.ff_task;
+      if (!task) return;
+      if (isDocsTab && active.id !== task.tabId) {
+        chrome.storage.local.set({ ff_task: { ...task, tabId: active.id } });
+      }
+      const targetId = isDocsTab ? active.id : task.tabId;
+      if (!targetId) return;
+      chrome.tabs.sendMessage(targetId, { type: "FF_RESUME_TASK" }).catch(() => {});
+    });
+  });
+}
+
 const TEAL = {
   50: "#E1F5EE",
   100: "#9FE1CB",
@@ -797,7 +823,12 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       if (typeof chrome !== "undefined" && chrome.storage) {
         chrome.storage.local.remove("ff_interrupted");
       }
-      setScreen(mode === "resume" ? "monitoring" : "contextPrep");
+      if (mode === "resume") {
+        resumeTaskTracking(); // content script may have been re-injected — restart tracking
+        setScreen("monitoring");
+      } else {
+        setScreen("contextPrep");
+      }
     }}/>,
     contextPrep: <ContextPrepScreen setScreen={setScreen} />,
     monitoring: <ActiveMonitoringScreen
@@ -842,6 +873,9 @@ export default function App() {
         if (result.ff_interrupted) {
           setScreen("init"); // TaskInitScreen reads ff_task and ff_interrupted to show the right UI
         } else if (result.ff_task) {
+          // Panel reopened mid-session — tracking may have died if the
+          // content script was re-injected since (safe no-op otherwise).
+          resumeTaskTracking();
           setScreen("monitoring");
         }
       });
