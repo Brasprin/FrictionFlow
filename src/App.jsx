@@ -14,133 +14,15 @@ const styles = {
   root: {
     fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
     background: "#F7FAF9",
-    minHeight: "100vh",
     display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "flex-start",
-    padding: "0",
     color: "#030213",
   },
-  // Nav tabs
-  nav: {
-    width: "100%",
-    background: "#fff",
-    borderBottom: "1px solid rgba(0,0,0,0.08)",
-    display: "flex",
-    alignItems: "center",
-    gap: "0",
-    padding: "0 16px",
-    position: "sticky",
-    top: 0,
-    zIndex: 100,
-    boxShadow: "0 1px 4px rgba(29,158,117,0.06)",
-  },
-  logo: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    padding: "12px 16px 12px 0",
-    borderRight: "1px solid rgba(0,0,0,0.08)",
-    marginRight: "8px",
-  },
-  logoMark: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-    background: TEAL[400],
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    color: "#fff",
-    fontSize: 14,
-    fontWeight: 700,
-    letterSpacing: "-0.5px",
-  },
-  logoText: {
-    fontSize: 14,
-    fontWeight: 600,
-    color: "#030213",
-    letterSpacing: "-0.3px",
-  },
-  tab: (active) => ({
-    padding: "14px 16px",
-    fontSize: 13,
-    fontWeight: active ? 600 : 400,
-    color: active ? TEAL[600] : "#717182",
-    borderBottom: active ? `2px solid ${TEAL[400]}` : "2px solid transparent",
-    cursor: "pointer",
-    background: "none",
-    border: "none",
-    borderBottom: active ? `2px solid ${TEAL[400]}` : "2px solid transparent",
-    transition: "color 0.15s",
-    whiteSpace: "nowrap",
-  }),
   content: {
-    width: "100%",
-    maxWidth: 900,
-    padding: "24px 16px 48px",
     display: "flex",
-    flexDirection: "column",
-    gap: "24px",
-  },
-  screenLabel: {
-    fontSize: 11,
-    fontWeight: 600,
-    letterSpacing: "0.08em",
-    textTransform: "uppercase",
-    color: TEAL[600],
-    marginBottom: 8,
-  },
-  card: {
-    background: "#fff",
-    borderRadius: 16,
-    border: "1px solid rgba(0,0,0,0.07)",
-    overflow: "hidden",
-    boxShadow: "0 2px 12px rgba(29,158,117,0.06)",
   },
 };
 
 // ─── Shared Components ────────────────────────────────────────────────────────
-
-function ExtensionShell({ children, sidePanel }) {
-  return (
-    <div style={{ display: "flex", gap: 0, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(0,0,0,0.08)", boxShadow: "0 4px 24px rgba(29,158,117,0.08)", background: "#fff", minHeight: 460 }}>
-      <div style={{ flex: 1, background: "#F0F4F2", position: "relative", overflow: "hidden", minHeight: 460 }}>
-        {/* Fake browser chrome */}
-        <div style={{ background: "#E8EEEC", borderBottom: "1px solid rgba(0,0,0,0.08)", padding: "8px 12px", display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ display: "flex", gap: 5 }}>
-            {["#FF5F57","#FEBC2E","#28C840"].map((c,i) => <div key={i} style={{ width: 10, height: 10, borderRadius: 999, background: c }} />)}
-          </div>
-          <div style={{ flex: 1, background: "#fff", borderRadius: 6, padding: "3px 10px", fontSize: 11, color: "#888", border: "1px solid rgba(0,0,0,0.1)" }}>
-            docs.google.com/document/d/1a2B3c…
-          </div>
-          <div style={{ fontSize: 13, color: TEAL[400], fontWeight: 600, cursor: "pointer" }}>FF</div>
-        </div>
-        {/* Google Docs mock */}
-        <div style={{ padding: "20px 32px", height: "calc(100% - 37px)", overflowY: "auto" }}>
-          <div style={{ maxWidth: 480, margin: "0 auto" }}>
-            <div style={{ height: 16, background: "rgba(0,0,0,0.08)", borderRadius: 4, width: "60%", marginBottom: 12 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "100%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "92%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "85%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "97%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "78%", marginBottom: 20 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "100%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "88%", marginBottom: 8 }} />
-            <div style={{ height: 10, background: "rgba(0,0,0,0.05)", borderRadius: 4, width: "70%", marginBottom: 8 }} />
-          </div>
-        </div>
-        {children}
-      </div>
-      {sidePanel && (
-        <div style={{ width: 256, borderLeft: "1px solid rgba(0,0,0,0.07)", background: "#fff", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-          {sidePanel}
-        </div>
-      )}
-    </div>
-  );
-}
 
 function SidePanelHeader({ title, subtitle, status }) {
   return (
@@ -155,7 +37,7 @@ function SidePanelHeader({ title, subtitle, status }) {
         <span style={{ fontSize: 13, fontWeight: 700, color: "#030213", letterSpacing: "-0.2px" }}>FrictionFlow</span>
         {status && <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 600, color: TEAL[600], background: TEAL[50], padding: "2px 7px", borderRadius: 99 }}>{status}</span>}
       </div>
-      {subtitle && <p style={{ fontSize: 11, color: "#717182", margin: 0, paddingLeft: 32 }}>{subtitle}</p>}
+      {subtitle && <p style={{ fontSize: 11, color: "#717182", margin: 0 }}>{subtitle}</p>}
     </div>
   );
 }
@@ -241,7 +123,7 @@ function TaskInitScreen({ onStart }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 0" }}>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
@@ -277,7 +159,7 @@ function TaskInitScreen({ onStart }) {
           </div>
         )}
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
         {isActive ? (
           <>
             <Btn variant="primary" style={{ width: "100%" }} onClick={onStart}>
@@ -300,7 +182,7 @@ function TaskInitScreen({ onStart }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-function ActiveMonitoringScreen() {
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const [taskName, setTaskName] = useState("Research Essay Draft");
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
@@ -352,10 +234,42 @@ function ActiveMonitoringScreen() {
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
+  function handleFinishSession() {
+    // Snapshot the current live stats into a summary object before storage is cleared.
+    const finishedSummary = {
+      taskName,
+      elapsedSeconds: elapsed,
+      wordCount: words,
+      wpm,
+      totalPauses,
+      longestPauseMs: longestPause,
+      scrollFrequency,
+      scrollFrequencyLabel,
+    };
+    setSummary(finishedSummary);
+
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      // Session is truly over — clear stored task/session/idle data so the
+      // init screen starts blank next time, not in a "Resume session" state.
+      chrome.storage.local.remove("ff_task");
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+
+      // Tell content script to stop tracking
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
+        }
+      });
+    }
+
+    setScreen("analytics");
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Live stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
@@ -397,32 +311,16 @@ function ActiveMonitoringScreen() {
           <span style={{ display: "inline-block", width: 2, height: 12, background: TEAL[400], marginLeft: 2, verticalAlign: "middle", animation: "blink 1s infinite" }} />
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="ghost" style={{ width: "100%", fontSize: 12 }}>Take a break</Btn>
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen 3: Distraction Prompt ────────────────────────────────────────────
-
-function DistractionPromptScreen({ onAction }) {
-  return (
-    <div style={{ position: "absolute", inset: 0, background: "rgba(3,2,19,0.38)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 20, backdropFilter: "blur(1px)" }}>
-      <div style={{ background: "#fff", borderRadius: 16, padding: "24px 22px", width: 260, boxShadow: "0 8px 32px rgba(0,0,0,0.18)", textAlign: "center" }}>
-        <div style={{ width: 40, height: 40, borderRadius: 12, background: TEAL[50], display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
-          <svg width="20" height="20" fill="none" viewBox="0 0 20 20">
-            <circle cx="10" cy="10" r="8" stroke={TEAL[400]} strokeWidth="1.5" />
-            <path d="M10 6v4M10 13h.01" stroke={TEAL[400]} strokeWidth="1.8" strokeLinecap="round" />
-          </svg>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
+          <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
         </div>
-        <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 700, color: "#030213" }}>Gentle reminder</p>
-        <p style={{ margin: "0 0 18px", fontSize: 12, color: "#717182", lineHeight: 1.5 }}>You've been away from your writing for a while. Ready to get back on track?</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <Btn variant="primary" onClick={() => onAction("resume")} style={{ width: "100%" }}>Get back to work</Btn>
-          <Btn variant="outline" onClick={() => onAction("break")} style={{ width: "100%" }}>Take a break</Btn>
-          <Btn variant="ghost" onClick={() => onAction("dismiss")} style={{ width: "100%", fontSize: 12, color: "#aaa", border: "none" }}>Dismiss</Btn>
-        </div>
+        {hasRecoverySummary && (
+          <button onClick={() => setScreen("recovery")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: 0, alignSelf: "center" }}>
+            View last recovery summary
+          </button>
+        )}
       </div>
     </div>
   );
@@ -430,7 +328,7 @@ function DistractionPromptScreen({ onAction }) {
 
 // ─── Screen 4: Recovery Interface ────────────────────────────────────────────
 
-function RecoveryScreen() {
+function RecoveryScreen({ setScreen }) {
   const suggestions = [
     "Continue the sentence you were drafting about AI's personalization capabilities.",
     "Expand on the point about student engagement metrics from paragraph 2.",
@@ -440,7 +338,7 @@ function RecoveryScreen() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Welcome back!" />
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Context summary */}
         <div style={{ background: TEAL[50], borderRadius: 12, padding: "12px 13px", marginBottom: 14, border: `1px solid ${TEAL[100]}` }}>
           <p style={{ margin: "0 0 3px", fontSize: 12, fontWeight: 700, color: TEAL[800] }}>Research Essay Draft</p>
@@ -468,8 +366,8 @@ function RecoveryScreen() {
           ))}
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
-        <Btn variant="primary" style={{ width: "100%" }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("monitoring")}>
           Continue where I left off →
         </Btn>
       </div>
@@ -479,7 +377,7 @@ function RecoveryScreen() {
 
 // ─── Screen 5: Break Mode ─────────────────────────────────────────────────────
 
-function BreakScreen() {
+function BreakScreen({ setScreen, setHasRecoverySummary }) {
   const [secs, setSecs] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
@@ -487,8 +385,8 @@ function BreakScreen() {
   }, []);
   const activities = ["🧘 Breathe slowly", "🚶 Take a short walk", "💧 Drink some water", "👁 Rest your eyes"];
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", alignItems: "center", justifyContent: "center", padding: "24px 16px" }}>
-      <div style={{ textAlign: "center", marginBottom: 20 }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <div style={{ textAlign: "center", padding: "20px 16px 4px" }}>
         <div style={{ width: 56, height: 56, borderRadius: 16, background: TEAL[50], border: `2px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
           <svg width="26" height="26" fill="none" viewBox="0 0 26 26">
             <circle cx="13" cy="13" r="10" stroke={TEAL[400]} strokeWidth="1.8" />
@@ -498,13 +396,13 @@ function BreakScreen() {
         <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 700, color: "#030213" }}>Taking a break</p>
         <p style={{ margin: 0, fontSize: 12, color: "#717182" }}>Your session is paused</p>
       </div>
-      <div style={{ background: "#F7FAF9", borderRadius: 12, padding: "14px 28px", textAlign: "center", marginBottom: 20, border: `1px solid ${TEAL[50]}` }}>
-        <p style={{ margin: 0, fontSize: 11, color: "#717182", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Break duration</p>
-        <p style={{ margin: 0, fontSize: 30, fontWeight: 700, color: TEAL[800], fontVariantNumeric: "tabular-nums" }}>
-          {String(Math.floor(secs/60)).padStart(2,"0")}:{String(secs%60).padStart(2,"0")}
-        </p>
-      </div>
-      <div style={{ width: "100%", marginBottom: 20 }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+        <div style={{ background: "#F7FAF9", borderRadius: 12, padding: "14px 28px", textAlign: "center", marginBottom: 18, border: `1px solid ${TEAL[50]}` }}>
+          <p style={{ margin: 0, fontSize: 11, color: "#717182", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Break duration</p>
+          <p style={{ margin: 0, fontSize: 30, fontWeight: 700, color: TEAL[800], fontVariantNumeric: "tabular-nums" }}>
+            {String(Math.floor(secs/60)).padStart(2,"0")}:{String(secs%60).padStart(2,"0")}
+          </p>
+        </div>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8, textAlign: "center" }}>Suggested activities</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {activities.map(a => (
@@ -512,23 +410,33 @@ function BreakScreen() {
           ))}
         </div>
       </div>
-      <Btn variant="primary" style={{ width: "100%" }}>
-        I'm ready to continue →
-      </Btn>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => { setHasRecoverySummary(true); setScreen("recovery"); }}>
+          I'm ready to continue →
+        </Btn>
+      </div>
     </div>
   );
 }
 
 // ─── Screen 6: Session Analytics ─────────────────────────────────────────────
 
-function AnalyticsScreen() {
+function AnalyticsScreen({ setScreen, summary }) {
+  const s = summary ?? {};
+
+  const mins = Math.floor((s.elapsedSeconds ?? 0) / 60);
+  const secs = (s.elapsedSeconds ?? 0) % 60;
+  const sessionTimeStr = `${mins}m ${secs}s`;
+
+  // Stats backed by real tracked data from content.js
   const stats = [
-    { label: "Session time", value: "47m 12s", icon: "⏱" },
-    { label: "Words written", value: "624", icon: "📝" },
-    { label: "Avg. WPM", value: "38", icon: "⚡" },
-    { label: "Distractions", value: "4", icon: "🔔" },
-    { label: "Breaks taken", value: "1", icon: "☕" },
-    { label: "Recovery rate", value: "100%", icon: "✅" },
+    { label: "Session time", value: sessionTimeStr, icon: "⏱" },
+    { label: "Words written", value: s.wordCount ?? 0, icon: "📝" },
+    { label: "Avg. WPM", value: s.wpm ?? 0, icon: "⚡" },
+    { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸" },
+    // NOTE: distraction count, breaks taken, and recovery rate aren't tracked
+    // by content.js yet (only current phase is logged, not a running tally
+    // of distraction events or break usage) — left out until that's added.
   ];
   const phases = [
     { label: "Planning", pct: 18, color: TEAL[100] },
@@ -544,15 +452,15 @@ function AnalyticsScreen() {
           </svg>
         </div>
         <p style={{ margin: "0 0 2px", fontSize: 13, fontWeight: 700, color: "#030213" }}>Session complete!</p>
-        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>Research Essay Draft</p>
+        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>{s.taskName || "Untitled task"}</p>
       </div>
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
-          {stats.map(s => (
-            <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
-              <p style={{ margin: 0, fontSize: 16 }}>{s.icon}</p>
-              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{s.value}</p>
-              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{s.label}</p>
+          {stats.map(st => (
+            <div key={st.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
+              <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
+              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
+              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
             </div>
           ))}
         </div>
@@ -575,112 +483,36 @@ function AnalyticsScreen() {
           <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>You recovered focus quickly after each distraction. You spent most of your time in the translating phase — a sign of productive flow.</p>
         </div>
       </div>
-      <div style={{ padding: 14, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }}>Start new task</Btn>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
       </div>
     </div>
   );
 }
 
-// ─── Full Popup Mode (no side panel) ─────────────────────────────────────────
+// ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen }) {
-  const [distractionAction, setDistractionAction] = useState(null);
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary }) {
   const screenMap = {
-    init: <TaskInitScreen onStart={() => setScreen("monitoring")}/>,
-    monitoring: <ActiveMonitoringScreen />,
-    recovery: <RecoveryScreen />,
-    break: <BreakScreen />,
-    analytics: <AnalyticsScreen />,
+    init: <TaskInitScreen onStart={() => { setHasRecoverySummary(false); setScreen("monitoring"); }}/>,
+    monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} hasRecoverySummary={hasRecoverySummary} />,
+    recovery: <RecoveryScreen setScreen={setScreen} />,
+    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
+    analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
-    <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
-      {/* Extension popup */}
-      <div style={{ flex: "0 0 260px" }}>
-        <p style={styles.screenLabel}>Extension popup</p>
-        <div style={{ ...styles.card, width: 260, minHeight: 460, display: "flex", flexDirection: "column", overflow: "visible" }}>
-          <div style={{ display: "flex", flexDirection: "column", height: 460, overflow: "hidden", borderRadius: 16 }}>
-            {screenMap[screen]}
-          </div>
-        </div>
-      </div>
-      {/* Screen selector */}
-      <div style={{ flex: 1, minWidth: 220 }}>
-        <p style={styles.screenLabel}>Select screen</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {[
-            { key: "init", label: "Task initialization", desc: "Set task name & objective" },
-            { key: "monitoring", label: "Active monitoring", desc: "Live stats & phase detection" },
-            { key: "recovery", label: "Recovery interface", desc: "Context summary + next steps" },
-            { key: "break", label: "Break mode", desc: "Break timer & activities" },
-            { key: "analytics", label: "Session analytics", desc: "End-of-session summary" },
-          ].map(s => (
-            <button key={s.key} onClick={() => setScreen(s.key)}
-              style={{ textAlign: "left", background: screen === s.key ? TEAL[50] : "#fff", border: screen === s.key ? `1.5px solid ${TEAL[200]}` : "1px solid rgba(0,0,0,0.08)", borderRadius: 10, padding: "10px 13px", cursor: "pointer", transition: "all 0.15s" }}>
-              <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: screen === s.key ? TEAL[800] : "#030213" }}>{s.label}</p>
-              <p style={{ margin: 0, fontSize: 11, color: "#717182", marginTop: 2 }}>{s.desc}</p>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Distraction Overlay Demo ─────────────────────────────────────────────────
-
-function DistractionDemo() {
-  const [show, setShow] = useState(false);
-  const [action, setAction] = useState(null);
-  return (
-    <div>
-      <p style={styles.screenLabel}>Distraction overlay</p>
-      <div style={{ ...styles.card, overflow: "visible" }}>
-        <ExtensionShell sidePanel={
-          <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-            <SidePanelHeader title="FrictionFlow" subtitle="Research Essay Draft" status="Active" />
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 16, gap: 12 }}>
-              {action ? (
-                <div style={{ textAlign: "center" }}>
-                  <p style={{ fontSize: 13, fontWeight: 700, color: TEAL[800], marginBottom: 6 }}>
-                    {action === "resume" ? "Welcome back! 👋" : action === "break" ? "Enjoy your break ☕" : "Dismissed"}
-                  </p>
-                  <p style={{ fontSize: 11, color: "#717182", margin: "0 0 16px" }}>
-                    {action === "resume" ? "Recovery context loaded." : action === "break" ? "Break timer started." : "Monitoring continues."}
-                  </p>
-                  <Btn variant="outline" onClick={() => { setAction(null); setShow(false); }} style={{ fontSize: 11 }}>Reset demo</Btn>
-                </div>
-              ) : (
-                <>
-                  <p style={{ fontSize: 12, color: "#717182", textAlign: "center", margin: 0 }}>Monitoring active. Idle threshold: 45s</p>
-                  <Btn variant="danger" onClick={() => setShow(true)} style={{ width: "100%", fontSize: 12 }}>
-                    Simulate distraction
-                  </Btn>
-                </>
-              )}
-            </div>
-          </div>
-        }>
-          {show && !action && (
-            <DistractionPromptScreen onAction={a => { setAction(a); setShow(false); }} />
-          )}
-        </ExtensionShell>
-      </div>
+    <div style={{ width: 320, height: 500, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      {screenMap[screen]}
     </div>
   );
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────────
 
-const TABS = [
-  { key: "popup", label: "Extension popup" },
-  { key: "overlay", label: "Distraction overlay" },
-  { key: "inline", label: "Inline monitoring" },
-];
-
 export default function App() {
-  const [tab, setTab] = useState("popup");
   const [screen, setScreen] = useState("init");
+  const [summary, setSummary] = useState(null); // snapshot of session stats captured when a session finishes
+  const [hasRecoverySummary, setHasRecoverySummary] = useState(false); // true once a real recovery moment has happened this task
 
   return (
     <div style={styles.root}>
@@ -689,34 +521,16 @@ export default function App() {
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
         button:hover { opacity: 0.85; }
       `}</style>
-      {/* Nav */}
-      <div style={styles.nav}>
-        <div style={styles.logo}>
-          <div style={styles.logoMark}>FF</div>
-          <span style={styles.logoText}>FrictionFlow</span>
-        </div>
-        {TABS.map(t => (
-          <button key={t.key} style={styles.tab(tab === t.key)} onClick={() => setTab(t.key)}>
-            {t.label}
-          </button>
-        ))}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 8, height: 8, borderRadius: 999, background: TEAL[400] }} />
-          <span style={{ fontSize: 11, color: "#717182" }}>Browser Extension UI</span>
-        </div>
-      </div>
       {/* Content */}
       <div style={styles.content}>
-        {tab === "popup" && <PopupView screen={screen} setScreen={setScreen} />}
-        {tab === "overlay" && <DistractionDemo />}
-        {tab === "inline" && (
-          <div>
-            <p style={styles.screenLabel}>Full inline view — active session</p>
-            <div style={styles.card}>
-              <ExtensionShell sidePanel={<ActiveMonitoringScreen />} />
-            </div>
-          </div>
-        )}
+        <PopupView
+          screen={screen}
+          setScreen={setScreen}
+          summary={summary}
+          setSummary={setSummary}
+          hasRecoverySummary={hasRecoverySummary}
+          setHasRecoverySummary={setHasRecoverySummary}
+        />
       </div>
     </div>
   );
