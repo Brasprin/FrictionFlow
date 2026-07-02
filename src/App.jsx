@@ -277,8 +277,8 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
       ? Math.floor((Date.now() - sessionStartTime) / 1000)
       : elapsed;
 
-    // Read the last ff_session snapshot to grab totalBreakMs before we clear storage
-    function buildAndNavigate(totalBreakMs = 0) {
+    // Read the last ff_session snapshot to grab totalBreakMs/phaseDurationsMs before we clear storage
+    function buildAndNavigate(totalBreakMs = 0, phaseDurationsMs = {}) {
       const finishedSummary = {
         taskName,
         elapsedSeconds: finalElapsedSeconds,
@@ -289,6 +289,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
         longestPauseMs: longestPause,
         scrollFrequency,
         scrollFrequencyLabel,
+        phaseDurationsMs,
       };
       setSummary(finishedSummary);
 
@@ -309,10 +310,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.get("ff_session", (result) => {
-        buildAndNavigate(result.ff_session?.totalBreakMs ?? 0);
+        buildAndNavigate(result.ff_session?.totalBreakMs ?? 0, result.ff_session?.phaseDurationsMs ?? {});
       });
     } else {
-      buildAndNavigate(0);
+      buildAndNavigate(0, {});
     }
   }
 
@@ -513,11 +514,25 @@ function AnalyticsScreen({ setScreen, summary }) {
     // NOTE: distraction count and recovery rate aren't tracked by content.js
     // yet — left out until that's added.
   ];
-  const phases = [
-    { label: "Planning", pct: 18, color: TEAL[100] },
-    { label: "Translating", pct: 64, color: TEAL[400] },
-    { label: "Reviewing", pct: 18, color: TEAL[200] },
-  ];
+  const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
+  const PHASE_ORDER = ["Planning", "Translating", "Reviewing", "Distracted"];
+
+  const phaseDurationsMs = s.phaseDurationsMs ?? {};
+  const totalPhaseMs = PHASE_ORDER.reduce((sum, label) => sum + (phaseDurationsMs[label] ?? 0), 0);
+
+  const phases = totalPhaseMs > 0
+    ? PHASE_ORDER
+        .filter(label => (phaseDurationsMs[label] ?? 0) > 0)
+        .map(label => ({
+          label,
+          pct: Math.round((phaseDurationsMs[label] / totalPhaseMs) * 100),
+          color: PHASE_COLORS[label],
+        }))
+    : [];
+
+  const dominantPhase = phases.length > 0
+    ? phases.reduce((max, p) => (p.pct > max.pct ? p : max))
+    : null;
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid rgba(0,0,0,0.06)", textAlign: "center" }}>
@@ -541,21 +556,31 @@ function AnalyticsScreen({ setScreen, summary }) {
         </div>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Time in writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
-          <div style={{ display: "flex", height: 10, borderRadius: 99, overflow: "hidden", gap: 2, marginBottom: 8 }}>
-            {phases.map(p => <div key={p.label} style={{ flex: p.pct, background: p.color }} />)}
-          </div>
-          <div style={{ display: "flex", gap: 12 }}>
-            {phases.map(p => (
-              <div key={p.label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <div style={{ width: 8, height: 8, borderRadius: 2, background: p.color }} />
-                <span style={{ fontSize: 10, color: "#717182" }}>{p.label} {p.pct}%</span>
+          {phases.length > 0 ? (
+            <>
+              <div style={{ display: "flex", height: 10, borderRadius: 99, overflow: "hidden", gap: 2, marginBottom: 8 }}>
+                {phases.map(p => <div key={p.label} style={{ flex: p.pct, background: p.color }} />)}
               </div>
-            ))}
-          </div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                {phases.map(p => (
+                  <div key={p.label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: p.color }} />
+                    <span style={{ fontSize: 10, color: "#717182" }}>{p.label} {p.pct}%</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>No phase data recorded for this session.</p>
+          )}
         </div>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}` }}>
-          <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>Great session!</p>
-          <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>You recovered focus quickly after each distraction. You spent most of your time in the translating phase — a sign of productive flow.</p>
+          <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>{dominantPhase ? "Great session!" : "Session complete"}</p>
+          <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
+            {dominantPhase
+              ? `You spent most of your time in the ${dominantPhase.label.toLowerCase()} phase${dominantPhase.label === "Translating" ? " — a sign of productive flow." : "."}`
+              : "Start a new session to build up your phase breakdown."}
+          </p>
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
