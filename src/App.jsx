@@ -16,9 +16,14 @@ const styles = {
     background: "#F7FAF9",
     display: "flex",
     color: "#030213",
+    width: "100%",
+    height: "100vh",
   },
   content: {
     display: "flex",
+    width: "100%",
+    maxWidth: 420,
+    margin: "0 auto",
   },
 };
 
@@ -97,15 +102,13 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
 
-        // Tell content script to start tracking
-        if (tabId) {
-          chrome.tabs.sendMessage(tabId, { type: "FF_START_TASK" });
-        }
+        // FF_START_TASK is sent by ContextPrepScreen once the prep animation
+        // finishes — tracking shouldn't begin until context prep completes.
       });
     }
 
     setIsActive(true);
-    onStart(); // navigates to active monitoring screen
+    onStart("fresh"); // navigates to context preparation screen
   }
 
   function handleCancelTask() {
@@ -177,7 +180,7 @@ function TaskInitScreen({ onStart }) {
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
         {isActive ? (
           <>
-            <Btn variant="primary" style={{ width: "100%" }} onClick={onStart}>
+            <Btn variant="primary" style={{ width: "100%" }} onClick={() => onStart("resume")}>
               {isInterrupted ? "Resume session →" : "Resume session →"}
             </Btn>
             <Btn variant="danger" style={{ width: "100%" }} onClick={handleCancelTask}>
@@ -195,10 +198,74 @@ function TaskInitScreen({ onStart }) {
   );
 }
 
+// ─── Screen 1b: Context Preparation ──────────────────────────────────────────
+
+function ContextPrepScreen({ setScreen }) {
+  const [taskName, setTaskName] = useState("");
+  const [objective, setObjective] = useState("");
+  const [startTime, setStartTime] = useState(null);
+  const [stage, setStage] = useState("building"); // "building" -> "connecting"
+
+  useEffect(() => {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        const t = result.ff_task;
+        if (!t) return;
+        setTaskName(t.taskName ?? "");
+        setObjective(t.objective ?? "");
+        setStartTime(t.sessionStartTime ?? Date.now());
+      });
+    }
+  }, []);
+
+  // Simulated build → connect sequence, then hand off to content.js to
+  // actually start tracking. Tracking intentionally begins here rather than
+  // at "Start Task", since context prep is meant to complete first.
+  useEffect(() => {
+    const buildTimer = setTimeout(() => setStage("connecting"), 1300);
+    const connectTimer = setTimeout(() => {
+      if (typeof chrome !== "undefined" && chrome.tabs) {
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (tabs[0]?.id) {
+            chrome.tabs.sendMessage(tabs[0].id, { type: "FF_START_TASK" });
+          }
+        });
+      }
+      setScreen("monitoring");
+    }, 2600);
+    return () => {
+      clearTimeout(buildTimer);
+      clearTimeout(connectTimer);
+    };
+  }, [setScreen]);
+
+  const formattedStart = startTime
+    ? new Date(startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "—";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <SidePanelHeader title="FrictionFlow" subtitle="Preparing your session" />
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", padding: 24, textAlign: "center" }}>
+        <div style={{ width: 40, height: 40, borderRadius: 12, border: `3px solid ${TEAL[100]}`, borderTopColor: TEAL[400], animation: "spin 0.9s linear infinite", marginBottom: 18 }} />
+        <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 700, color: "#030213" }}>{taskName || "Untitled task"}</p>
+        {objective && <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.5, maxWidth: 230 }}>{objective}</p>}
+        <div style={{ background: TEAL[50], borderRadius: 8, padding: "6px 12px", fontSize: 10, color: TEAL[600], marginBottom: 16 }}>
+          Started at {formattedStart}
+        </div>
+        <p style={{ fontSize: 12, fontWeight: 600, color: TEAL[600], margin: 0 }}>
+          {stage === "building" ? "Building context-aware focus model…" : "Connecting to Google Docs…"}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
 function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
-  const [taskName, setTaskName] = useState("Research Essay Draft");
+  const [taskName, setTaskName] = useState("");
+  const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
   const [elapsed, setElapsed] = useState(0);                      // calculated locally every second
   const [wpm, setWpm] = useState(0);
@@ -208,6 +275,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
+  const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
+  // Ref, not state — read inside the storage-poll interval closure, so it
+  // needs to reflect the latest value without waiting for a re-render.
+  const promptDismissedRef = useRef(false);
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -240,7 +311,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
           const s = result.ff_session;
           const t = result.ff_task;
 
-          if (t) setTaskName(t.taskName ?? "");
+          if (t) {
+            setTaskName(t.taskName ?? "");
+            setObjective(t.objective ?? "");
+          }
 
           if (!s) return;
           setWpm(s.wpm ?? 0);
@@ -250,6 +324,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
+
+          // Auto-trigger the distraction prompt while the phase reads
+          // "Distracted", once per episode — reset once the user leaves
+          // that state (whether on their own or via the prompt).
+          if (s.currentPhase === "Distracted") {
+            if (!promptDismissedRef.current) setShowDistractionPrompt(true);
+          } else {
+            promptDismissedRef.current = false;
+            setShowDistractionPrompt(false);
+          }
         });
       }
     }
@@ -271,6 +355,21 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   };
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
+
+  function handleGetBackToWork() {
+    setShowDistractionPrompt(false);
+    setScreen("recovery");
+  }
+
+  function handleTakeBreakFromPrompt() {
+    setShowDistractionPrompt(false);
+    setScreen("break");
+  }
+
+  function handleDismissPrompt() {
+    promptDismissedRef.current = true;
+    setShowDistractionPrompt(false);
+  }
 
   function handleFinishSession() {
     const finalElapsedSeconds = sessionStartTime
@@ -318,7 +417,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", position: "relative" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Live stats */}
@@ -353,7 +452,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active context</p>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{taskName}</p>
-          <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>Write a 500-word essay on the impact of AI in education.</p>
+          <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>{objective}</p>
         </div>
         {/* Recent activity */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Last paragraph</p>
@@ -373,6 +472,26 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
           </button>
         )}
       </div>
+      {showDistractionPrompt && (
+        <div style={{ position: "absolute", inset: 0, background: "rgba(3,2,19,0.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 10 }}>
+          <div style={{ background: "#fff", borderRadius: 14, padding: "18px 18px 14px", width: "100%", maxWidth: 320, boxShadow: "0 12px 32px rgba(0,0,0,0.2)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <div style={{ width: 26, height: 26, borderRadius: 8, background: "#FFF3E0", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <svg width="14" height="14" fill="none" viewBox="0 0 14 14"><path d="M7 4v4M7 10h.01" stroke="#F4A261" strokeWidth="1.8" strokeLinecap="round" /></svg>
+              </div>
+              <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#030213" }}>Gentle Reminder</p>
+            </div>
+            <p style={{ margin: "0 0 14px", fontSize: 12, color: "#717182", lineHeight: 1.5 }}>
+              Looks like you've drifted from "{taskName || "your task"}". Want a hand getting back into it?
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+              <Btn variant="primary" style={{ width: "100%" }} onClick={handleGetBackToWork}>Get Back to Work</Btn>
+              <Btn variant="outline" style={{ width: "100%" }} onClick={handleTakeBreakFromPrompt}>Take a Break</Btn>
+              <Btn variant="ghost" style={{ width: "100%" }} onClick={handleDismissPrompt}>Dismiss</Btn>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -594,20 +713,21 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary }) {
   const screenMap = {
-    init: <TaskInitScreen onStart={() => {
+    init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
       if (typeof chrome !== "undefined" && chrome.storage) {
         chrome.storage.local.remove("ff_interrupted");
       }
-      setScreen("monitoring");
+      setScreen(mode === "resume" ? "monitoring" : "contextPrep");
     }}/>,
+    contextPrep: <ContextPrepScreen setScreen={setScreen} />,
     monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} hasRecoverySummary={hasRecoverySummary} />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
     break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
-    <div style={{ width: 320, height: 500, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div style={{ width: "100%", height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {screenMap[screen]}
     </div>
   );
@@ -641,6 +761,7 @@ export default function App() {
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
       <style>{`
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
         button:hover { opacity: 0.85; }
       `}</style>
       {/* Content */}

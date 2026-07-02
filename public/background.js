@@ -5,6 +5,15 @@ let lastRecoveryTime = null;
 let isCallingClaude = false; // prevent concurrent API calls
 
 
+//------------------ Side Panel ------------------//
+// Opens the side panel when the toolbar icon is clicked, since manifest.json
+// no longer sets a default_popup. Called unconditionally (not just in
+// onInstalled) so it's re-applied whenever the service worker restarts.
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((error) => console.error("FrictionFlow: sidePanel setup failed", error));
+
+
 //------------------ Install ------------------//
 chrome.runtime.onInstalled.addListener(() => {
   console.log("FrictionFlow installed");

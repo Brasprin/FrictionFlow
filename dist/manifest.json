@@ -7,7 +7,8 @@
     "storage",
     "tabs",
     "activeTab",
-    "scripting"
+    "scripting",
+    "sidePanel"
   ],
   "host_permissions": [
     "https://docs.google.com/*"
@@ -15,8 +16,9 @@
   "background": {
     "service_worker": "background.js"
   },
-  "action": {
-    "default_popup": "index.html"
+  "action": {},
+  "side_panel": {
+    "default_path": "index.html"
   },
   "content_scripts": [
     {
