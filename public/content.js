@@ -43,6 +43,9 @@ let burstCount = 0;
 let totalBurstDurationMs = 0;
 let lastCompletedBurstMs = 0;
 
+// Break Variables
+let totalBreakMs = 0;
+
 // Interval handles — needed so we can clear them on extension context invalidation
 let flushIntervalId = null;
 let pauseIntervalId = null;
@@ -310,6 +313,8 @@ function resetSessionState() {
   burstCount = 0;
   totalBurstDurationMs = 0;
   lastCompletedBurstMs = 0;
+
+  totalBreakMs = 0;
 }
 
 function startTracking() {
@@ -367,6 +372,9 @@ function startIntervals() {
       // Phase
       currentPhase: classifyPhase(scrollFreq),
 
+      // Breaks
+      totalBreakMs,
+
       lastUpdated: Date.now(),
     };
 
@@ -413,6 +421,15 @@ if (isExtensionContextValid()) {
       startTracking();
     } else if (message?.type === "FF_CANCEL_TASK") {
       stopTracking();
+    } else if (message?.type === "FF_UPDATE_BREAK_MS") {
+      totalBreakMs += message.breakMs ?? 0;
+
+      // Write immediately so totalBreakMs isn't lost if the session ends
+      // before the next activity-triggered flush.
+      safeStorageGet("ff_session", (result) => {
+        const existing = (result && result.ff_session) ?? {};
+        safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
+      });
     }
   });
 }
