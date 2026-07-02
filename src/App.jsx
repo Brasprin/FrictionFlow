@@ -184,16 +184,40 @@ function TaskInitScreen({ onStart }) {
 
 function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const [taskName, setTaskName] = useState("Research Essay Draft");
+  const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
+  const [elapsed, setElapsed] = useState(0);                      // calculated locally every second
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
-  const [elapsed, setElapsed] = useState(0);
   const [totalPauses, setTotalPauses] = useState(0);
   const [longestPause, setLongestPause] = useState(0);
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
 
-  // Poll chrome.storage.local every 2s to get current metrics 
+  // Read sessionStartTime once from ff_task on mount so the timer can run locally.
+  // This survives popup close/reopen since ff_task is in storage and never changes
+  // mid-session — the popup just recalculates from the same anchor point.
+  useEffect(() => {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        if (result.ff_task?.sessionStartTime) {
+          setSessionStartTime(result.ff_task.sessionStartTime);
+        }
+      });
+    }
+  }, []);
+
+  // Local timer — ticks every second regardless of what the user is doing.
+  // No storage writes needed; just Date.now() - sessionStartTime.
+  useEffect(() => {
+    if (!sessionStartTime) return;
+    const t = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - sessionStartTime) / 1000));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [sessionStartTime]);
+
+  // Poll ff_session every 2s for behavioral metrics from content.js
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
@@ -201,20 +225,19 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
           const s = result.ff_session;
           const t = result.ff_task;
 
-          if(t) setTaskName(t.taskName ?? "");
+          if (t) setTaskName(t.taskName ?? "");
 
           if (!s) return;
           setWpm(s.wpm ?? 0);
           setWords(s.wordCount ?? 0);
-          setElapsed(s.elapsedSeconds ?? 0);
           setTotalPauses(s.totalPauses ?? 0);
           setLongestPause(s.longestPauseMs ?? 0);
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
-        })
+        });
       }
-    } 
+    }
     readStorage();
     const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
@@ -235,35 +258,47 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
   function handleFinishSession() {
-    // Snapshot the current live stats into a summary object before storage is cleared.
-    const finishedSummary = {
-      taskName,
-      elapsedSeconds: elapsed,
-      wordCount: words,
-      wpm,
-      totalPauses,
-      longestPauseMs: longestPause,
-      scrollFrequency,
-      scrollFrequencyLabel,
-    };
-    setSummary(finishedSummary);
+    const finalElapsedSeconds = sessionStartTime
+      ? Math.floor((Date.now() - sessionStartTime) / 1000)
+      : elapsed;
 
-    if (typeof chrome !== "undefined" && chrome.storage) {
-      // Session is truly over — clear stored task/session/idle data so the
-      // init screen starts blank next time, not in a "Resume session" state.
-      chrome.storage.local.remove("ff_task");
-      chrome.storage.local.remove("ff_session");
-      chrome.storage.local.remove("ff_idle");
+    // Read the last ff_session snapshot to grab totalBreakMs before we clear storage
+    function buildAndNavigate(totalBreakMs = 0) {
+      const finishedSummary = {
+        taskName,
+        elapsedSeconds: finalElapsedSeconds,
+        totalBreakMs,
+        wordCount: words,
+        wpm,
+        totalPauses,
+        longestPauseMs: longestPause,
+        scrollFrequency,
+        scrollFrequencyLabel,
+      };
+      setSummary(finishedSummary);
 
-      // Tell content script to stop tracking
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
-        }
-      });
+      if (typeof chrome !== "undefined" && chrome.storage) {
+        chrome.storage.local.remove("ff_task");
+        chrome.storage.local.remove("ff_session");
+        chrome.storage.local.remove("ff_idle");
+
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (tabs[0]?.id) {
+            chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
+          }
+        });
+      }
+
+      setScreen("analytics");
     }
 
-    setScreen("analytics");
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_session", (result) => {
+        buildAndNavigate(result.ff_session?.totalBreakMs ?? 0);
+      });
+    } else {
+      buildAndNavigate(0);
+    }
   }
 
   return (
@@ -379,10 +414,28 @@ function RecoveryScreen({ setScreen }) {
 
 function BreakScreen({ setScreen, setHasRecoverySummary }) {
   const [secs, setSecs] = useState(0);
+  const breakStartRef = useRef(Date.now()); // track when break started for totalBreakMs
+
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
     return () => clearInterval(t);
   }, []);
+
+  function handleContinue() {
+    const breakMs = Date.now() - breakStartRef.current;
+
+    // Tell content.js how long this break was so it can accumulate totalBreakMs
+    if (typeof chrome !== "undefined" && chrome.tabs) {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_UPDATE_BREAK_MS", breakMs });
+        }
+      });
+    }
+
+    setHasRecoverySummary(true);
+    setScreen("recovery");
+  }
   const activities = ["🧘 Breathe slowly", "🚶 Take a short walk", "💧 Drink some water", "👁 Rest your eyes"];
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -411,7 +464,7 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }} onClick={() => { setHasRecoverySummary(true); setScreen("recovery"); }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={handleContinue}>
           I'm ready to continue →
         </Btn>
       </div>
@@ -424,19 +477,26 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
 function AnalyticsScreen({ setScreen, summary }) {
   const s = summary ?? {};
 
-  const mins = Math.floor((s.elapsedSeconds ?? 0) / 60);
-  const secs = (s.elapsedSeconds ?? 0) % 60;
-  const sessionTimeStr = `${mins}m ${secs}s`;
+  const totalSecs = s.elapsedSeconds ?? 0;
+  const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
+  const writingSecs = Math.max(0, totalSecs - breakSecs);
+
+  function fmt(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
 
   // Stats backed by real tracked data from content.js
   const stats = [
-    { label: "Session time", value: sessionTimeStr, icon: "⏱" },
-    { label: "Words written", value: s.wordCount ?? 0, icon: "📝" },
-    { label: "Avg. WPM", value: s.wpm ?? 0, icon: "⚡" },
-    { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸" },
-    // NOTE: distraction count, breaks taken, and recovery rate aren't tracked
-    // by content.js yet (only current phase is logged, not a running tally
-    // of distraction events or break usage) — left out until that's added.
+    { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
+    { label: "Writing time",  value: fmt(writingSecs),  icon: "✍️" },
+    { label: "Words written", value: s.wordCount ?? 0,  icon: "📝" },
+    { label: "Avg. WPM",      value: s.wpm ?? 0,        icon: "⚡" },
+    { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
+    { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
+    // NOTE: distraction count and recovery rate aren't tracked by content.js
+    // yet — left out until that's added.
   ];
   const phases = [
     { label: "Planning", pct: 18, color: TEAL[100] },
@@ -511,8 +571,22 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
 
 export default function App() {
   const [screen, setScreen] = useState("init");
-  const [summary, setSummary] = useState(null); // snapshot of session stats captured when a session finishes
-  const [hasRecoverySummary, setHasRecoverySummary] = useState(false); // true once a real recovery moment has happened this task
+  const [summary, setSummary] = useState(null);
+  const [hasRecoverySummary, setHasRecoverySummary] = useState(false);
+
+  // On popup open, check if a session is already active.
+  // ff_task exists in storage if and only if a session was started and not yet
+  // finished/cancelled — so if we find it, jump straight to monitoring instead
+  // of showing the init/setup screen.
+  useEffect(() => {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        if (result.ff_task) {
+          setScreen("monitoring");
+        }
+      });
+    }
+  }, []);
 
   return (
     <div style={styles.root}>
