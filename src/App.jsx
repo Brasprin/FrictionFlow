@@ -1,5 +1,23 @@
 import { useState, useEffect, useRef } from "react";
 
+// Sends a message to the Docs tab specifically (via the tabId stored on
+// ff_task at session start), rather than "whichever tab is active right
+// now" — the side panel stays open across tab switches, so the active tab
+// is frequently not the Docs tab, which previously caused "Could not
+// establish connection" errors when messaging the wrong tab.
+function sendToTaskTab(message) {
+  if (typeof chrome === "undefined" || !chrome.storage || !chrome.tabs) return;
+  chrome.storage.local.get("ff_task", (result) => {
+    const tabId = result.ff_task?.tabId;
+    if (!tabId) return;
+    chrome.tabs.sendMessage(tabId, message).catch(() => {
+      // Tab may have been closed or navigated away — background.js's
+      // onRemoved/onUpdated listeners already handle marking the session
+      // interrupted in that case, so this is safe to ignore here.
+    });
+  });
+}
+
 const TEAL = {
   50: "#E1F5EE",
   100: "#9FE1CB",
@@ -53,6 +71,48 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
   if (variant === "outline") return <button style={{ ...base, background: "transparent", color: TEAL[600], border: `1px solid ${TEAL[200]}` }} onClick={onClick}>{children}</button>;
   if (variant === "ghost") return <button style={{ ...base, background: "transparent", color: "#717182", border: "1px solid rgba(0,0,0,0.1)" }} onClick={onClick}>{children}</button>;
   if (variant === "danger") return <button style={{ ...base, background: "transparent", color: "#d4183d", border: "1px solid rgba(212,24,61,0.25)" }} onClick={onClick}>{children}</button>;
+}
+
+// Placeholder until the Claude integration lands — both RecoveryScreen and
+// ActiveMonitoringScreen's inline card read from this single mock so there's
+// one source of truth to swap for real ff_recovery data later.
+const MOCK_RECOVERY_SUMMARY = {
+  whatYouWereDoing: "Actively drafting the body paragraphs — you were in a translating phase with a steady typing rhythm.",
+  whereYouLeftOff: "“…artificial intelligence has begun reshaping traditional classroom paradigms, offering personalized learning pathways that adapt to—”",
+  suggestions: [
+    "Continue the sentence you were drafting about AI's personalization capabilities.",
+    "Expand on the point about student engagement metrics from paragraph 2.",
+    "Outline the counterargument section you planned in your objective.",
+    "Review and revise the thesis statement before moving forward.",
+  ],
+};
+
+function RecoverySummaryContent({ summary }) {
+  return (
+    <>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+        <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "11px 12px", border: "1px solid rgba(0,0,0,0.06)" }}>
+          <p style={{ margin: "0 0 5px", fontSize: 11, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>What you were doing</p>
+          <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6 }}>{summary.whatYouWereDoing}</p>
+        </div>
+        <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "11px 12px", border: "1px solid rgba(0,0,0,0.06)" }}>
+          <p style={{ margin: "0 0 5px", fontSize: 11, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>Where you left off</p>
+          <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6, fontStyle: "italic" }}>{summary.whereYouLeftOff}</p>
+        </div>
+      </div>
+      <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Suggested next steps</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+        {summary.suggestions.map((s, i) => (
+          <div key={i} style={{ background: "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${TEAL[100]}`, display: "flex", gap: 8, alignItems: "flex-start" }}>
+            <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[50], border: `1px solid ${TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: TEAL[600] }}>{i + 1}</span>
+            </div>
+            <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
+          </div>
+        ))}
+      </div>
+    </>
+  );
 }
 
 // ─── Screen 1: Task Initialization ───────────────────────────────────────────
@@ -113,16 +173,13 @@ function TaskInitScreen({ onStart }) {
 
   function handleCancelTask() {
     if (typeof chrome !== "undefined" && chrome.storage) {
+      // Send before clearing ff_task — sendToTaskTab needs its tabId.
+      sendToTaskTab({ type: "FF_CANCEL_TASK" });
+
       chrome.storage.local.remove("ff_task");
       chrome.storage.local.remove("ff_session");
       chrome.storage.local.remove("ff_idle");
       chrome.storage.local.remove("ff_interrupted");
-
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
-        }
-      });
     }
 
     setTaskName("");
@@ -224,13 +281,7 @@ function ContextPrepScreen({ setScreen }) {
   useEffect(() => {
     const buildTimer = setTimeout(() => setStage("connecting"), 1300);
     const connectTimer = setTimeout(() => {
-      if (typeof chrome !== "undefined" && chrome.tabs) {
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-          if (tabs[0]?.id) {
-            chrome.tabs.sendMessage(tabs[0].id, { type: "FF_START_TASK" });
-          }
-        });
-      }
+      sendToTaskTab({ type: "FF_START_TASK" });
       setScreen("monitoring");
     }, 2600);
     return () => {
@@ -263,7 +314,11 @@ function ContextPrepScreen({ setScreen }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
+// showDistractionPrompt/setShowDistractionPrompt/promptDismissedRef are lifted
+// up to App and passed in as props — they must survive this component
+// unmounting when navigating to Recovery/Break and remounting on return,
+// otherwise a still-"Distracted" phase immediately re-triggers the modal.
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -275,10 +330,6 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
-  const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
-  // Ref, not state — read inside the storage-poll interval closure, so it
-  // needs to reflect the latest value without waiting for a re-render.
-  const promptDismissedRef = useRef(false);
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -340,7 +391,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
     readStorage();
     const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
-  }, []);
+  }, [promptDismissedRef, setShowDistractionPrompt]);
 
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
@@ -356,12 +407,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
+  // All three responses acknowledge the current distraction episode — none
+  // of them should cause the modal to reappear until the phase leaves
+  // "Distracted" and a new episode begins later.
   function handleGetBackToWork() {
+    promptDismissedRef.current = true;
     setShowDistractionPrompt(false);
+    setHasRecoverySummary(true);
     setScreen("recovery");
   }
 
   function handleTakeBreakFromPrompt() {
+    promptDismissedRef.current = true;
     setShowDistractionPrompt(false);
     setScreen("break");
   }
@@ -393,15 +450,12 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
       setSummary(finishedSummary);
 
       if (typeof chrome !== "undefined" && chrome.storage) {
+        // Send before clearing ff_task — sendToTaskTab needs its tabId.
+        sendToTaskTab({ type: "FF_CANCEL_TASK" });
+
         chrome.storage.local.remove("ff_task");
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
-
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-          if (tabs[0]?.id) {
-            chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
-          }
-        });
       }
 
       setScreen("analytics");
@@ -454,12 +508,6 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
           <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{taskName}</p>
           <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>{objective}</p>
         </div>
-        {/* Recent activity */}
-        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Last paragraph</p>
-        <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", border: "1px solid rgba(0,0,0,0.06)", fontSize: 11, color: "#444", lineHeight: 1.6 }}>
-          "…artificial intelligence has begun reshaping traditional classroom paradigms, offering personalized learning pathways that adapt to—"
-          <span style={{ display: "inline-block", width: 2, height: 12, background: TEAL[400], marginLeft: 2, verticalAlign: "middle", animation: "blink 1s infinite" }} />
-        </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 8 }}>
@@ -499,42 +547,30 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary }) {
 // ─── Screen 4: Recovery Interface ────────────────────────────────────────────
 
 function RecoveryScreen({ setScreen }) {
-  const suggestions = [
-    "Continue the sentence you were drafting about AI's personalization capabilities.",
-    "Expand on the point about student engagement metrics from paragraph 2.",
-    "Outline the counterargument section you planned in your objective.",
-    "Review and revise the thesis statement before moving forward.",
-  ];
+  const [taskName, setTaskName] = useState("");
+  const [objective, setObjective] = useState("");
+
+  useEffect(() => {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        const t = result.ff_task;
+        if (!t) return;
+        setTaskName(t.taskName ?? "");
+        setObjective(t.objective ?? "");
+      });
+    }
+  }, []);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Welcome back!" />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Context summary */}
         <div style={{ background: TEAL[50], borderRadius: 12, padding: "12px 13px", marginBottom: 14, border: `1px solid ${TEAL[100]}` }}>
-          <p style={{ margin: "0 0 3px", fontSize: 12, fontWeight: 700, color: TEAL[800] }}>Research Essay Draft</p>
-          <p style={{ margin: 0, fontSize: 11, color: TEAL[600] }}>Write a 500-word essay on the impact of AI in education.</p>
+          <p style={{ margin: "0 0 3px", fontSize: 12, fontWeight: 700, color: TEAL[800] }}>{taskName || "Untitled task"}</p>
+          <p style={{ margin: 0, fontSize: 11, color: TEAL[600] }}>{objective}</p>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
-          <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "11px 12px", border: "1px solid rgba(0,0,0,0.06)" }}>
-            <p style={{ margin: "0 0 5px", fontSize: 11, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>What you were doing</p>
-            <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6 }}>Actively drafting the body paragraphs — you were in a translating phase with a steady typing rhythm.</p>
-          </div>
-          <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "11px 12px", border: "1px solid rgba(0,0,0,0.06)" }}>
-            <p style={{ margin: "0 0 5px", fontSize: 11, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>Where you left off</p>
-            <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6, fontStyle: "italic" }}>"…artificial intelligence has begun reshaping traditional classroom paradigms, offering personalized learning pathways that adapt to—"</p>
-          </div>
-        </div>
-        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Suggested next steps</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-          {suggestions.map((s, i) => (
-            <div key={i} style={{ background: "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${TEAL[100]}`, display: "flex", gap: 8, alignItems: "flex-start", cursor: "pointer" }}>
-              <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[50], border: `1px solid ${TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
-                <span style={{ fontSize: 9, fontWeight: 700, color: TEAL[600] }}>{i+1}</span>
-              </div>
-              <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
-            </div>
-          ))}
-        </div>
+        <RecoverySummaryContent summary={MOCK_RECOVERY_SUMMARY} />
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
         <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("monitoring")}>
@@ -560,13 +596,7 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
     const breakMs = Date.now() - breakStartRef.current;
 
     // Tell content.js how long this break was so it can accumulate totalBreakMs
-    if (typeof chrome !== "undefined" && chrome.tabs) {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_UPDATE_BREAK_MS", breakMs });
-        }
-      });
-    }
+    sendToTaskTab({ type: "FF_UPDATE_BREAK_MS", breakMs });
 
     setHasRecoverySummary(true);
     setScreen("recovery");
@@ -711,17 +741,27 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
   const screenMap = {
     init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
+      setShowDistractionPrompt(false);
+      promptDismissedRef.current = false;
       if (typeof chrome !== "undefined" && chrome.storage) {
         chrome.storage.local.remove("ff_interrupted");
       }
       setScreen(mode === "resume" ? "monitoring" : "contextPrep");
     }}/>,
     contextPrep: <ContextPrepScreen setScreen={setScreen} />,
-    monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} hasRecoverySummary={hasRecoverySummary} />,
+    monitoring: <ActiveMonitoringScreen
+      setScreen={setScreen}
+      setSummary={setSummary}
+      hasRecoverySummary={hasRecoverySummary}
+      setHasRecoverySummary={setHasRecoverySummary}
+      showDistractionPrompt={showDistractionPrompt}
+      setShowDistractionPrompt={setShowDistractionPrompt}
+      promptDismissedRef={promptDismissedRef}
+    />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
     break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
@@ -739,6 +779,11 @@ export default function App() {
   const [screen, setScreen] = useState("init");
   const [summary, setSummary] = useState(null);
   const [hasRecoverySummary, setHasRecoverySummary] = useState(false);
+  // Lifted here (rather than inside ActiveMonitoringScreen) so the
+  // distraction-prompt acknowledgment survives navigating to Recovery/Break
+  // and back to Monitoring, which otherwise unmounts and remounts that screen.
+  const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
+  const promptDismissedRef = useRef(false);
 
   // On popup open, check storage to decide the correct starting screen:
   // - ff_interrupted = true means the Docs tab was closed mid-session → init with interrupted notice
@@ -773,6 +818,9 @@ export default function App() {
           setSummary={setSummary}
           hasRecoverySummary={hasRecoverySummary}
           setHasRecoverySummary={setHasRecoverySummary}
+          showDistractionPrompt={showDistractionPrompt}
+          setShowDistractionPrompt={setShowDistractionPrompt}
+          promptDismissedRef={promptDismissedRef}
         />
       </div>
     </div>

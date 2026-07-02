@@ -155,7 +155,6 @@ function classifyPhase(scrollFreq) {
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
   // Distracted — away from tab or long idle
-  // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
   if (document.hidden) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
