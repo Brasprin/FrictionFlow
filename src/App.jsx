@@ -382,6 +382,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
   const [condition, setCondition] = useState("intervention");
+  const [distractionCount, setDistractionCount] = useState(0);
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -428,6 +429,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
+          setDistractionCount(s.distractionCount ?? 0);
 
           // Auto-trigger the distraction prompt while the phase reads
           // "Distracted", once per episode — reset once the user leaves
@@ -490,20 +492,23 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       ? Math.floor((Date.now() - sessionStartTime) / 1000)
       : elapsed;
 
-    // Read the last ff_session snapshot to grab totalBreakMs/phaseDurationsMs before we clear storage
-    function buildAndNavigate(totalBreakMs = 0, phaseDurationsMs = {}) {
+    // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
+    function buildAndNavigate(sessionSnapshot = {}) {
       const finishedSummary = {
         taskName,
         condition,
         elapsedSeconds: finalElapsedSeconds,
-        totalBreakMs,
+        totalBreakMs: sessionSnapshot.totalBreakMs ?? 0,
         wordCount: words,
         wpm,
         totalPauses,
         longestPauseMs: longestPause,
         scrollFrequency,
         scrollFrequencyLabel,
-        phaseDurationsMs,
+        phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
+        distractionCount: sessionSnapshot.distractionCount ?? 0,
+        distractionEpisodes: sessionSnapshot.distractionEpisodes ?? [],
+        avgResumptionMs: sessionSnapshot.avgResumptionMs ?? 0,
       };
       setSummary(finishedSummary);
 
@@ -521,10 +526,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.get("ff_session", (result) => {
-        buildAndNavigate(result.ff_session?.totalBreakMs ?? 0, result.ff_session?.phaseDurationsMs ?? {});
+        buildAndNavigate(result.ff_session ?? {});
       });
     } else {
-      buildAndNavigate(0, {});
+      buildAndNavigate({});
     }
   }
 
@@ -541,6 +546,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: `${longestPauseSec}s` },
             { label: "Scroll Frequency", value: `${scrollFrequencyLabel} (${scrollFrequency}/min)` },
+            { label: "Distractions", value: distractionCount },
           ].map(s => (
             <div key={s.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 10px 8px", border: `1px solid ${TEAL[50]}` }}>
               <p style={{ margin: 0, fontSize: 10, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.label}</p>
@@ -723,6 +729,8 @@ function AnalyticsScreen({ setScreen, summary }) {
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
   }
 
+  const avgResumptionSecs = Math.round((s.avgResumptionMs ?? 0) / 1000);
+
   // Stats backed by real tracked data from content.js
   const stats = [
     { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
@@ -731,8 +739,8 @@ function AnalyticsScreen({ setScreen, summary }) {
     { label: "Avg. WPM",      value: s.wpm ?? 0,        icon: "⚡" },
     { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
     { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
-    // NOTE: distraction count and recovery rate aren't tracked by content.js
-    // yet — left out until that's added.
+    { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
+    { label: "Avg. recovery", value: (s.distractionCount ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
   ];
   const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
   const PHASE_ORDER = ["Planning", "Translating", "Reviewing", "Distracted"];
