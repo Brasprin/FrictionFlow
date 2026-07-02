@@ -43,10 +43,19 @@ let burstCount = 0;
 let totalBurstDurationMs = 0;
 let lastCompletedBurstMs = 0;
 
+// Break Variables
+let totalBreakMs = 0;
+
+// Phase Duration Variables — accumulated ms spent in each classified phase
+let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+let currentTrackedPhase = null;
+let phaseSegmentStartTime = null;
+
 // Interval handles — needed so we can clear them on extension context invalidation
 let flushIntervalId = null;
 let pauseIntervalId = null;
 let idleIntervalId = null;
+let phaseIntervalId = null;
 
 
 //------------------- Helper -----------------------------//
@@ -101,9 +110,11 @@ function stopAllTracking() {
   if (flushIntervalId !== null) clearInterval(flushIntervalId);
   if (pauseIntervalId !== null) clearInterval(pauseIntervalId);
   if (idleIntervalId !== null) clearInterval(idleIntervalId);
+  if (phaseIntervalId !== null) clearInterval(phaseIntervalId);
   flushIntervalId = null;
   pauseIntervalId = null;
   idleIntervalId = null;
+  phaseIntervalId = null;
 
   console.log("FrictionFlow: extension context invalidated — tracking stopped. Refresh this tab to resume.");
 }
@@ -144,8 +155,9 @@ function classifyPhase(scrollFreq) {
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
   // Distracted — away from tab or long idle
+  // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
   if (document.hidden) return "Distracted";
-  if (currentPauseSec > 120) return "Distracted";
+  if (currentPauseSec > 5) return "Distracted";
 
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
@@ -158,6 +170,38 @@ function classifyPhase(scrollFreq) {
 
   // Default fallback
   return "Planning";
+}
+
+// Re-classifies the phase and rolls the elapsed time since the last check
+// into the previous phase's running total. Must be called on a fixed
+// interval regardless of typing activity — otherwise a silent pause never
+// gets re-classified (e.g. into "Distracted") because classifyPhase would
+// only ever run inside the activity-gated flush.
+function updatePhaseTracking() {
+  const phase = classifyPhase(rollingScrollFrequency());
+  const now = Date.now();
+
+  if (currentTrackedPhase === null) {
+    currentTrackedPhase = phase;
+    phaseSegmentStartTime = now;
+    return;
+  }
+
+  if (phase !== currentTrackedPhase) {
+    phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+    currentTrackedPhase = phase;
+    phaseSegmentStartTime = now;
+  }
+}
+
+// Returns accumulated phase durations including the in-progress segment,
+// so reads reflect time up to "now" rather than the last phase transition.
+function getPhaseDurationsMsSnapshot() {
+  const snapshot = { ...phaseDurationsMs };
+  if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
+    snapshot[currentTrackedPhase] += Date.now() - phaseSegmentStartTime;
+  }
+  return snapshot;
 }
 
 
@@ -310,6 +354,12 @@ function resetSessionState() {
   burstCount = 0;
   totalBurstDurationMs = 0;
   lastCompletedBurstMs = 0;
+
+  totalBreakMs = 0;
+
+  phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+  currentTrackedPhase = null;
+  phaseSegmentStartTime = null;
 }
 
 function startTracking() {
@@ -365,7 +415,11 @@ function startIntervals() {
       lastCompletedBurstSec: Math.round(lastCompletedBurstMs / 1000),
 
       // Phase
-      currentPhase: classifyPhase(scrollFreq),
+      currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
+      phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+
+      // Breaks
+      totalBreakMs,
 
       lastUpdated: Date.now(),
     };
@@ -387,6 +441,27 @@ function startIntervals() {
       if (!existing) return; // no existing session data, skip
       safeStorageSet({
         ff_session: { ...existing, currentPauseSec }
+      });
+    });
+  }, 2000);
+
+  // Phase re-classification — runs unconditionally so silent pauses still
+  // get re-classified (e.g. into "Distracted") instead of freezing the
+  // phase at whatever it was during the last typing-triggered flush.
+  phaseIntervalId = setInterval(() => {
+    if (!isTracking) return;
+    if (!isExtensionContextValid()) { stopAllTracking(); return; }
+
+    updatePhaseTracking();
+
+    safeStorageGet("ff_session", (result) => {
+      const existing = (result && result.ff_session) ?? {};
+      safeStorageSet({
+        ff_session: {
+          ...existing,
+          currentPhase: currentTrackedPhase,
+          phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+        }
       });
     });
   }, 2000);
@@ -413,6 +488,15 @@ if (isExtensionContextValid()) {
       startTracking();
     } else if (message?.type === "FF_CANCEL_TASK") {
       stopTracking();
+    } else if (message?.type === "FF_UPDATE_BREAK_MS") {
+      totalBreakMs += message.breakMs ?? 0;
+
+      // Write immediately so totalBreakMs isn't lost if the session ends
+      // before the next activity-triggered flush.
+      safeStorageGet("ff_session", (result) => {
+        const existing = (result && result.ff_session) ?? {};
+        safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
+      });
     }
   });
 }

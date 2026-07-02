@@ -6,20 +6,20 @@ const WPM_WINDOW_MS = 30000;              // 60s window for WPM calculation
 const STORAGE_FLUSH_MS = 2000;            // 2s interval to write to storage
 const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
-const BURST_MIN_DURATION_MS = 10000;     // Minimum 10s of activity to consider a burst 
+const BURST_MIN_DURATION_MS = 10000;      // Minimum 10s of activity to consider a burst
 
 
 //------------------- State --------------------------//
 // KeyStroke Variables
 let keyStrokeTimeStamps = [];         // Timestamps of keystrokes for WPM calculation
-let netChars = 0;                    
-let sessionStartTime = Date.now();    
-let lastKeyTime = null;              
-let lastActivityTime = Date.now();   
+let netChars = 0;
+let sessionStartTime = Date.now();
+let lastKeyTime = null;
+let lastActivityTime = Date.now();
 
 // Pause/State Variables
 let totalPauses = 0;
-let longestPauseMs = 0; 
+let longestPauseMs = 0;
 let lastPauseMs = 0;
 let isTyping = false;               // when state change since last flush
 let isTracking = false;             // whether tracking is currently active
@@ -31,17 +31,31 @@ let lastScrollTop = 0;
 let scrollUpCount = 0;
 let scrollDownCount = 0;
 
-// Tab Switch Varibales
-let tabSwitchCount = 0; 
+// Tab Switch Variables
+let tabSwitchCount = 0;
 let lastTabSwitchTime = null;   // currently not used, but may be useful for future analysis of tab switch patterns
 let totalTabAwayMs = 0;
-let tabHiddenAt = null; 
- 
+let tabHiddenAt = null;
+
 // Burst Variables
 let burstStartTime = null;
 let burstCount = 0;
-let totalBurstDurationMs = 0; 
+let totalBurstDurationMs = 0;
 let lastCompletedBurstMs = 0;
+
+// Break Variables
+let totalBreakMs = 0;
+
+// Phase Duration Variables — accumulated ms spent in each classified phase
+let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+let currentTrackedPhase = null;
+let phaseSegmentStartTime = null;
+
+// Interval handles — needed so we can clear them on extension context invalidation
+let flushIntervalId = null;
+let pauseIntervalId = null;
+let idleIntervalId = null;
+let phaseIntervalId = null;
 
 
 //------------------- Helper -----------------------------//
@@ -53,7 +67,7 @@ function rollingWPM() {
   const cutOff = Date.now() - WPM_WINDOW_MS;
   while (keyStrokeTimeStamps.length > 0 && keyStrokeTimeStamps[0] < cutOff) {
     keyStrokeTimeStamps.shift();
-  } 
+  }
   return Math.round(keyStrokeTimeStamps.length / CHARS_PER_WORD);
 }
 
@@ -73,6 +87,66 @@ function getLiveWordCount() {
   return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
 }
 
+// Checks whether the extension's runtime context is still alive.
+// Once the extension is reloaded/updated/disabled, chrome.runtime.id becomes
+// undefined inside any content script that was injected before the reload —
+// any chrome.* API call made after that point throws "Extension context
+// invalidated." This check lets us detect that *before* calling the API.
+function isExtensionContextValid() {
+  try {
+    return !!(chrome && chrome.runtime && chrome.runtime.id);
+  } catch (e) {
+    return false;
+  }
+}
+
+// Stops all tracking: clears every interval and flips isTracking off so any
+// in-flight event listeners (keydown/scroll/visibilitychange) become no-ops.
+// Called once, the first time we detect the extension context has died.
+function stopAllTracking() {
+  if (!isTracking) return; // already stopped, avoid double logging
+  isTracking = false;
+
+  if (flushIntervalId !== null) clearInterval(flushIntervalId);
+  if (pauseIntervalId !== null) clearInterval(pauseIntervalId);
+  if (idleIntervalId !== null) clearInterval(idleIntervalId);
+  if (phaseIntervalId !== null) clearInterval(phaseIntervalId);
+  flushIntervalId = null;
+  pauseIntervalId = null;
+  idleIntervalId = null;
+  phaseIntervalId = null;
+
+  console.log("FrictionFlow: extension context invalidated — tracking stopped. Refresh this tab to resume.");
+}
+
+// Wraps a chrome.storage.local call so that if the extension context has
+// been invalidated, we stop tracking cleanly instead of throwing on every
+// interval tick.
+function safeStorageSet(payload) {
+  if (!isExtensionContextValid()) {
+    stopAllTracking();
+    return;
+  }
+  try {
+    chrome.storage.local.set(payload);
+  } catch (e) {
+    // Context died between the check above and this call — stop here too.
+    stopAllTracking();
+  }
+}
+
+function safeStorageGet(keys, callback) {
+  if (!isExtensionContextValid()) {
+    stopAllTracking();
+    return;
+  }
+  try {
+    chrome.storage.local.get(keys, callback);
+  } catch (e) {
+    stopAllTracking();
+  }
+}
+
 
 //------------------ Phase Detection -------------------//
 function classifyPhase(scrollFreq) {
@@ -81,6 +155,7 @@ function classifyPhase(scrollFreq) {
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
   // Distracted — away from tab or long idle
+  // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
   if (document.hidden) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
@@ -97,18 +172,52 @@ function classifyPhase(scrollFreq) {
   return "Planning";
 }
 
+// Re-classifies the phase and rolls the elapsed time since the last check
+// into the previous phase's running total. Must be called on a fixed
+// interval regardless of typing activity — otherwise a silent pause never
+// gets re-classified (e.g. into "Distracted") because classifyPhase would
+// only ever run inside the activity-gated flush.
+function updatePhaseTracking() {
+  const phase = classifyPhase(rollingScrollFrequency());
+  const now = Date.now();
+
+  if (currentTrackedPhase === null) {
+    currentTrackedPhase = phase;
+    phaseSegmentStartTime = now;
+    return;
+  }
+
+  if (phase !== currentTrackedPhase) {
+    phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+    currentTrackedPhase = phase;
+    phaseSegmentStartTime = now;
+  }
+}
+
+// Returns accumulated phase durations including the in-progress segment,
+// so reads reflect time up to "now" rather than the last phase transition.
+function getPhaseDurationsMsSnapshot() {
+  const snapshot = { ...phaseDurationsMs };
+  if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
+    snapshot[currentTrackedPhase] += Date.now() - phaseSegmentStartTime;
+  }
+  return snapshot;
+}
+
 
 //------------------ Event Listeners ------------------------//
 // Google docs swallows events before they reach the document
 function attachTypingListener() {
   const docsInput = document.querySelector("iframe.docs-texteventtarget-iframe");
-  
+
   if (!docsInput) {
     setTimeout(attachTypingListener, 500);
     return;
   }
 
   docsInput.contentDocument.addEventListener("keydown", (e) => {
+    if (!isTracking) return; // ignore activity once tracking has stopped
+
     const now = Date.now();
 
     if (isPrintable(e.key)) {
@@ -157,15 +266,17 @@ function attachTypingListener() {
 
 function attachScrollListener() {
   const editor = document.querySelector(".kix-appview-editor");
-  
+
   if (!editor) {
     setTimeout(attachScrollListener, 500);
     return;
   }
-  
+
   let scrollDebounceTimer = null;
 
   editor.addEventListener("scroll", () => {
+    if (!isTracking) return; // ignore activity once tracking has stopped
+
     const currentScrollTop = editor.scrollTop;
     const delta = currentScrollTop - lastScrollTop;
 
@@ -179,17 +290,19 @@ function attachScrollListener() {
     lastScrollTop = currentScrollTop;
     lastActivityTime = Date.now();
     isTyping = true; // treat scrolling as activity for idle detection
- 
+
     // Only push timestamp once per scroll burst, not on every raw event
     clearTimeout(scrollDebounceTimer);
     scrollDebounceTimer = setTimeout(() => {
-      scrollTimeStamps.push(Date.now());  
+      scrollTimeStamps.push(Date.now());
     }, 150); // waits 150ms after last scroll before counting
   });
 }
 
 function attachTabSwitchListener() {
   document.addEventListener("visibilitychange", () => {
+    if (!isTracking) return; // ignore activity once tracking has stopped
+
     if (document.hidden) {
       tabSwitchCount++;
       tabHiddenAt = Date.now();
@@ -201,155 +314,191 @@ function attachTabSwitchListener() {
       }
       isTyping = true; // treat returning to tab as activity for idle detection
     }
-  })
+  });
 }
 
-// Periodic flush to chrome.local.storage
-setInterval(() => {
-  if (!isTracking) return;
-  if (!isTyping) return; // Only log if there was activity since last flush
-  isTyping = false;
+function attachListenersOnce() {
+  if (listenerAttached) return;
+  listenerAttached = true;
 
-  const scrollFreq = rollingScrollFrequency(); // to avoid recalculating multiple times during flush
-
-  const payLoad = {
-    // Keystroke
-    wpm: rollingWPM(),
-    wordCount: getLiveWordCount(),
-    elapsedSeconds: elapsedSeconds(),
-    
-    // Pauses
-    totalPauses,
-    longestPauseMs,
-    
-    // Scroll
-    scrollFrequency: scrollFreq,
-    scrollFrequencyLabel: (() => {
-      if (scrollFreq === 0)  return "None";
-      if (scrollFreq < 5)   return "Low";
-      if (scrollFreq < 10)  return "Medium";
-      return "High";
-    })(),
-    
-    // Tab Switching
-    tabSwitchCount,
-    totalTabAwayMs,
-
-    // Bursts
-    currentBurstDurationSec: burstStartTime ? Math.round((Date.now() - burstStartTime) / 1000) : 0,
-    burstCount,
-    avgBurstDurationSec: burstCount > 0 ? Math.round(totalBurstDurationMs / burstCount / 1000) : 0,
-    lastCompletedBurstSec: Math.round(lastCompletedBurstMs / 1000),
-
-    // Phase
-    currentPhase: classifyPhase(scrollFreq),
-
-    lastUpdated: Date.now(),
-  };
-
-  chrome.storage.local.set({ff_session: payLoad});
-}, STORAGE_FLUSH_MS);
-
-// Interval specifically for currentPauseSec, runs regardless of activity
-setInterval(() => {
-  if (!isTracking) return;
-  if (!lastKeyTime) return;
-
-  const currentPauseSec = Math.round((Date.now() - lastKeyTime) / 1000);
-  if (currentPauseSec < 2) return; // don't log very short pauses
-  
-  chrome.storage.local.get("ff_session", (result) => {
-    const existing = result.ff_session;
-    if (!existing) return; // no existing session data, skip
-    chrome.storage.local.set({
-      ff_session: { ...existing, currentPauseSec }
-    });
-  });
-
-  // Tell background to check if user is stuck
-  // if (currentPauseSec >= 90) {
-  //   chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK" });
-  // }
-}, 2000);
-
-// Idle watcher
-setInterval(() => {
-  if (!isTracking) return;
-  const idleTime = Date.now() - lastActivityTime;
-  if (idleTime >= 120000) {
-    chrome.storage.local.set({
-      ff_idle: {duration: idleTime, since: lastActivityTime}
-    });
-  }
-}, 60000);
+  attachTypingListener();
+  attachScrollListener();
+  attachTabSwitchListener();
+}
 
 
-//------------------ Initialization ----------------//
-console.log("FrictionFlow content script active."); // console log for debugging
-
-// Reset all state before starting
-function startTracking() {
-  isTracking = true;
+//------------------ Tracking Lifecycle -------------------//
+function resetSessionState() {
   keyStrokeTimeStamps = [];
   netChars = 0;
   sessionStartTime = Date.now();
   lastKeyTime = null;
   lastActivityTime = Date.now();
+
   totalPauses = 0;
   longestPauseMs = 0;
   lastPauseMs = 0;
   isTyping = false;
+
   scrollTimeStamps = [];
   lastScrollTop = 0;
   scrollUpCount = 0;
   scrollDownCount = 0;
+
   tabSwitchCount = 0;
+  lastTabSwitchTime = null;
   totalTabAwayMs = 0;
   tabHiddenAt = null;
+
   burstStartTime = null;
   burstCount = 0;
   totalBurstDurationMs = 0;
   lastCompletedBurstMs = 0;
 
-  if (!listenerAttached) {
-    attachTypingListener(); // call attach typing listener function
-    attachScrollListener(); // call attach scroll listener function
-    attachTabSwitchListener(); // call attach tab switch listener function
-    listenerAttached = true;
-  }
-  console.log("FrictionFlow tracking started.");
+  totalBreakMs = 0;
+
+  phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+  currentTrackedPhase = null;
+  phaseSegmentStartTime = null;
 }
 
-// Check if a task is already active on load (e.g. page refresh mid-session)
-chrome.storage.local.get("ff_task", (result) => {
-  if (result.ff_task) {
-    startTracking();
-  }
-});
+function startTracking() {
+  resetSessionState();
+  isTracking = true;
+  attachListenersOnce();
+  startIntervals();
+  console.log("FrictionFlow: tracking started.");
+}
 
-// Listen for task start/cancel messages from the popup
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "FF_START_TASK") {
-    startTracking();
-  }
+function stopTracking() {
+  stopAllTracking();
+  console.log("FrictionFlow: tracking cancelled.");
+}
 
-  if (message.type === "FF_CANCEL_TASK") {
-    isTracking = false;  // stops all intervals from writing
-    // reset all state so nothing bleeds into next session
-    keyStrokeTimeStamps = [];
-    netChars = 0;
-    lastKeyTime = null;
-    lastActivityTime = Date.now();
+function startIntervals() {
+  // Periodic flush to chrome.storage.local
+  flushIntervalId = setInterval(() => {
+    if (!isTracking) return;
+    if (!isExtensionContextValid()) { stopAllTracking(); return; }
+    if (!isTyping) return; // Only log if there was activity since last flush
     isTyping = false;
-    totalPauses = 0;
-    longestPauseMs = 0;
-    scrollTimeStamps = [];
-    tabSwitchCount = 0;
-    totalTabAwayMs = 0;
-    burstStartTime = null;
-    burstCount = 0;
-    totalBurstDurationMs = 0;
-    lastCompletedBurstMs = 0;
-    console.log("FrictionFlow tracking cancelled.");
-  }
-});
+
+    const scrollFreq = rollingScrollFrequency(); // to avoid recalculating multiple times during flush
+
+    const payLoad = {
+      // Keystroke
+      wpm: rollingWPM(),
+      wordCount: getLiveWordCount(),
+      elapsedSeconds: elapsedSeconds(),
+
+      // Pauses
+      totalPauses,
+      longestPauseMs,
+
+      // Scroll
+      scrollFrequency: scrollFreq,
+      scrollFrequencyLabel: (() => {
+        if (scrollFreq === 0) return "None";
+        if (scrollFreq < 5)   return "Low";
+        if (scrollFreq < 10)  return "Medium";
+        return "High";
+      })(),
+
+      // Tab Switching
+      tabSwitchCount,
+      totalTabAwayMs,
+
+      // Bursts
+      currentBurstDurationSec: burstStartTime ? Math.round((Date.now() - burstStartTime) / 1000) : 0,
+      burstCount,
+      avgBurstDurationSec: burstCount > 0 ? Math.round(totalBurstDurationMs / burstCount / 1000) : 0,
+      lastCompletedBurstSec: Math.round(lastCompletedBurstMs / 1000),
+
+      // Phase
+      currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
+      phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+
+      // Breaks
+      totalBreakMs,
+
+      lastUpdated: Date.now(),
+    };
+
+    safeStorageSet({ ff_session: payLoad });
+  }, STORAGE_FLUSH_MS);
+
+  // Interval specifically for currentPauseSec, runs regardless of activity
+  pauseIntervalId = setInterval(() => {
+    if (!isTracking) return;
+    if (!isExtensionContextValid()) { stopAllTracking(); return; }
+    if (!lastKeyTime) return;
+
+    const currentPauseSec = Math.round((Date.now() - lastKeyTime) / 1000);
+    if (currentPauseSec < 2) return; // don't log very short pauses
+
+    safeStorageGet("ff_session", (result) => {
+      const existing = result && result.ff_session;
+      if (!existing) return; // no existing session data, skip
+      safeStorageSet({
+        ff_session: { ...existing, currentPauseSec }
+      });
+    });
+  }, 2000);
+
+  // Phase re-classification — runs unconditionally so silent pauses still
+  // get re-classified (e.g. into "Distracted") instead of freezing the
+  // phase at whatever it was during the last typing-triggered flush.
+  phaseIntervalId = setInterval(() => {
+    if (!isTracking) return;
+    if (!isExtensionContextValid()) { stopAllTracking(); return; }
+
+    updatePhaseTracking();
+
+    safeStorageGet("ff_session", (result) => {
+      const existing = (result && result.ff_session) ?? {};
+      safeStorageSet({
+        ff_session: {
+          ...existing,
+          currentPhase: currentTrackedPhase,
+          phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+        }
+      });
+    });
+  }, 2000);
+
+  // Idle watcher
+  idleIntervalId = setInterval(() => {
+    if (!isTracking) return;
+    if (!isExtensionContextValid()) { stopAllTracking(); return; }
+
+    const idleTime = Date.now() - lastActivityTime;
+    if (idleTime >= 120000) {
+      safeStorageSet({
+        ff_idle: { duration: idleTime, since: lastActivityTime }
+      });
+    }
+  }, 60000);
+}
+
+
+//------------------ Messages from popup ------------------------//
+if (isExtensionContextValid()) {
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "FF_START_TASK") {
+      startTracking();
+    } else if (message?.type === "FF_CANCEL_TASK") {
+      stopTracking();
+    } else if (message?.type === "FF_UPDATE_BREAK_MS") {
+      totalBreakMs += message.breakMs ?? 0;
+
+      // Write immediately so totalBreakMs isn't lost if the session ends
+      // before the next activity-triggered flush.
+      safeStorageGet("ff_session", (result) => {
+        const existing = (result && result.ff_session) ?? {};
+        safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
+      });
+    }
+  });
+}
+
+console.log("FrictionFlow content script loaded — waiting for task start."); // console log for debugging

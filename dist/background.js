@@ -4,16 +4,65 @@ const RECOVERY_COOLDOWN_MS = 180000; // 3 minutes before retriggering (doubling 
 let lastRecoveryTime = null;
 let isCallingClaude = false; // prevent concurrent API calls
 
-//------------------ Message Listener ------------------//
+
+//------------------ Side Panel ------------------//
+// Opens the side panel when the toolbar icon is clicked, since manifest.json
+// no longer sets a default_popup. Called unconditionally (not just in
+// onInstalled) so it's re-applied whenever the service worker restarts.
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((error) => console.error("FrictionFlow: sidePanel setup failed", error));
+
+
+//------------------ Install ------------------//
 chrome.runtime.onInstalled.addListener(() => {
   console.log("FrictionFlow installed");
 });
 
+
+//------------------ Message Listener ------------------//
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "FF_CHECK_STUCK") {
     handleStuckCheck();
   }
 });
+
+
+//------------------ Tab Closure / Navigation Detection ------------------//
+// Fires when any tab is closed. If it matches the session tab, mark interrupted.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.local.get("ff_task", (result) => {
+    const task = result.ff_task;
+    if (!task) return;
+
+    if (task.tabId === tabId) {
+      chrome.storage.local.set({ ff_interrupted: true });
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+      console.log("FrictionFlow: session tab closed — marked as interrupted.");
+    }
+  });
+});
+
+// Fires when a tab navigates to a new URL. If the session tab leaves Docs, mark interrupted.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+
+  chrome.storage.local.get("ff_task", (result) => {
+    const task = result.ff_task;
+    if (!task) return;
+    if (task.tabId !== tabId) return;
+
+    const isStillOnDocs = changeInfo.url.startsWith("https://docs.google.com/");
+    if (!isStillOnDocs) {
+      chrome.storage.local.set({ ff_interrupted: true });
+      chrome.storage.local.remove("ff_session");
+      chrome.storage.local.remove("ff_idle");
+      console.log("FrictionFlow: session tab left Docs — marked as interrupted.");
+    }
+  });
+});
+
 
 //------------------ Stuck Detection -------------------//
 async function handleStuckCheck() {
@@ -50,6 +99,7 @@ async function handleStuckCheck() {
   }
 }
 
+
 //------------------ Claude API Call -------------------//
 async function callClaude(session, task) {
   const prompt = `You are helping a writer who is stuck. Analyze their behavioral data and writing goal, then provide recovery guidance.
@@ -85,7 +135,7 @@ Respond ONLY with a JSON object in this exact format, no markdown, no preamble:
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": "",  // TODO: Insert your Anthropic API key here 
+      "x-api-key": "",  // TODO: Insert your Anthropic API key here
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
