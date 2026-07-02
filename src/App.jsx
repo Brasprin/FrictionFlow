@@ -122,6 +122,9 @@ function TaskInitScreen({ onStart }) {
   const [objective, setObjective] = useState("");
   const [isActive, setIsActive] = useState(false);
   const [isInterrupted, setIsInterrupted] = useState(false);
+  // "baseline" = no recovery prompts (control condition); "intervention" =
+  // recovery prompts enabled. This is the study's independent variable.
+  const [condition, setCondition] = useState("intervention");
 
   const templates = [
     { name: "Research Essay", obj: "Write a 500-word essay on the impact of AI in education." },
@@ -136,6 +139,7 @@ function TaskInitScreen({ onStart }) {
         if (!t) return;
         setTaskName(t.taskName ?? "");
         setObjective(t.objective ?? "");
+        setCondition(t.condition ?? "intervention");
         setIsActive(true);
         if (result.ff_interrupted) setIsInterrupted(true);
       });
@@ -152,6 +156,7 @@ function TaskInitScreen({ onStart }) {
         const taskMetadata = {
           taskName,
           objective,
+          condition,
           sessionStartTime: Date.now(),
           tabId, // stored so background.js can detect if this specific tab closes
         };
@@ -206,6 +211,26 @@ function TaskInitScreen({ onStart }) {
           rows={3}
           style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
+        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Session condition</p>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          <button
+            onClick={() => !isActive && setCondition("baseline")}
+            disabled={isActive}
+            style={{ flex: 1, textAlign: "center", cursor: isActive ? "default" : "pointer", borderRadius: 8, padding: "8px 10px", fontSize: 12, fontWeight: 600, border: `1px solid ${condition === "baseline" ? TEAL[400] : "rgba(0,0,0,0.12)"}`, background: condition === "baseline" ? TEAL[50] : "#FAFAFA", color: condition === "baseline" ? TEAL[800] : "#717182" }}>
+            Baseline
+          </button>
+          <button
+            onClick={() => !isActive && setCondition("intervention")}
+            disabled={isActive}
+            style={{ flex: 1, textAlign: "center", cursor: isActive ? "default" : "pointer", borderRadius: 8, padding: "8px 10px", fontSize: 12, fontWeight: 600, border: `1px solid ${condition === "intervention" ? TEAL[400] : "rgba(0,0,0,0.12)"}`, background: condition === "intervention" ? TEAL[50] : "#FAFAFA", color: condition === "intervention" ? TEAL[800] : "#717182" }}>
+            Intervention
+          </button>
+        </div>
+        <p style={{ margin: "-8px 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>
+          {condition === "baseline"
+            ? "No recovery prompts will appear — behavioral data is still logged."
+            : "Recovery prompts appear when inactivity is detected."}
+        </p>
         {!isActive && (
           <>
             <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Quick templates</p>
@@ -330,6 +355,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
+  const [condition, setCondition] = useState("intervention");
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -365,6 +391,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           if (t) {
             setTaskName(t.taskName ?? "");
             setObjective(t.objective ?? "");
+            setCondition(t.condition ?? "intervention");
           }
 
           if (!s) return;
@@ -378,9 +405,13 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
           // Auto-trigger the distraction prompt while the phase reads
           // "Distracted", once per episode — reset once the user leaves
-          // that state (whether on their own or via the prompt).
+          // that state (whether on their own or via the prompt). Behavioral
+          // logging (phase classification) runs identically in both
+          // conditions — only the baseline condition suppresses the prompt
+          // itself, since that's the study's independent variable.
+          const isBaseline = (t?.condition ?? "intervention") === "baseline";
           if (s.currentPhase === "Distracted") {
-            if (!promptDismissedRef.current) setShowDistractionPrompt(true);
+            if (!isBaseline && !promptDismissedRef.current) setShowDistractionPrompt(true);
           } else {
             promptDismissedRef.current = false;
             setShowDistractionPrompt(false);
@@ -437,6 +468,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     function buildAndNavigate(totalBreakMs = 0, phaseDurationsMs = {}) {
       const finishedSummary = {
         taskName,
+        condition,
         elapsedSeconds: finalElapsedSeconds,
         totalBreakMs,
         wordCount: words,
@@ -472,7 +504,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", position: "relative" }}>
-      <SidePanelHeader title="FrictionFlow" subtitle={taskName} status={currentPhase} />
+      <SidePanelHeader title="FrictionFlow" subtitle={condition === "baseline" ? `${taskName} · Baseline` : taskName} status={currentPhase} />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         {/* Live stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
@@ -595,11 +627,24 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
   function handleContinue() {
     const breakMs = Date.now() - breakStartRef.current;
 
-    // Tell content.js how long this break was so it can accumulate totalBreakMs
+    // Tell content.js how long this break was so it can accumulate
+    // totalBreakMs — logged in both conditions, this isn't the prompt itself.
     sendToTaskTab({ type: "FF_UPDATE_BREAK_MS", breakMs });
 
-    setHasRecoverySummary(true);
-    setScreen("recovery");
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        const isBaseline = (result.ff_task?.condition ?? "intervention") === "baseline";
+        if (isBaseline) {
+          setScreen("monitoring");
+        } else {
+          setHasRecoverySummary(true);
+          setScreen("recovery");
+        }
+      });
+    } else {
+      setHasRecoverySummary(true);
+      setScreen("recovery");
+    }
   }
   const activities = ["🧘 Breathe slowly", "🚶 Take a short walk", "💧 Drink some water", "👁 Rest your eyes"];
   return (
@@ -691,7 +736,9 @@ function AnalyticsScreen({ setScreen, summary }) {
           </svg>
         </div>
         <p style={{ margin: "0 0 2px", fontSize: 13, fontWeight: 700, color: "#030213" }}>Session complete!</p>
-        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>{s.taskName || "Untitled task"}</p>
+        <p style={{ margin: 0, fontSize: 11, color: "#717182" }}>
+          {s.taskName || "Untitled task"}{s.condition && ` · ${s.condition === "baseline" ? "Baseline" : "Intervention"}`}
+        </p>
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
