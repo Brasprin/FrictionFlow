@@ -56,6 +56,7 @@ function TaskInitScreen({ onStart }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [isActive, setIsActive] = useState(false);
+  const [isInterrupted, setIsInterrupted] = useState(false);
 
   const templates = [
     { name: "Research Essay", obj: "Write a 500-word essay on the impact of AI in education." },
@@ -65,41 +66,46 @@ function TaskInitScreen({ onStart }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get("ff_task", (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
         const t = result.ff_task;
         if (!t) return;
         setTaskName(t.taskName ?? "");
         setObjective(t.objective ?? "");
-        setIsActive(true); 
-      })
+        setIsActive(true);
+        if (result.ff_interrupted) setIsInterrupted(true);
+      });
     }
   }, []);
 
   function handleStartTask() {
     if (!taskName.trim()) return;
 
-    const taskMetadata = {
-      taskName, 
-      objective,
-      sessionStartTime: Date.now(),
-    };
-
     if (typeof chrome !== "undefined" && chrome.storage) {
-      // save metadata and clear previous data sessions
-      chrome.storage.local.set({ ff_task: taskMetadata });
-      chrome.storage.local.remove("ff_session");
-      chrome.storage.local.remove("ff_idle");
-
-      // Tell content script to start tracking
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_START_TASK" });
+        const tabId = tabs[0]?.id ?? null;
+
+        const taskMetadata = {
+          taskName,
+          objective,
+          sessionStartTime: Date.now(),
+          tabId, // stored so background.js can detect if this specific tab closes
+        };
+
+        // save metadata and clear previous data sessions
+        chrome.storage.local.set({ ff_task: taskMetadata });
+        chrome.storage.local.remove("ff_session");
+        chrome.storage.local.remove("ff_idle");
+        chrome.storage.local.remove("ff_interrupted");
+
+        // Tell content script to start tracking
+        if (tabId) {
+          chrome.tabs.sendMessage(tabId, { type: "FF_START_TASK" });
         }
       });
     }
 
     setIsActive(true);
-    onStart();  // navigates to active monitoring screen
+    onStart(); // navigates to active monitoring screen
   }
 
   function handleCancelTask() {
@@ -107,14 +113,15 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_task");
       chrome.storage.local.remove("ff_session");
       chrome.storage.local.remove("ff_idle");
-    
+      chrome.storage.local.remove("ff_interrupted");
+
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs[0]?.id) {
-        chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
-      }
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: "FF_CANCEL_TASK" });
+        }
       });
     }
-    
+
     setTaskName("");
     setObjective("");
     setIsActive(false);
@@ -153,9 +160,17 @@ function TaskInitScreen({ onStart }) {
             </div>
           </>
         )}
-        {isActive && (
+        {isActive && !isInterrupted && (
           <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
             <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>Session is active. Cancel to start a new task.</p>
+          </div>
+        )}
+        {isInterrupted && (
+          <div style={{ background: "#FFF8F0", borderRadius: 10, padding: "10px 12px", border: "1px solid #FDDCB5", marginBottom: 14 }}>
+            <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Session interrupted</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+              Your Google Docs tab was closed before the session finished. You can reopen the doc and resume, or cancel to start fresh.
+            </p>
           </div>
         )}
       </div>
@@ -163,10 +178,10 @@ function TaskInitScreen({ onStart }) {
         {isActive ? (
           <>
             <Btn variant="primary" style={{ width: "100%" }} onClick={onStart}>
-              Resume session →
+              {isInterrupted ? "Resume session →" : "Resume session →"}
             </Btn>
             <Btn variant="danger" style={{ width: "100%" }} onClick={handleCancelTask}>
-              Cancel session
+              {isInterrupted ? "Discard session" : "Cancel session"}
             </Btn>
           </>
         ) : (
@@ -554,7 +569,13 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary }) {
   const screenMap = {
-    init: <TaskInitScreen onStart={() => { setHasRecoverySummary(false); setScreen("monitoring"); }}/>,
+    init: <TaskInitScreen onStart={() => {
+      setHasRecoverySummary(false);
+      if (typeof chrome !== "undefined" && chrome.storage) {
+        chrome.storage.local.remove("ff_interrupted");
+      }
+      setScreen("monitoring");
+    }}/>,
     monitoring: <ActiveMonitoringScreen setScreen={setScreen} setSummary={setSummary} hasRecoverySummary={hasRecoverySummary} />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
     break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
@@ -574,14 +595,16 @@ export default function App() {
   const [summary, setSummary] = useState(null);
   const [hasRecoverySummary, setHasRecoverySummary] = useState(false);
 
-  // On popup open, check if a session is already active.
-  // ff_task exists in storage if and only if a session was started and not yet
-  // finished/cancelled — so if we find it, jump straight to monitoring instead
-  // of showing the init/setup screen.
+  // On popup open, check storage to decide the correct starting screen:
+  // - ff_interrupted = true means the Docs tab was closed mid-session → init with interrupted notice
+  // - ff_task exists (no interruption) → active session, go straight to monitoring
+  // - neither → fresh start, stay on init
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get("ff_task", (result) => {
-        if (result.ff_task) {
+      chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
+        if (result.ff_interrupted) {
+          setScreen("init"); // TaskInitScreen reads ff_task and ff_interrupted to show the right UI
+        } else if (result.ff_task) {
           setScreen("monitoring");
         }
       });
