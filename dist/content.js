@@ -51,6 +51,13 @@ let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 
 let currentTrackedPhase = null;
 let phaseSegmentStartTime = null;
 
+// Distraction Episode Variables — one entry per completed "Distracted" phase
+// episode: { startedAt, endedAt, durationMs, trigger, resumptionMs }.
+// resumptionMs is the time from returning to the doc until typing resumed
+// (for tab-away episodes) or the full episode length (for idle episodes).
+let distractionEpisodes = [];
+let activeDistraction = null; // { startedAt, trigger, returnedAt } while an episode is ongoing
+
 // Interval handles — needed so we can clear them on extension context invalidation
 let flushIntervalId = null;
 let pauseIntervalId = null;
@@ -157,7 +164,7 @@ function classifyPhase(scrollFreq) {
   // Distracted — away from tab or long idle
   // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
   if (document.hidden) return "Distracted";
-  if (currentPauseSec > 120) return "Distracted";
+  if (currentPauseSec > 2) return "Distracted";
 
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
@@ -184,14 +191,50 @@ function updatePhaseTracking() {
   if (currentTrackedPhase === null) {
     currentTrackedPhase = phase;
     phaseSegmentStartTime = now;
+    if (phase === "Distracted") startDistractionEpisode(now);
     return;
   }
 
   if (phase !== currentTrackedPhase) {
     phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+
+    // Episode bookkeeping on the Distracted boundary (check before
+    // reassigning currentTrackedPhase — it still holds the previous phase).
+    if (phase === "Distracted") {
+      startDistractionEpisode(now);
+    } else if (currentTrackedPhase === "Distracted") {
+      finalizeDistractionEpisode(now);
+    }
+
     currentTrackedPhase = phase;
     phaseSegmentStartTime = now;
   }
+}
+
+function startDistractionEpisode(now) {
+  if (activeDistraction) return;
+  activeDistraction = {
+    startedAt: now,
+    trigger: document.hidden ? "tab-away" : "idle",
+    returnedAt: null,
+  };
+}
+
+// Called when the phase leaves "Distracted" — which only happens once the
+// user types again (or scrolls enough), so `now` marks task resumption.
+function finalizeDistractionEpisode(now) {
+  if (!activeDistraction) return;
+  const ep = activeDistraction;
+  distractionEpisodes.push({
+    startedAt: ep.startedAt,
+    endedAt: now,
+    durationMs: now - ep.startedAt,
+    trigger: ep.trigger,
+    // For tab-away episodes measure from the moment they came back to the
+    // doc; for idle episodes the user never left, so use the full episode.
+    resumptionMs: ep.trigger === "tab-away" && ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
+  });
+  activeDistraction = null;
 }
 
 // Returns accumulated phase durations including the in-progress segment,
@@ -202,6 +245,12 @@ function getPhaseDurationsMsSnapshot() {
     snapshot[currentTrackedPhase] += Date.now() - phaseSegmentStartTime;
   }
   return snapshot;
+}
+
+function getAvgResumptionMs() {
+  if (distractionEpisodes.length === 0) return 0;
+  const total = distractionEpisodes.reduce((sum, ep) => sum + ep.resumptionMs, 0);
+  return Math.round(total / distractionEpisodes.length);
 }
 
 
@@ -312,6 +361,11 @@ function attachTabSwitchListener() {
         totalTabAwayMs += Date.now() - tabHiddenAt;
         tabHiddenAt = null;
       }
+      // Mark when the user came back to the doc so resumptionMs can measure
+      // return-to-doc → typing-resumed, not the whole time away.
+      if (activeDistraction && activeDistraction.trigger === "tab-away" && activeDistraction.returnedAt === null) {
+        activeDistraction.returnedAt = Date.now();
+      }
       isTyping = true; // treat returning to tab as activity for idle detection
     }
   });
@@ -360,6 +414,9 @@ function resetSessionState() {
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
   phaseSegmentStartTime = null;
+
+  distractionEpisodes = [];
+  activeDistraction = null;
 }
 
 function startTracking() {
@@ -368,6 +425,39 @@ function startTracking() {
   attachListenersOnce();
   startIntervals();
   console.log("FrictionFlow: tracking started.");
+}
+
+// Resumes tracking in a freshly injected content script (tab refresh,
+// extension reload, or doc reopened after an interruption) by restoring
+// accumulated counters from the last ff_session snapshot, so the session
+// continues instead of restarting from zero. Callers must check isTracking
+// first — if tracking is already alive, resuming would be a data-losing reset.
+function resumeTracking(snapshot, task) {
+  resetSessionState();
+
+  // Keep the original session anchor so elapsed time stays continuous.
+  if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
+
+  if (snapshot) {
+    netChars = (snapshot.wordCount ?? 0) * CHARS_PER_WORD;
+    totalPauses = snapshot.totalPauses ?? 0;
+    longestPauseMs = snapshot.longestPauseMs ?? 0;
+    tabSwitchCount = snapshot.tabSwitchCount ?? 0;
+    totalTabAwayMs = snapshot.totalTabAwayMs ?? 0;
+    burstCount = snapshot.burstCount ?? 0;
+    totalBurstDurationMs = (snapshot.avgBurstDurationSec ?? 0) * 1000 * burstCount;
+    lastCompletedBurstMs = (snapshot.lastCompletedBurstSec ?? 0) * 1000;
+    totalBreakMs = snapshot.totalBreakMs ?? 0;
+    if (snapshot.phaseDurationsMs) {
+      phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
+    }
+    distractionEpisodes = snapshot.distractionEpisodes ?? [];
+  }
+
+  isTracking = true;
+  attachListenersOnce();
+  startIntervals();
+  console.log("FrictionFlow: tracking resumed from stored session snapshot.");
 }
 
 function stopTracking() {
@@ -418,6 +508,11 @@ function startIntervals() {
       currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
       phaseDurationsMs: getPhaseDurationsMsSnapshot(),
 
+      // Distraction episodes
+      distractionCount: distractionEpisodes.length,
+      distractionEpisodes,
+      avgResumptionMs: getAvgResumptionMs(),
+
       // Breaks
       totalBreakMs,
 
@@ -461,6 +556,9 @@ function startIntervals() {
           ...existing,
           currentPhase: currentTrackedPhase,
           phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+          distractionCount: distractionEpisodes.length,
+          distractionEpisodes,
+          avgResumptionMs: getAvgResumptionMs(),
         }
       });
     });
@@ -486,6 +584,14 @@ if (isExtensionContextValid()) {
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "FF_START_TASK") {
       startTracking();
+    } else if (message?.type === "FF_RESUME_TASK") {
+      // No-op if tracking is already alive — only a freshly injected script
+      // (which starts with isTracking = false) needs to restore and restart.
+      if (!isTracking) {
+        safeStorageGet(["ff_session", "ff_task"], (result) => {
+          resumeTracking(result?.ff_session, result?.ff_task);
+        });
+      }
     } else if (message?.type === "FF_CANCEL_TASK") {
       stopTracking();
     } else if (message?.type === "FF_UPDATE_BREAK_MS") {

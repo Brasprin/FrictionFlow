@@ -2,7 +2,7 @@
 
 // Logs behavioral data to chrome.storage.local
 const PAUSE_THRESHOLD_MS = 30000;         // gap > 30s = pause
-const WPM_WINDOW_MS = 30000;              // 60s window for WPM calculation
+const WPM_WINDOW_MS = 30000;              // rolling window for WPM calculation
 const STORAGE_FLUSH_MS = 2000;            // 2s interval to write to storage
 const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
@@ -45,11 +45,19 @@ let lastCompletedBurstMs = 0;
 
 // Break Variables
 let totalBreakMs = 0;
+let isOnBreak = false;   // phase/episode tracking is suspended while true
 
 // Phase Duration Variables — accumulated ms spent in each classified phase
 let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
 let currentTrackedPhase = null;
 let phaseSegmentStartTime = null;
+
+// Distraction Episode Variables — one entry per completed "Distracted" phase
+// episode: { startedAt, endedAt, durationMs, trigger, resumptionMs }.
+// resumptionMs is the time from returning to the doc until typing resumed
+// (for tab-away episodes) or the full episode length (for idle episodes).
+let distractionEpisodes = [];
+let activeDistraction = null; // { startedAt, trigger, returnedAt } while an episode is ongoing
 
 // Interval handles — needed so we can clear them on extension context invalidation
 let flushIntervalId = null;
@@ -68,7 +76,9 @@ function rollingWPM() {
   while (keyStrokeTimeStamps.length > 0 && keyStrokeTimeStamps[0] < cutOff) {
     keyStrokeTimeStamps.shift();
   }
-  return Math.round(keyStrokeTimeStamps.length / CHARS_PER_WORD);
+  // Normalize words-in-window to a per-minute rate — without the 60s/window
+  // factor this reported words-per-30s as WPM (half the real value).
+  return Math.round((keyStrokeTimeStamps.length / CHARS_PER_WORD) * (60000 / WPM_WINDOW_MS));
 }
 
 function rollingScrollFrequency() {
@@ -155,9 +165,9 @@ function classifyPhase(scrollFreq) {
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
   // Distracted — away from tab or long idle
-  // TODO revert: threshold temporarily dropped from 120 to 5 for manual testing
+  // TODO revert: threshold temporarily dropped from 120 to 2 for manual testing
   if (document.hidden) return "Distracted";
-  if (currentPauseSec > 5) return "Distracted";
+  if (currentPauseSec > 2) return "Distracted";
 
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
@@ -184,14 +194,50 @@ function updatePhaseTracking() {
   if (currentTrackedPhase === null) {
     currentTrackedPhase = phase;
     phaseSegmentStartTime = now;
+    if (phase === "Distracted") startDistractionEpisode(now);
     return;
   }
 
   if (phase !== currentTrackedPhase) {
     phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+
+    // Episode bookkeeping on the Distracted boundary (check before
+    // reassigning currentTrackedPhase — it still holds the previous phase).
+    if (phase === "Distracted") {
+      startDistractionEpisode(now);
+    } else if (currentTrackedPhase === "Distracted") {
+      finalizeDistractionEpisode(now);
+    }
+
     currentTrackedPhase = phase;
     phaseSegmentStartTime = now;
   }
+}
+
+function startDistractionEpisode(now) {
+  if (activeDistraction) return;
+  activeDistraction = {
+    startedAt: now,
+    trigger: document.hidden ? "tab-away" : "idle",
+    returnedAt: null,
+  };
+}
+
+// Called when the phase leaves "Distracted" — which only happens once the
+// user types again (or scrolls enough), so `now` marks task resumption.
+function finalizeDistractionEpisode(now) {
+  if (!activeDistraction) return;
+  const ep = activeDistraction;
+  distractionEpisodes.push({
+    startedAt: ep.startedAt,
+    endedAt: now,
+    durationMs: now - ep.startedAt,
+    trigger: ep.trigger,
+    // For tab-away episodes measure from the moment they came back to the
+    // doc; for idle episodes the user never left, so use the full episode.
+    resumptionMs: ep.trigger === "tab-away" && ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
+  });
+  activeDistraction = null;
 }
 
 // Returns accumulated phase durations including the in-progress segment,
@@ -202,6 +248,12 @@ function getPhaseDurationsMsSnapshot() {
     snapshot[currentTrackedPhase] += Date.now() - phaseSegmentStartTime;
   }
   return snapshot;
+}
+
+function getAvgResumptionMs() {
+  if (distractionEpisodes.length === 0) return 0;
+  const total = distractionEpisodes.reduce((sum, ep) => sum + ep.resumptionMs, 0);
+  return Math.round(total / distractionEpisodes.length);
 }
 
 
@@ -312,6 +364,11 @@ function attachTabSwitchListener() {
         totalTabAwayMs += Date.now() - tabHiddenAt;
         tabHiddenAt = null;
       }
+      // Mark when the user came back to the doc so resumptionMs can measure
+      // return-to-doc → typing-resumed, not the whole time away.
+      if (activeDistraction && activeDistraction.trigger === "tab-away" && activeDistraction.returnedAt === null) {
+        activeDistraction.returnedAt = Date.now();
+      }
       isTyping = true; // treat returning to tab as activity for idle detection
     }
   });
@@ -356,10 +413,14 @@ function resetSessionState() {
   lastCompletedBurstMs = 0;
 
   totalBreakMs = 0;
+  isOnBreak = false;
 
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
   phaseSegmentStartTime = null;
+
+  distractionEpisodes = [];
+  activeDistraction = null;
 }
 
 function startTracking() {
@@ -370,9 +431,80 @@ function startTracking() {
   console.log("FrictionFlow: tracking started.");
 }
 
+// Resumes tracking in a freshly injected content script (tab refresh,
+// extension reload, or doc reopened after an interruption) by restoring
+// accumulated counters from the last ff_session snapshot, so the session
+// continues instead of restarting from zero. Callers must check isTracking
+// first — if tracking is already alive, resuming would be a data-losing reset.
+function resumeTracking(snapshot, task) {
+  resetSessionState();
+
+  // Keep the original session anchor so elapsed time stays continuous.
+  if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
+
+  if (snapshot) {
+    netChars = (snapshot.wordCount ?? 0) * CHARS_PER_WORD;
+    totalPauses = snapshot.totalPauses ?? 0;
+    longestPauseMs = snapshot.longestPauseMs ?? 0;
+    tabSwitchCount = snapshot.tabSwitchCount ?? 0;
+    totalTabAwayMs = snapshot.totalTabAwayMs ?? 0;
+    burstCount = snapshot.burstCount ?? 0;
+    totalBurstDurationMs = (snapshot.avgBurstDurationSec ?? 0) * 1000 * burstCount;
+    lastCompletedBurstMs = (snapshot.lastCompletedBurstSec ?? 0) * 1000;
+    totalBreakMs = snapshot.totalBreakMs ?? 0;
+    if (snapshot.phaseDurationsMs) {
+      phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
+    }
+    distractionEpisodes = snapshot.distractionEpisodes ?? [];
+  }
+
+  isTracking = true;
+  attachListenersOnce();
+  startIntervals();
+  console.log("FrictionFlow: tracking resumed from stored session snapshot.");
+}
+
 function stopTracking() {
   stopAllTracking();
   console.log("FrictionFlow: tracking cancelled.");
+}
+
+// A sanctioned break suspends phase/episode tracking so break time doesn't
+// pollute the behavioral data (Distracted time, episodes, pauses) — per the
+// paper, the system is "in a paused state" during break mode.
+function startBreak() {
+  if (!isTracking || isOnBreak) return;
+  isOnBreak = true;
+
+  const now = Date.now();
+  // Close out the current phase segment so break time isn't attributed to it.
+  if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
+    phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+  }
+  currentTrackedPhase = null;
+  phaseSegmentStartTime = null;
+
+  // If a distraction episode led into this break, it ends here — the user
+  // responded to it by taking a sanctioned break, not by disengaging further.
+  finalizeDistractionEpisode(now);
+}
+
+function endBreak(breakMs) {
+  if (!isOnBreak) return;
+  isOnBreak = false;
+  totalBreakMs += breakMs ?? 0;
+
+  // Don't let the break gap read as a typing pause, an idle stretch, or a
+  // continuing burst once tracking resumes.
+  lastKeyTime = null;
+  burstStartTime = null;
+  lastActivityTime = Date.now();
+
+  // Persist immediately — the user may finish the session before typing again.
+  safeStorageGet("ff_session", (result) => {
+    const existing = (result && result.ff_session) ?? {};
+    safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
+  });
 }
 
 function startIntervals() {
@@ -418,6 +550,11 @@ function startIntervals() {
       currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
       phaseDurationsMs: getPhaseDurationsMsSnapshot(),
 
+      // Distraction episodes
+      distractionCount: distractionEpisodes.length,
+      distractionEpisodes,
+      avgResumptionMs: getAvgResumptionMs(),
+
       // Breaks
       totalBreakMs,
 
@@ -450,6 +587,7 @@ function startIntervals() {
   // phase at whatever it was during the last typing-triggered flush.
   phaseIntervalId = setInterval(() => {
     if (!isTracking) return;
+    if (isOnBreak) return; // suspended during sanctioned breaks
     if (!isExtensionContextValid()) { stopAllTracking(); return; }
 
     updatePhaseTracking();
@@ -461,6 +599,9 @@ function startIntervals() {
           ...existing,
           currentPhase: currentTrackedPhase,
           phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+          distractionCount: distractionEpisodes.length,
+          distractionEpisodes,
+          avgResumptionMs: getAvgResumptionMs(),
         }
       });
     });
@@ -486,17 +627,25 @@ if (isExtensionContextValid()) {
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "FF_START_TASK") {
       startTracking();
+    } else if (message?.type === "FF_RESUME_TASK") {
+      if (isTracking) {
+        // Panel may have been closed mid-break; the UI is back at monitoring,
+        // so make sure tracking isn't still suspended (the exact break length
+        // is unrecoverable in that case — endBreak(0) just unpauses).
+        endBreak(0);
+      } else {
+        // Freshly injected script (isTracking starts false) — restore
+        // counters from the last snapshot and restart tracking.
+        safeStorageGet(["ff_session", "ff_task"], (result) => {
+          resumeTracking(result?.ff_session, result?.ff_task);
+        });
+      }
     } else if (message?.type === "FF_CANCEL_TASK") {
       stopTracking();
-    } else if (message?.type === "FF_UPDATE_BREAK_MS") {
-      totalBreakMs += message.breakMs ?? 0;
-
-      // Write immediately so totalBreakMs isn't lost if the session ends
-      // before the next activity-triggered flush.
-      safeStorageGet("ff_session", (result) => {
-        const existing = (result && result.ff_session) ?? {};
-        safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
-      });
+    } else if (message?.type === "FF_BREAK_START") {
+      startBreak();
+    } else if (message?.type === "FF_BREAK_END") {
+      endBreak(message.breakMs ?? 0);
     }
   });
 }
