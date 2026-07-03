@@ -160,14 +160,26 @@ function TaskInitScreen({ onStart }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft"], (result) => {
         const t = result.ff_task;
-        if (!t) return;
-        setTaskName(t.taskName ?? "");
-        setObjective(t.objective ?? "");
-        setCondition(t.condition ?? "intervention");
-        setIsActive(true);
-        if (result.ff_interrupted) setIsInterrupted(true);
+        if (t) {
+          setTaskName(t.taskName ?? "");
+          setObjective(t.objective ?? "");
+          setCondition(t.condition ?? "intervention");
+          setIsActive(true);
+          if (result.ff_interrupted) setIsInterrupted(true);
+          return;
+        }
+        // No active session, but a draft left over from a failed connection
+        // attempt — prefill the form and consume the draft so it doesn't
+        // resurface in unrelated future sessions.
+        const d = result.ff_draft;
+        if (d) {
+          setTaskName(d.taskName ?? "");
+          setObjective(d.objective ?? "");
+          setCondition(d.condition ?? "intervention");
+          chrome.storage.local.remove("ff_draft");
+        }
       });
     }
   }, []);
@@ -187,19 +199,24 @@ function TaskInitScreen({ onStart }) {
           tabId, // stored so background.js can detect if this specific tab closes
         };
 
-        // save metadata and clear previous data sessions
-        chrome.storage.local.set({ ff_task: taskMetadata });
+        // clear previous session data
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
 
-        // FF_START_TASK is sent by ContextPrepScreen once the prep animation
-        // finishes — tracking shouldn't begin until context prep completes.
+        // Navigate only after ff_task is persisted — ContextPrepScreen reads
+        // it on mount, and navigating before the write landed made it show
+        // "Untitled task". FF_START_TASK is sent by ContextPrepScreen once
+        // the prep sequence completes.
+        chrome.storage.local.set({ ff_task: taskMetadata }, () => {
+          setIsActive(true);
+          onStart("fresh");
+        });
       });
+    } else {
+      setIsActive(true);
+      onStart("fresh");
     }
-
-    setIsActive(true);
-    onStart("fresh"); // navigates to context preparation screen
   }
 
   function handleCancelTask() {
@@ -312,7 +329,7 @@ function ContextPrepScreen({ setScreen }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [startTime, setStartTime] = useState(null);
-  const [stage, setStage] = useState("building"); // "building" -> "connecting"
+  const [stage, setStage] = useState("building"); // "building" | "connecting" | "error"
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
@@ -326,20 +343,77 @@ function ContextPrepScreen({ setScreen }) {
     }
   }, []);
 
-  // Simulated build → connect sequence, then hand off to content.js to
-  // actually start tracking. Tracking intentionally begins here rather than
-  // at "Start Task", since context prep is meant to complete first.
+  // The "connecting" stage is a real delivery check: FF_START_TASK must be
+  // received by the content script in the Docs tab before we proceed to
+  // monitoring. If it isn't (not a Docs tab, or the tab wasn't refreshed
+  // after an extension reload), show an error instead of silently starting
+  // a dead session that would log nothing.
+  function connectToDocs() {
+    setStage("connecting");
+
+    if (typeof chrome === "undefined" || !chrome.tabs || !chrome.storage) {
+      setScreen("monitoring"); // plain-browser dev preview, nothing to connect to
+      return;
+    }
+
+    // Re-resolve the target tab on every attempt. The tabId stored at
+    // "Start Task" is whatever tab was active at that moment — if that
+    // wasn't the doc (the usual reason for landing in the error state),
+    // retrying against the same wrong tab would fail forever. If the user
+    // is on a Docs tab now, adopt it as the session tab.
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const active = tabs[0];
+      const isDocsTab = !!active?.url?.startsWith("https://docs.google.com/");
+      chrome.storage.local.get("ff_task", (result) => {
+        const task = result.ff_task;
+        if (!task) {
+          setStage("error");
+          return;
+        }
+        if (isDocsTab && active.id !== task.tabId) {
+          chrome.storage.local.set({ ff_task: { ...task, tabId: active.id } });
+        }
+        const targetId = isDocsTab ? active.id : task.tabId;
+        if (!targetId) {
+          setStage("error");
+          return;
+        }
+        chrome.tabs.sendMessage(targetId, { type: "FF_START_TASK" })
+          .then(() => setTimeout(() => setScreen("monitoring"), 800))
+          .catch(() => setStage("error"));
+      });
+    });
+  }
+
+  // The session never actually started (delivery was never confirmed), so
+  // discard the stored task — otherwise setup shows a phantom "session in
+  // progress" for a session that never tracked anything. The typed details
+  // are kept as a draft so the user doesn't have to re-enter them.
+  function handleBackToSetup() {
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.get("ff_task", (result) => {
+        const t = result.ff_task;
+        if (t) {
+          chrome.storage.local.set({
+            ff_draft: { taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
+          });
+        }
+        chrome.storage.local.remove("ff_task");
+        chrome.storage.local.remove("ff_session");
+        chrome.storage.local.remove("ff_idle");
+        chrome.storage.local.remove("ff_interrupted");
+        setScreen("init");
+      });
+    } else {
+      setScreen("init");
+    }
+  }
+
   useEffect(() => {
-    const buildTimer = setTimeout(() => setStage("connecting"), 1300);
-    const connectTimer = setTimeout(() => {
-      sendToTaskTab({ type: "FF_START_TASK" });
-      setScreen("monitoring");
-    }, 2600);
-    return () => {
-      clearTimeout(buildTimer);
-      clearTimeout(connectTimer);
-    };
-  }, [setScreen]);
+    const buildTimer = setTimeout(connectToDocs, 1300);
+    return () => clearTimeout(buildTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const formattedStart = startTime
     ? new Date(startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -349,15 +423,31 @@ function ContextPrepScreen({ setScreen }) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Preparing your session" />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", padding: 24, textAlign: "center" }}>
-        <div style={{ width: 40, height: 40, borderRadius: 12, border: `3px solid ${TEAL[100]}`, borderTopColor: TEAL[400], animation: "spin 0.9s linear infinite", marginBottom: 18 }} />
-        <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 700, color: "#030213" }}>{taskName || "Untitled task"}</p>
-        {objective && <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.5, maxWidth: 230 }}>{objective}</p>}
-        <div style={{ background: TEAL[50], borderRadius: 8, padding: "6px 12px", fontSize: 10, color: TEAL[600], marginBottom: 16 }}>
-          Started at {formattedStart}
-        </div>
-        <p style={{ fontSize: 12, fontWeight: 600, color: TEAL[600], margin: 0 }}>
-          {stage === "building" ? "Building context-aware focus model…" : "Connecting to Google Docs…"}
-        </p>
+        {stage === "error" ? (
+          <>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "#FFF3E0", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 18 }}>
+              <svg width="20" height="20" fill="none" viewBox="0 0 20 20"><path d="M10 6v5M10 14h.01" stroke="#F4A261" strokeWidth="2" strokeLinecap="round" /></svg>
+            </div>
+            <p style={{ margin: "0 0 6px", fontSize: 13, fontWeight: 700, color: "#030213" }}>Couldn't connect to your Google Doc</p>
+            <p style={{ margin: "0 0 18px", fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 250 }}>
+              Make sure the document tab is open and focused when starting a task. If the extension was recently reloaded, refresh the document tab first — then retry.
+            </p>
+            <Btn variant="primary" style={{ width: "100%", maxWidth: 220, marginBottom: 8 }} onClick={connectToDocs}>Retry connection</Btn>
+            <Btn variant="ghost" style={{ width: "100%", maxWidth: 220 }} onClick={handleBackToSetup}>Back to setup</Btn>
+          </>
+        ) : (
+          <>
+            <div style={{ width: 40, height: 40, borderRadius: 12, border: `3px solid ${TEAL[100]}`, borderTopColor: TEAL[400], animation: "spin 0.9s linear infinite", marginBottom: 18 }} />
+            <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 700, color: "#030213" }}>{taskName || "Untitled task"}</p>
+            {objective && <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.5, maxWidth: 230 }}>{objective}</p>}
+            <div style={{ background: TEAL[50], borderRadius: 8, padding: "6px 12px", fontSize: 10, color: TEAL[600], marginBottom: 16 }}>
+              Started at {formattedStart}
+            </div>
+            <p style={{ fontSize: 12, fontWeight: 600, color: TEAL[600], margin: 0 }}>
+              {stage === "building" ? "Building context-aware focus model…" : "Connecting to Google Docs…"}
+            </p>
+          </>
+        )}
       </div>
     </div>
   );
