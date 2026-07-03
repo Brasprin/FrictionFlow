@@ -2,9 +2,8 @@
 
 **Supporting Focus Recovery and Re-engagement from Cognitive Disruptions**
 
-FrictionFlow is a Chrome extension (Manifest V3) that supports students in recovering focus during academic writing tasks in Google Docs. Instead of blocking distractions, it passively logs writing behavior (typing, pauses, scrolling, tab switches), infers the writer's current cognitive phase — Planning, Translating, Reviewing, or Distracted (Flower & Hayes, 1981) — and offers contextual recovery prompts when disengagement is detected.
+FrictionFlow is a Chrome extension (Manifest V3) that supports students in recovering focus during academic writing tasks in Google Docs. Instead of blocking distractions, it passively logs writing behavior (typing, pauses, scrolling, tab switches), infers the writer's current cognitive phase Planning, Translating, Reviewing, or Distracted (Flower & Hayes, 1981)  and offers contextual recovery prompts when disengagement is detected.
 
-Developed as a BS Computer Science (Software Technology) thesis at De La Salle University Manila by Oliver Aldrin H. Arucan, Aljirah Brendl Y. Resurreccion, and Andrei G. Tamse, advised by Jordan Aiko P. Deja, PhD.
 
 ---
 
