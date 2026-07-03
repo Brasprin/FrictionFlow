@@ -656,12 +656,18 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
     return () => clearInterval(t);
   }, []);
 
+  // Suspend behavioral tracking for the duration of the break so break time
+  // doesn't pollute phase durations, pauses, or distraction episodes.
+  useEffect(() => {
+    sendToTaskTab({ type: "FF_BREAK_START" });
+  }, []);
+
   function handleContinue() {
     const breakMs = Date.now() - breakStartRef.current;
 
-    // Tell content.js how long this break was so it can accumulate
-    // totalBreakMs — logged in both conditions, this isn't the prompt itself.
-    sendToTaskTab({ type: "FF_UPDATE_BREAK_MS", breakMs });
+    // Ends the tracking suspension and reports the break length so
+    // content.js can accumulate totalBreakMs — logged in both conditions.
+    sendToTaskTab({ type: "FF_BREAK_END", breakMs });
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.get("ff_task", (result) => {
@@ -731,12 +737,16 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const avgResumptionSecs = Math.round((s.avgResumptionMs ?? 0) / 1000);
 
+  // True session average — words over active writing time. (s.wpm is only
+  // the last rolling-window value at the moment the session was finished.)
+  const avgWpm = writingSecs > 0 ? Math.round((s.wordCount ?? 0) / (writingSecs / 60)) : 0;
+
   // Stats backed by real tracked data from content.js
   const stats = [
     { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
     { label: "Writing time",  value: fmt(writingSecs),  icon: "✍️" },
     { label: "Words written", value: s.wordCount ?? 0,  icon: "📝" },
-    { label: "Avg. WPM",      value: s.wpm ?? 0,        icon: "⚡" },
+    { label: "Avg. WPM",      value: avgWpm,            icon: "⚡" },
     { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
     { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
     { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
@@ -805,11 +815,15 @@ function AnalyticsScreen({ setScreen, summary }) {
           )}
         </div>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}` }}>
-          <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>{dominantPhase ? "Great session!" : "Session complete"}</p>
+          <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>
+            {dominantPhase && dominantPhase.label !== "Distracted" ? "Great session!" : "Session complete"}
+          </p>
           <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
-            {dominantPhase
-              ? `You spent most of your time in the ${dominantPhase.label.toLowerCase()} phase${dominantPhase.label === "Translating" ? " — a sign of productive flow." : "."}`
-              : "Start a new session to build up your phase breakdown."}
+            {!dominantPhase
+              ? "Start a new session to build up your phase breakdown."
+              : dominantPhase.label === "Distracted"
+                ? "Most of this session was spent away from the task — shorter sessions or fewer open tabs might help next time."
+                : `You spent most of your time in the ${dominantPhase.label.toLowerCase()} phase${dominantPhase.label === "Translating" ? " — a sign of productive flow." : "."}`}
           </p>
         </div>
       </div>
