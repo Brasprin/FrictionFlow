@@ -379,7 +379,13 @@ function ContextPrepScreen({ setScreen }) {
           return;
         }
         chrome.tabs.sendMessage(targetId, { type: "FF_START_TASK" })
-          .then(() => setTimeout(() => setScreen("monitoring"), 800))
+          .then(() => {
+            // Kick the one-time Google consent for the Docs API here, at
+            // session start, so it never pops up mid-writing. Failure is
+            // fine — word count / doc text fall back to keystroke data.
+            chrome.runtime.sendMessage({ type: "FF_ENSURE_DOCS_AUTH" }).catch(() => {});
+            setTimeout(() => setScreen("monitoring"), 800);
+          })
           .catch(() => setStage("error"));
       });
     });
@@ -466,6 +472,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [elapsed, setElapsed] = useState(0);                      // calculated locally every second
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
+  const [totalDocWords, setTotalDocWords] = useState(0);
   const [totalPauses, setTotalPauses] = useState(0);
   const [longestPause, setLongestPause] = useState(0);
   const [scrollFrequency, setScrollFrequency] = useState(0);
@@ -520,6 +527,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
           setDistractionCount(s.distractionCount ?? 0);
+          setTotalDocWords(s.totalDocWords ?? 0);
 
           // Auto-trigger the distraction prompt while the phase reads
           // "Distracted", once per episode — reset once the user leaves
@@ -631,7 +639,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
             { label: "Time", value: `${mins}:${secs}` },
-            { label: "Words", value: words },
+            { label: "Words", value: totalDocWords },
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: `${longestPauseSec}s` },
@@ -660,7 +668,8 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active context</p>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{taskName}</p>
-          <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>{objective}</p>
+          <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
+            {objective} {totalDocWords > 0 ? `· ${totalDocWords} words` : ""} </p>
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
@@ -703,15 +712,29 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 function RecoveryScreen({ setScreen }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get("ff_task", (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery"], (result) => {
         const t = result.ff_task;
-        if (!t) return;
-        setTaskName(t.taskName ?? "");
-        setObjective(t.objective ?? "");
+        const r = result.ff_recovery;
+        if (t) {
+          setTaskName(t.taskName ?? "");
+          setObjective(t.objective ?? "");
+        }
+        if (r) {
+          setSummary({
+            whatYouWereDoing: r.whatYouWereDoing,
+            whereYouLeftOff: r.whereYouLeftOff,
+            suggestions: r.suggestedNextSteps ?? [],
+          });
+        }
+        setLoading(false);
       });
+    } else {
+      setLoading(false);
     }
   }, []);
 
@@ -719,12 +742,19 @@ function RecoveryScreen({ setScreen }) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Welcome back!" />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
-        {/* Context summary */}
         <div style={{ background: TEAL[50], borderRadius: 12, padding: "12px 13px", marginBottom: 14, border: `1px solid ${TEAL[100]}` }}>
           <p style={{ margin: "0 0 3px", fontSize: 12, fontWeight: 700, color: TEAL[800] }}>{taskName || "Untitled task"}</p>
           <p style={{ margin: 0, fontSize: 11, color: TEAL[600] }}>{objective}</p>
         </div>
-        <RecoverySummaryContent summary={MOCK_RECOVERY_SUMMARY} />
+        {loading ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "#717182", fontSize: 12 }}>
+            Loading recovery summary…
+          </div>
+        ) : summary ? (
+          <RecoverySummaryContent summary={summary} />
+        ) : (
+          <RecoverySummaryContent summary={MOCK_RECOVERY_SUMMARY} />
+        )}
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
         <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("monitoring")}>

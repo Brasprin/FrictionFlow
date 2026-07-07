@@ -7,6 +7,7 @@ const STORAGE_FLUSH_MS = 2000;            // 2s interval to write to storage
 const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
 const BURST_MIN_DURATION_MS = 10000;      // Minimum 10s of activity to consider a burst
+const WORD_SYNC_INTERVAL_MS = 30000;      // 30s cadence for real word count via the Docs API
 
 
 //------------------- State --------------------------//
@@ -47,6 +48,19 @@ let lastCompletedBurstMs = 0;
 let totalBreakMs = 0;
 let isOnBreak = false;   // phase/episode tracking is suspended while true
 
+// Word Count Sync Variables — background.js reads the real count via the
+// Google Docs API; only the number crosses into this script (never the text).
+// Until the first successful sync (or if OAuth isn't configured) the word
+// count falls back to the netChars keystroke approximation.
+let syncedWordCount = null;   // words written this session per the API (total - baseline)
+let netCharsAtSync = 0;       // netChars at that moment, for the live delta
+// Study docs start with the writing prompt already in them, so "words
+// written" must subtract the doc's word count at session start. The baseline
+// is a number (not text) so persisting it in ff_session is allowed — and
+// required, or a tab refresh mid-session would re-baseline and zero the count.
+let docWordBaseline = null;
+let totalDocWords = 0;        // total words in the doc (baseline + written) — for display only
+
 // Phase Duration Variables — accumulated ms spent in each classified phase
 let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
 let currentTrackedPhase = null;
@@ -64,6 +78,7 @@ let flushIntervalId = null;
 let pauseIntervalId = null;
 let idleIntervalId = null;
 let phaseIntervalId = null;
+let wordSyncIntervalId = null;
 
 
 //------------------- Helper -----------------------------//
@@ -94,7 +109,39 @@ function elapsedSeconds() {
 }
 
 function getLiveWordCount() {
+  if (syncedWordCount !== null) {
+    // API-anchored: real count from the last sync, plus a keystroke-estimated
+    // delta so the number still moves live between syncs.
+    const delta = Math.round((netChars - netCharsAtSync) / CHARS_PER_WORD);
+    return Math.max(0, syncedWordCount + delta);
+  }
   return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
+}
+
+// Asks background.js for the real word count (Docs API). Silently keeps the
+// keystroke approximation on any failure — no auth, background asleep, API
+// error — so this can never block or break tracking.
+function syncWordCount() {
+  if (!isTracking) return;
+  if (!isExtensionContextValid()) { stopAllTracking(); return; }
+  try {
+    chrome.runtime.sendMessage({ type: "FF_SYNC_WORD_COUNT" }, (response) => {
+      if (chrome.runtime.lastError) return; // keep approximation
+      if (response && typeof response.wordCount === "number") {
+        if (docWordBaseline === null) {
+          // First sync: everything in the doc beyond what this session's
+          // keystrokes account for was already there — that's the baseline.
+          docWordBaseline = Math.max(0, response.wordCount - Math.round(netChars / CHARS_PER_WORD));
+        }
+        syncedWordCount = Math.max(0, response.wordCount - docWordBaseline);
+        netCharsAtSync = netChars;
+        totalDocWords = response.wordCount;
+        isTyping = true; // make the next flush write the corrected count
+      }
+    });
+  } catch (e) {
+    stopAllTracking();
+  }
 }
 
 // Checks whether the extension's runtime context is still alive.
@@ -121,10 +168,12 @@ function stopAllTracking() {
   if (pauseIntervalId !== null) clearInterval(pauseIntervalId);
   if (idleIntervalId !== null) clearInterval(idleIntervalId);
   if (phaseIntervalId !== null) clearInterval(phaseIntervalId);
+  if (wordSyncIntervalId !== null) clearInterval(wordSyncIntervalId);
   flushIntervalId = null;
   pauseIntervalId = null;
   idleIntervalId = null;
   phaseIntervalId = null;
+  wordSyncIntervalId = null;
 
   console.log("FrictionFlow: extension context invalidated — tracking stopped. Refresh this tab to resume.");
 }
@@ -167,7 +216,7 @@ function classifyPhase(scrollFreq) {
   // Distracted — away from tab or long idle
   // TODO revert: threshold temporarily dropped from 120 to 2 for manual testing
   if (document.hidden) return "Distracted";
-  if (currentPauseSec > 2) return "Distracted";
+  if (currentPauseSec > 120) return "Distracted";
 
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
@@ -415,6 +464,10 @@ function resetSessionState() {
   totalBreakMs = 0;
   isOnBreak = false;
 
+  syncedWordCount = null;
+  netCharsAtSync = 0;
+  docWordBaseline = null;
+
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
   phaseSegmentStartTime = null;
@@ -444,6 +497,7 @@ function resumeTracking(snapshot, task) {
 
   if (snapshot) {
     netChars = (snapshot.wordCount ?? 0) * CHARS_PER_WORD;
+    docWordBaseline = snapshot.docWordBaseline ?? null;
     totalPauses = snapshot.totalPauses ?? 0;
     longestPauseMs = snapshot.longestPauseMs ?? 0;
     tabSwitchCount = snapshot.tabSwitchCount ?? 0;
@@ -521,6 +575,8 @@ function startIntervals() {
       // Keystroke
       wpm: rollingWPM(),
       wordCount: getLiveWordCount(),
+      docWordBaseline, // number only — survives reinjection so resume doesn't re-baseline
+      totalDocWords, // for display only, not used in calculations
       elapsedSeconds: elapsedSeconds(),
 
       // Pauses
@@ -606,6 +662,12 @@ function startIntervals() {
       });
     });
   }, 2000);
+
+  // Real word count sync via the Docs API (through background.js). First
+  // sync fires shortly after start so a doc with existing text doesn't show
+  // "0 words" for 30s; the guard inside syncWordCount handles early stops.
+  wordSyncIntervalId = setInterval(syncWordCount, WORD_SYNC_INTERVAL_MS);
+  setTimeout(syncWordCount, 3000);
 
   // Idle watcher
   idleIntervalId = setInterval(() => {

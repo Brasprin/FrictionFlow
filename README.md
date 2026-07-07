@@ -41,7 +41,20 @@ npm run build -- --watch
 3. Click **Load unpacked**
 4. Select the **`dist/`** folder inside this project
 
-### 4. Use it
+### 4. Google Docs API setup (document reading)
+
+The extension reads the actual document text through the official **Google Docs API** — used for the real word count and for the AI recovery summaries. Without this setup everything still works, but word count falls back to keystroke approximation and recovery prompts are behavioral-signals-only.
+
+1. Load the extension once (step 3) and copy its **ID** from `chrome://extensions`.
+2. In [Google Cloud Console](https://console.cloud.google.com): create a project and enable the **Google Docs API** (APIs & Services → Library).
+3. Configure the **OAuth consent screen**: External, *Testing* publishing status, and add the Google account(s) that will run sessions as **test users**.
+4. Create credentials → **OAuth client ID** → application type **Chrome Extension** → paste the extension ID from step 1.
+5. Copy the generated client ID into `public/manifest.json` → `oauth2.client_id` (replacing the `REPLACE_WITH_OAUTH_CLIENT_ID` placeholder), rebuild, and reload the extension.
+6. On the first session start, Chrome shows a one-time Google consent popup (read-only Docs scope). Approve it once; later sessions are silent.
+
+> ⚠️ The OAuth client is bound to the extension ID. An unpacked extension's ID is derived from its folder path, so it changes if you load `dist/` from a different path or machine — re-create (or edit) the OAuth client with the new ID if that happens.
+
+### 5. Use it
 
 1. Open a document at [docs.google.com](https://docs.google.com)
 2. Click the FrictionFlow icon in the toolbar — the side panel opens, docked next to the doc
@@ -90,7 +103,7 @@ Behavioral logging is identical in both conditions.
 ```
 
 - **`public/content.js`** — the sensor. Runs inside Google Docs; logs keystrokes (via Docs' text-event iframe), scrolls, and visibility changes. Classifies the writing phase every 2 s, accumulates time-in-phase and distraction episodes (with task-resumption times), and flushes everything to `chrome.storage.local` (`ff_session`).
-- **`public/background.js`** — the watchdog. Opens the side panel on toolbar click; marks the session interrupted if the Docs tab closes or navigates away. Also contains parked scaffolding for the future Claude-generated recovery summaries (not active).
+- **`public/background.js`** — the watchdog + API gateway. Opens the side panel on toolbar click; marks the session interrupted if the Docs tab closes or navigates away. Reads the document text via the Google Docs API (OAuth, read-only scope) on request: content.js asks for the real word count every 30 s, and the recovery-summary generation reads the doc tail for context. **Document text is ephemeral** — it is used inside the request and never written to storage, logs, or exports; only the derived word count (a number) is persisted. Also contains parked scaffolding for the Claude-generated recovery summaries (not active).
 - **`src/App.jsx`** — the UI. All six screens in one file, polling `ff_session` for live data and messaging the content script for lifecycle events (`FF_START_TASK`, `FF_RESUME_TASK`, `FF_CANCEL_TASK`, `FF_BREAK_START`, `FF_BREAK_END`).
 
 ### Storage keys
@@ -123,11 +136,11 @@ Tab-switching away from the doc flags Distracted immediately in both modes (by d
 
 ## Known limitations
 
-- Word count is keystroke-approximated (paste, undo, and autocorrect are not counted)
+- Word count is API-anchored when Docs API auth is configured (synced every 30 s, session-baseline-subtracted so pre-existing prompt text isn't counted); between syncs — and always, if OAuth isn't set up — it falls back to keystroke approximation (paste, undo, and autocorrect not counted)
 - Any tab-away counts as Distracted — the system cannot distinguish legitimate reference-checking from distraction (mitigate by using self-contained writing prompts in study sessions)
 - Switching to another *application* (not just another tab) is detected via `document.hidden` and is indistinguishable from a tab switch
 - Only Google Docs is supported as the writing environment
 
 ## Privacy
 
-The extension records only keyboard/scroll/tab-switch *activity metrics* inside the writing interface — never the document text itself as stored data, and no external applications or websites are monitored. See the study's informed-consent documents for the full data-handling protocol.
+The extension records only keyboard/scroll/tab-switch *activity metrics* inside the writing interface — never the document text itself as stored data, and no external applications or websites are monitored. Document text **is** read ephemerally through the Google Docs API (read-only scope) to compute the word count and, in intervention sessions, to generate recovery prompts — per the consent-form commitment it is never persisted to storage, logs, or exported data. See the study's informed-consent documents for the full data-handling protocol.
