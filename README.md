@@ -115,15 +115,9 @@ Behavioral logging is identical in both conditions.
 | `ff_interrupted` | background.js | Set when the Docs tab closes/navigates mid-session |
 | `ff_idle` | content.js | Long-idle marker (≥ 2 min without activity) |
 
-## ⚠️ Testing thresholds
+## Detection thresholds
 
-Some detection thresholds are currently lowered for fast manual testing and **must be reverted before running real study sessions** (search the code for `TODO revert`):
-
-| Threshold | Current (testing) | Study value | Location |
-|---|---|---|---|
-| Idle time → Distracted | 2 s | 120 s | `public/content.js`, `classifyPhase()` |
-
-Tab-switching away from the doc flags Distracted immediately in both modes (by design — see limitations).
+Thresholds are at **study values** (idle → Distracted after 120 s of no typing, in `public/content.js` → `classifyPhase()`). For quick manual testing, use tab-switching instead: leaving the doc tab flags Distracted immediately (by design — see limitations).
 
 ## Current status
 

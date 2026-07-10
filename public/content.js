@@ -214,7 +214,6 @@ function classifyPhase(scrollFreq) {
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
   // Distracted — away from tab or long idle
-  // TODO revert: threshold temporarily dropped from 120 to 2 for manual testing
   if (document.hidden) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
@@ -467,6 +466,7 @@ function resetSessionState() {
   syncedWordCount = null;
   netCharsAtSync = 0;
   docWordBaseline = null;
+  totalDocWords = 0;
 
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;

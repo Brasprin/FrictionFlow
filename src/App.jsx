@@ -203,6 +203,7 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
+        chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -228,6 +229,7 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_session");
       chrome.storage.local.remove("ff_idle");
       chrome.storage.local.remove("ff_interrupted");
+      chrome.storage.local.remove("ff_recovery");
     }
 
     setTaskName("");
@@ -617,6 +619,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_task");
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
+        chrome.storage.local.remove("ff_recovery");
       }
 
       setScreen("analytics");
@@ -639,7 +642,9 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
             { label: "Time", value: `${mins}:${secs}` },
-            { label: "Words", value: totalDocWords },
+            // Doc total comes from the Docs API; without OAuth it stays 0,
+            // so fall back to the session's (keystroke-tracked) word count.
+            { label: "Words", value: totalDocWords > 0 ? totalDocWords : words },
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: `${longestPauseSec}s` },
