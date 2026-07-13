@@ -3,6 +3,7 @@
   "name": "FrictionFlow",
   "version": "1.0",
   "description": "AI-assisted writing recovery extension",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtdWxmgE3jqnKIgm9jLPQ66N2wcDjjFcQSvhgxxtXgjzmnL4Vh52Z0igz5YJXeM4CCLeQ1iBddkr8QWUCxKHRUxzyqFgdsg27EmGHj/a4Dsv4mB9AzVi0+meqpcMxi1Jryvu/3ZVYTVwytCx2PCQAIf0AHsBUoiHZy40hO7gjZNxUdt0Gd5PWCIR0rIRQYTkLvsbTWd7a3nCPt86oYpWmzBfqctKISZEYiK0/9MF1FhaPp9bTqxUiCOG9e7csBFVgymtG9QvckRkXg0JxYbdpIXPr/V3lUvDqz6l3Q2/BuruBGhn9eGG0KhwL5TPFPGfTJN3DvqIDy7BidYo5wtOL4QIDAQAB",
   "permissions": [
     "storage",
     "tabs",

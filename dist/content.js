@@ -213,7 +213,11 @@ function classifyPhase(scrollFreq) {
   const currentPauseSec = lastKeyTime ? Math.round((now - lastKeyTime) / 1000) : 0;
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
 
-  // Distracted — away from tab or long idle
+  // Distracted — away from tab or long idle. Note: the phase (and with it
+  // the Gentle Reminder) flips back as soon as the user returns to the doc,
+  // but the distraction EPISODE stays open until the first keystroke — see
+  // finalizeDistractionEpisode, called from the keydown handler. Phase
+  // drives the UI; the episode drives the H1 resumption measurement.
   if (document.hidden) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
@@ -249,12 +253,12 @@ function updatePhaseTracking() {
   if (phase !== currentTrackedPhase) {
     phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
 
-    // Episode bookkeeping on the Distracted boundary (check before
-    // reassigning currentTrackedPhase — it still holds the previous phase).
+    // Entering Distracted opens an episode. Leaving Distracted does NOT
+    // close it — the episode ends only at the first keystroke (see the
+    // keydown handler), so resumptionMs measures actual writing resumption
+    // even though the phase/UI flips back the moment the user returns.
     if (phase === "Distracted") {
       startDistractionEpisode(now);
-    } else if (currentTrackedPhase === "Distracted") {
-      finalizeDistractionEpisode(now);
     }
 
     currentTrackedPhase = phase;
@@ -281,8 +285,9 @@ function startDistractionEpisode(now) {
   }
 }
 
-// Called when the phase leaves "Distracted" — which only happens once the
-// user types again (or scrolls enough), so `now` marks task resumption.
+// Called from the keydown handler at the first keystroke while an episode
+// is open (or from startBreak when the user opts for a break instead) —
+// `now` marks actual task resumption.
 function finalizeDistractionEpisode(now) {
   if (!activeDistraction) return;
   const ep = activeDistraction;
@@ -314,6 +319,27 @@ function getAvgResumptionMs() {
   return Math.round(total / distractionEpisodes.length);
 }
 
+// Merge-writes the current phase + episode data to storage immediately.
+// Used by the phase interval AND the visibilitychange handler: Chrome
+// throttles or outright freezes timers in hidden tabs, so distraction
+// detection must not depend on the next interval tick firing while hidden —
+// the visibility event itself is the reliable trigger.
+function flushPhaseToStorage() {
+  safeStorageGet("ff_session", (result) => {
+    const existing = (result && result.ff_session) ?? {};
+    safeStorageSet({
+      ff_session: {
+        ...existing,
+        currentPhase: currentTrackedPhase,
+        phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+        distractionCount: distractionEpisodes.length,
+        distractionEpisodes,
+        avgResumptionMs: getAvgResumptionMs(),
+      }
+    });
+  });
+}
+
 
 //------------------ Event Listeners ------------------------//
 // Google docs swallows events before they reach the document
@@ -329,6 +355,16 @@ function attachTypingListener() {
     if (!isTracking) return; // ignore activity once tracking has stopped
 
     const now = Date.now();
+
+    // First WRITING keystroke while a distraction episode is open = task
+    // resumed — close the episode here (not on phase transitions) so
+    // resumptionMs reflects when writing actually restarted. Lone modifier
+    // or navigation keys (Ctrl, Shift, arrows) are re-orientation, not
+    // resumption — H1 defines resumption as the return of typing.
+    const isWritingKey = isPrintable(e.key) || e.key === "Backspace" || e.key === "Delete" || e.key === "Enter";
+    if (isWritingKey && activeDistraction && !isOnBreak) {
+      finalizeDistractionEpisode(now);
+    }
 
     if (isPrintable(e.key)) {
       keyStrokeTimeStamps.push(now);
@@ -417,17 +453,34 @@ function attachTabSwitchListener() {
       tabSwitchCount++;
       tabHiddenAt = Date.now();
       lastTabSwitchTime = Date.now();
+
+      // Classify + persist NOW — the phase interval may be throttled or
+      // frozen by Chrome once this tab is hidden, so waiting for the next
+      // tick can miss the distraction entirely.
+      if (!isOnBreak) {
+        updatePhaseTracking();
+        flushPhaseToStorage();
+      }
     } else {
       if (tabHiddenAt !== null) {
         totalTabAwayMs += Date.now() - tabHiddenAt;
         tabHiddenAt = null;
       }
-      // Mark when the user came back to the doc so resumptionMs can measure
-      // return-to-doc → typing-resumed, not the whole time away.
-      if (activeDistraction && activeDistraction.trigger === "tab-away" && activeDistraction.returnedAt === null) {
+      // Stamp the LATEST return to the doc (overwriting earlier ones): if the
+      // user bounces away and back several times without typing, it's all one
+      // open episode, and resumptionMs should measure from the final return
+      // before writing resumed.
+      if (activeDistraction && activeDistraction.trigger === "tab-away") {
         activeDistraction.returnedAt = Date.now();
       }
       isTyping = true; // treat returning to tab as activity for idle detection
+
+      // Re-sync on return too — if the tab was frozen while hidden, this is
+      // the first chance to bank the away time into the phase durations.
+      if (!isOnBreak) {
+        updatePhaseTracking();
+        flushPhaseToStorage();
+      }
     }
   });
 }
@@ -657,20 +710,7 @@ function startIntervals() {
     if (!isExtensionContextValid()) { stopAllTracking(); return; }
 
     updatePhaseTracking();
-
-    safeStorageGet("ff_session", (result) => {
-      const existing = (result && result.ff_session) ?? {};
-      safeStorageSet({
-        ff_session: {
-          ...existing,
-          currentPhase: currentTrackedPhase,
-          phaseDurationsMs: getPhaseDurationsMsSnapshot(),
-          distractionCount: distractionEpisodes.length,
-          distractionEpisodes,
-          avgResumptionMs: getAvgResumptionMs(),
-        }
-      });
-    });
+    flushPhaseToStorage();
   }, 2000);
 
   // Real word count sync via the Docs API (through background.js). First

@@ -1,4 +1,9 @@
-const RECOVERY_COOLDOWN_MS = 180000; // 3 minutes between recovery generations
+// Minimum gap between recovery generations. Bounds API usage without going
+// stale: episodes inside the window reuse the previous ff_recovery, so a
+// too-long cooldown shows outdated "where you left off" content on
+// back-to-back distractions. 60s ≈ worst case ~50 calls per 50-min session —
+// well inside the Gemini free tier.
+const RECOVERY_COOLDOWN_MS = 60000;
 
 let lastRecoveryTime = null;
 let isGenerating = false; // prevent concurrent API calls
@@ -219,6 +224,9 @@ async function handleStuckCheck() {
 
   isGenerating = true;
   lastRecoveryTime = now;
+  // Timestamp (not a boolean) so the panel can ignore a stale flag if the
+  // worker ever dies mid-generation — the UI treats >30s-old as not running.
+  await chrome.storage.local.set({ ff_generating: now });
 
   try {
     // Doc text is read fresh here, used only inside the prompt, and never
@@ -232,6 +240,7 @@ async function handleStuckCheck() {
     console.error("FrictionFlow recovery generation error:", err);
   } finally {
     isGenerating = false;
+    chrome.storage.local.remove("ff_generating");
   }
 }
 
