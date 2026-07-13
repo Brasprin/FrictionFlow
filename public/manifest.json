@@ -13,8 +13,13 @@
   ],
   "host_permissions": [
     "https://docs.google.com/*",
-    "https://docs.googleapis.com/*"
+    "https://docs.googleapis.com/*",
+    "https://generativelanguage.googleapis.com/*"
   ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "oauth2": {
     "client_id": "600200227791-gkdbu0b4e587hud31vr5tbte24j09t1n.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/documents.readonly"]

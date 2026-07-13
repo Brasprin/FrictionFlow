@@ -269,6 +269,16 @@ function startDistractionEpisode(now) {
     trigger: document.hidden ? "tab-away" : "idle",
     returnedAt: null,
   };
+
+  // Ask background to pre-generate a recovery summary for this episode so
+  // it's ready by the time the user clicks "Get Back to Work". All gates
+  // (intervention condition, cooldown, key configured) live in background —
+  // this is fire-and-forget and must never affect tracking.
+  try {
+    chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK" }, () => void chrome.runtime.lastError);
+  } catch (e) {
+    // Extension context died mid-call — the interval guards will handle it.
+  }
 }
 
 // Called when the phase leaves "Distracted" — which only happens once the

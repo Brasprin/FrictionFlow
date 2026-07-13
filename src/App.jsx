@@ -743,6 +743,25 @@ function RecoveryScreen({ setScreen }) {
     }
   }, []);
 
+  // Generation is often still in flight when the user arrives here (it
+  // starts when the Distracted episode starts) — swap the placeholder for
+  // the real summary the moment background.js writes ff_recovery.
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome.storage) return;
+    function onStorageChange(changes, area) {
+      if (area === "local" && changes.ff_recovery?.newValue) {
+        const r = changes.ff_recovery.newValue;
+        setSummary({
+          whatYouWereDoing: r.whatYouWereDoing,
+          whereYouLeftOff: r.whereYouLeftOff,
+          suggestions: r.suggestedNextSteps ?? [],
+        });
+      }
+    }
+    chrome.storage.onChanged.addListener(onStorageChange);
+    return () => chrome.storage.onChanged.removeListener(onStorageChange);
+  }, []);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle="Welcome back!" />

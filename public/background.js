@@ -1,8 +1,7 @@
-const STUCK_THRESHOLD_SEC = 90;      // seconds before considering user stuck
-const RECOVERY_COOLDOWN_MS = 180000; // 3 minutes before retriggering (doubling from 90s)
+const RECOVERY_COOLDOWN_MS = 180000; // 3 minutes between recovery generations
 
 let lastRecoveryTime = null;
-let isCallingClaude = false; // prevent concurrent API calls
+let isGenerating = false; // prevent concurrent API calls
 
 
 //------------------ Side Panel ------------------//
@@ -191,47 +190,57 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 
-//------------------ Stuck Detection -------------------//
+//------------------ Recovery Generation -------------------//
+// Triggered by content.js when a Distracted episode starts (FF_CHECK_STUCK),
+// so the summary is usually ready by the time the user clicks "Get Back to
+// Work". All gates live here, not in the sender.
 async function handleStuckCheck() {
   // Prevent concurrent calls
-  if (isCallingClaude) return;
+  if (isGenerating) return;
 
   // Enforce cooldown between recovery calls
   const now = Date.now();
   if (lastRecoveryTime && (now - lastRecoveryTime) < RECOVERY_COOLDOWN_MS) return;
 
-  // Read session and task data
-  const result = await chrome.storage.local.get(["ff_session", "ff_task"]);
+  const result = await chrome.storage.local.get(["ff_session", "ff_task", "ff_settings"]);
   const session = result.ff_session;
   const task = result.ff_task;
 
   if (!session || !task) return;
 
-  // Only trigger if user is in Planning phase and has been paused long enough
-  if (session.currentPhase !== "Planning") return;
-  if ((session.currentPauseSec ?? 0) < STUCK_THRESHOLD_SEC) return;
+  // Independent variable: the baseline (control) condition never receives
+  // recovery content — behavioral logging is identical in both conditions.
+  if ((task.condition ?? "intervention") === "baseline") return;
 
-  // All conditions met — call Claude
-  isCallingClaude = true;
+  // No key configured → skip silently; the recovery screen keeps its
+  // placeholder content. Generation must never block a session.
+  const apiKey = result.ff_settings?.geminiApiKey;
+  if (!apiKey) return;
+
+  isGenerating = true;
   lastRecoveryTime = now;
 
   try {
     // Doc text is read fresh here, used only inside the prompt, and never
     // stored — ff_recovery holds only the generated summary.
     const docText = await getTaskDocText();
-    const recovery = await callClaude(session, task, docText);
+    const recovery = await generateRecovery(session, task, docText, apiKey);
     await chrome.storage.local.set({ ff_recovery: recovery });
-    chrome.runtime.sendMessage({ type: "FF_RECOVERY_READY" });
+    // Panel may be closed — a missing receiver is fine.
+    chrome.runtime.sendMessage({ type: "FF_RECOVERY_READY" }).catch(() => {});
   } catch (err) {
-    console.error("FrictionFlow Claude API error:", err);
+    console.error("FrictionFlow recovery generation error:", err);
   } finally {
-    isCallingClaude = false;
+    isGenerating = false;
   }
 }
 
 
-//------------------ Claude API Call -------------------//
-async function callClaude(session, task, docText) {
+//------------------ LLM API Call (Gemini) -------------------//
+// Provider details are isolated in this one function so swapping providers
+// (e.g. to Claude) is a contained change. The API key is researcher-entered
+// via the options page (ff_settings) — never hardcoded.
+async function generateRecovery(session, task, docText, apiKey) {
   // Only the tail of the doc goes into the prompt — "where you left off"
   // lives at the end, and it keeps token cost bounded on long documents.
   const docExcerpt = docText ? docText.slice(-2000) : null;
@@ -259,40 +268,56 @@ BEHAVIORAL DATA:
 - Tab switches: ${session.tabSwitchCount}
 - Session time: ${Math.round((session.elapsedSeconds ?? 0) / 60)} minutes
 
-Respond ONLY with a JSON object in this exact format, no markdown, no preamble:
-{
-  "condition": "one short phrase describing the writer's current state e.g. stuck on word choice, overwhelmed by scope, losing momentum",
-  "whatYouWereDoing": "one sentence describing what the behavioral data suggests they were doing before getting stuck",
-  "whereYouLeftOff": ${docExcerpt
-    ? '"one sentence pointing at the last thing they wrote (quote a short fragment) so they can re-orient instantly"'
-    : '"one sentence estimating where they were in the task based on timing and phase data"'},
-  "suggestedNextSteps": [
-    "specific actionable suggestion 1 tailored to their task",
-    "specific actionable suggestion 2 tailored to their task",
-    "specific actionable suggestion 3 tailored to their task"
-  ]
-}`;
+Field guidance:
+- condition: one short phrase describing the writer's current state, e.g. "stuck on word choice", "overwhelmed by scope", "losing momentum"
+- whatYouWereDoing: one sentence describing what the behavioral data suggests they were doing before getting stuck
+- whereYouLeftOff: ${docExcerpt
+    ? "one sentence pointing at the last thing they wrote (quote a short fragment) so they can re-orient instantly"
+    : "one sentence estimating where they were in the task based on timing and phase data"}
+- suggestedNextSteps: exactly 3 specific, actionable suggestions tailored to their task`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": "",  // TODO: Insert your Anthropic API key here
-      "anthropic-version": "2023-06-01",
+  // responseSchema guarantees parseable JSON — no prompt-begging needed.
+  const responseSchema = {
+    type: "OBJECT",
+    properties: {
+      condition: { type: "STRING" },
+      whatYouWereDoing: { type: "STRING" },
+      whereYouLeftOff: { type: "STRING" },
+      suggestedNextSteps: { type: "ARRAY", items: { type: "STRING" } },
     },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 500,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
+    required: ["condition", "whatYouWereDoing", "whereYouLeftOff", "suggestedNextSteps"],
+  };
 
-  if (!response.ok) throw new Error(`API error: ${response.status}`);
+  // Model is pinned (not a "-latest" alias) so the study runs on one citable
+  // model version. gemini-2.5-flash is closed to new API keys (404), hence 3.5.
+  // No thinkingConfig: the 2.5-era thinkingBudget field doesn't carry over to
+  // 3.x models — defaults apply, and maxOutputTokens has headroom for any
+  // thinking tokens the model spends before the JSON.
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema,
+          maxOutputTokens: 2048,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) throw new Error(`Gemini API error: ${response.status}`);
 
   const data = await response.json();
-  const text = data.content[0].text;
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Gemini API returned no content");
 
-  // Parse JSON response
   const parsed = JSON.parse(text);
 
   return {
