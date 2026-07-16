@@ -8,6 +8,10 @@ const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
 const BURST_MIN_DURATION_MS = 10000;      // Minimum 10s of activity to consider a burst
 const WORD_SYNC_INTERVAL_MS = 30000;      // 30s cadence for real word count via the Docs API
+const TAB_SWITCH_WINDOW_MS = 60000;       // rolling window for switch-frequency classification
+const RAPID_SWITCH_THRESHOLD = 3;         // >= this many switches in the window = Distracted
+                                          // (a switch every ~20s — attention residue never
+                                          // clears between switches; cf. Leroy 2009)
 
 
 //------------------- State --------------------------//
@@ -33,6 +37,7 @@ let scrollUpCount = 0;
 let scrollDownCount = 0;
 
 // Tab Switch Variables
+let tabSwitchTimeStamps = [];   // rolling window for the rapid-switch phase rule
 let tabSwitchCount = 0;
 let lastTabSwitchTime = null;   // currently not used, but may be useful for future analysis of tab switch patterns
 let totalTabAwayMs = 0;
@@ -94,6 +99,14 @@ function rollingWPM() {
   // Normalize words-in-window to a per-minute rate — without the 60s/window
   // factor this reported words-per-30s as WPM (half the real value).
   return Math.round((keyStrokeTimeStamps.length / CHARS_PER_WORD) * (60000 / WPM_WINDOW_MS));
+}
+
+function rollingTabSwitchFrequency() {
+  const cutOff = Date.now() - TAB_SWITCH_WINDOW_MS;
+  while (tabSwitchTimeStamps.length > 0 && tabSwitchTimeStamps[0] < cutOff) {
+    tabSwitchTimeStamps.shift();
+  }
+  return tabSwitchTimeStamps.length;
 }
 
 function rollingScrollFrequency() {
@@ -221,6 +234,13 @@ function classifyPhase(scrollFreq) {
   if (document.hidden) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
+  // Distracted — rapid tab switching: >= RAPID_SWITCH_THRESHOLD switches in
+  // the rolling window means attention is fragmented even while on the doc
+  // (a switch every ~20s never lets focus rebuild). WPM guard: a writer
+  // typing at speed is Translating regardless of recent switches — without
+  // it the panel would show "Distracted" through genuine writing.
+  if (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD && rollingWPM() < 10) return "Distracted";
+
   // Reviewing — scrolling a lot with low typing
   if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
 
@@ -270,7 +290,11 @@ function startDistractionEpisode(now) {
   if (activeDistraction) return;
   activeDistraction = {
     startedAt: now,
-    trigger: document.hidden ? "tab-away" : "idle",
+    // Three causes, distinguished for the export: hidden tab, rapid
+    // switching while visible, or a long idle pause on the doc.
+    trigger: document.hidden
+      ? "tab-away"
+      : (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD ? "rapid-switch" : "idle"),
     returnedAt: null,
   };
 
@@ -297,7 +321,8 @@ function finalizeDistractionEpisode(now) {
     durationMs: now - ep.startedAt,
     trigger: ep.trigger,
     // For tab-away episodes measure from the moment they came back to the
-    // doc; for idle episodes the user never left, so use the full episode.
+    // doc; for idle and rapid-switch episodes the user never left (or is
+    // currently on the doc), so use the full episode.
     resumptionMs: ep.trigger === "tab-away" && ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
   });
   activeDistraction = null;
@@ -451,6 +476,7 @@ function attachTabSwitchListener() {
 
     if (document.hidden) {
       tabSwitchCount++;
+      tabSwitchTimeStamps.push(Date.now()); // rolling window for the rapid-switch rule
       tabHiddenAt = Date.now();
       lastTabSwitchTime = Date.now();
 
@@ -513,6 +539,7 @@ function resetSessionState() {
   scrollUpCount = 0;
   scrollDownCount = 0;
 
+  tabSwitchTimeStamps = [];
   tabSwitchCount = 0;
   lastTabSwitchTime = null;
   totalTabAwayMs = 0;

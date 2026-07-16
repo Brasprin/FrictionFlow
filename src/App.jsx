@@ -132,6 +132,7 @@ function RecoverySummaryContent({ summary }) {
 function TaskInitScreen({ onStart }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
+  const [nameError, setNameError] = useState(false); // shown on a Start attempt with an empty name
   const [isActive, setIsActive] = useState(false);
   const [isInterrupted, setIsInterrupted] = useState(false);
   // "baseline" = no recovery prompts (control condition); "intervention" =
@@ -170,8 +171,19 @@ function TaskInitScreen({ onStart }) {
     }
   }, []);
 
+  // Soft input validation: the task name is required (it identifies the
+  // session and anchors the AI prompt); the objective is optional but nudged
+  // when very short, since it feeds recovery generation. Warn, never block —
+  // a false positive that stops a participant from starting a session is
+  // worse for the study than weak input reaching the (hardened) prompt.
+  const objectiveWordCount = objective.trim().split(/\s+/).filter(Boolean).length;
+  const showObjectiveNudge = !isActive && objectiveWordCount > 0 && objectiveWordCount < 3;
+
   function handleStartTask() {
-    if (!taskName.trim()) return;
+    if (!taskName.trim()) {
+      setNameError(true);
+      return;
+    }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -222,6 +234,7 @@ function TaskInitScreen({ onStart }) {
 
     setTaskName("");
     setObjective("");
+    setNameError(false);
     setIsActive(false);
   }
 
@@ -232,18 +245,28 @@ function TaskInitScreen({ onStart }) {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
-          onChange={e => !isActive && setTaskName(e.target.value)}
+          onChange={e => { if (!isActive) { setTaskName(e.target.value); if (nameError) setNameError(false); } }}
           placeholder="e.g. Research Essay Draft"
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${nameError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: nameError ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
         />
+        {nameError && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter a task name — it identifies this session.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Objective</p>
         <textarea
           value={objective}
           onChange={e => !isActive && setObjective(e.target.value)}
           placeholder="Briefly describe what you aim to accomplish in this session…"
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: showObjectiveNudge ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
+        {showObjectiveNudge && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#B45309", lineHeight: 1.5 }}>
+            A more specific objective helps FrictionFlow give better recovery tips — but you can start anyway.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Session condition</p>
         <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
           <button

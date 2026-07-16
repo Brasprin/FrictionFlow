@@ -135,7 +135,7 @@ Thresholds are at **study values** (idle → Distracted after 120 s of no typing
 ## Known limitations
 
 - Word count is API-anchored when Docs API auth is configured (synced every 30 s, session-baseline-subtracted so pre-existing prompt text isn't counted); between syncs — and always, if OAuth isn't set up — it falls back to keystroke approximation (paste, undo, and autocorrect not counted)
-- Any tab-away counts as Distracted — the system cannot distinguish legitimate reference-checking from distraction (mitigate by using self-contained writing prompts in study sessions)
+- Any tab-away counts as Distracted — the system cannot distinguish legitimate reference-checking from distraction (mitigate by using self-contained writing prompts in study sessions). Additionally, ≥3 tab switches within a rolling 60 s window classify the phase as Distracted even while on the doc (fragmented attention; suppressed while typing at ≥10 WPM so genuine writing is never misclassified)
 - Switching to another *application* (not just another tab) is detected via `document.hidden` and is indistinguishable from a tab switch
 - Only Google Docs is supported as the writing environment
 
