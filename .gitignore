@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Extension ID pinning — private key stays out of the repo (public key lives in manifest.json)
+extension-key.pem
+pubkey.b64

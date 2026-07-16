@@ -99,20 +99,6 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
   if (variant === "danger") return <button style={{ ...base, background: "transparent", color: "#d4183d", border: "1px solid rgba(212,24,61,0.25)" }} onClick={onClick}>{children}</button>;
 }
 
-// Placeholder until the Claude integration lands — both RecoveryScreen and
-// ActiveMonitoringScreen's inline card read from this single mock so there's
-// one source of truth to swap for real ff_recovery data later.
-const MOCK_RECOVERY_SUMMARY = {
-  whatYouWereDoing: "Actively drafting the body paragraphs — you were in a translating phase with a steady typing rhythm.",
-  whereYouLeftOff: "“…artificial intelligence has begun reshaping traditional classroom paradigms, offering personalized learning pathways that adapt to—”",
-  suggestions: [
-    "Continue the sentence you were drafting about AI's personalization capabilities.",
-    "Expand on the point about student engagement metrics from paragraph 2.",
-    "Outline the counterargument section you planned in your objective.",
-    "Review and revise the thesis statement before moving forward.",
-  ],
-};
-
 function RecoverySummaryContent({ summary }) {
   return (
     <>
@@ -203,6 +189,8 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
+        chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
+        chrome.storage.local.remove("ff_generating");
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -228,6 +216,8 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_session");
       chrome.storage.local.remove("ff_idle");
       chrome.storage.local.remove("ff_interrupted");
+      chrome.storage.local.remove("ff_recovery");
+      chrome.storage.local.remove("ff_generating");
     }
 
     setTaskName("");
@@ -529,18 +519,19 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setDistractionCount(s.distractionCount ?? 0);
           setTotalDocWords(s.totalDocWords ?? 0);
 
-          // Auto-trigger the distraction prompt while the phase reads
-          // "Distracted", once per episode — reset once the user leaves
-          // that state (whether on their own or via the prompt). Behavioral
-          // logging (phase classification) runs identically in both
-          // conditions — only the baseline condition suppresses the prompt
-          // itself, since that's the study's independent variable.
+          // Auto-trigger the distraction prompt when the phase reads
+          // "Distracted", once per episode. The prompt is STICKY by owner
+          // decision: it never dismisses itself — not on returning to the
+          // doc, not on typing — only the user's button click closes it
+          // (see the three handlers). Leaving Distracted merely re-arms the
+          // trigger for the next episode. Behavioral logging runs
+          // identically in both conditions — only baseline suppresses the
+          // prompt itself, since that's the study's independent variable.
           const isBaseline = (t?.condition ?? "intervention") === "baseline";
           if (s.currentPhase === "Distracted") {
             if (!isBaseline && !promptDismissedRef.current) setShowDistractionPrompt(true);
           } else {
             promptDismissedRef.current = false;
-            setShowDistractionPrompt(false);
           }
         });
       }
@@ -617,6 +608,8 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_task");
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
+        chrome.storage.local.remove("ff_recovery");
+        chrome.storage.local.remove("ff_generating");
       }
 
       setScreen("analytics");
@@ -639,7 +632,9 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
             { label: "Time", value: `${mins}:${secs}` },
-            { label: "Words", value: totalDocWords },
+            // Doc total comes from the Docs API; without OAuth it stays 0,
+            // so fall back to the session's (keystroke-tracked) word count.
+            { label: "Words", value: totalDocWords > 0 ? totalDocWords : words },
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: `${longestPauseSec}s` },
@@ -709,15 +704,20 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
 // ─── Screen 4: Recovery Interface ────────────────────────────────────────────
 
+// A generation-in-flight marker older than this is treated as dead (e.g. the
+// service worker was killed mid-call and never cleared it).
+const GENERATING_STALE_MS = 30000;
+
 function RecoveryScreen({ setScreen }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [summary, setSummary] = useState(null);
+  const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_recovery"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating"], (result) => {
         const t = result.ff_task;
         const r = result.ff_recovery;
         if (t) {
@@ -731,11 +731,36 @@ function RecoveryScreen({ setScreen }) {
             suggestions: r.suggestedNextSteps ?? [],
           });
         }
+        setGenerating(typeof result.ff_generating === "number" && Date.now() - result.ff_generating < GENERATING_STALE_MS);
         setLoading(false);
       });
     } else {
       setLoading(false);
     }
+  }, []);
+
+  // Generation is often still in flight when the user arrives here (it
+  // starts when the Distracted episode starts) — show a generating state
+  // and swap in the real summary the moment background.js writes it.
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome.storage) return;
+    function onStorageChange(changes, area) {
+      if (area !== "local") return;
+      if (changes.ff_recovery?.newValue) {
+        const r = changes.ff_recovery.newValue;
+        setSummary({
+          whatYouWereDoing: r.whatYouWereDoing,
+          whereYouLeftOff: r.whereYouLeftOff,
+          suggestions: r.suggestedNextSteps ?? [],
+        });
+      }
+      if ("ff_generating" in changes) {
+        const v = changes.ff_generating.newValue;
+        setGenerating(typeof v === "number" && Date.now() - v < GENERATING_STALE_MS);
+      }
+    }
+    chrome.storage.onChanged.addListener(onStorageChange);
+    return () => chrome.storage.onChanged.removeListener(onStorageChange);
   }, []);
 
   return (
@@ -750,10 +775,30 @@ function RecoveryScreen({ setScreen }) {
           <div style={{ textAlign: "center", padding: "32px 0", color: "#717182", fontSize: 12 }}>
             Loading recovery summary…
           </div>
+        ) : generating ? (
+          // While a fresh summary is generating, never show the previous
+          // (now-outdated) one — the whole point is current context. If
+          // generation fails, ff_generating clears and we fall back to
+          // whatever summary exists below.
+          <div style={{ textAlign: "center", padding: "36px 0" }}>
+            <div style={{ width: 32, height: 32, borderRadius: 10, border: `3px solid ${TEAL[100]}`, borderTopColor: TEAL[400], animation: "spin 0.9s linear infinite", margin: "0 auto 14px" }} />
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[600] }}>Generating your recovery summary…</p>
+            <p style={{ margin: "6px 0 0", fontSize: 11, color: "#717182" }}>Reading your recent activity and progress</p>
+          </div>
         ) : summary ? (
           <RecoverySummaryContent summary={summary} />
         ) : (
-          <RecoverySummaryContent summary={MOCK_RECOVERY_SUMMARY} />
+          // Honest empty state — no filler content pretending to be a real
+          // summary (no key configured, generation failed, or none yet).
+          <div style={{ textAlign: "center", padding: "36px 16px" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+              <svg width="18" height="18" fill="none" viewBox="0 0 18 18"><path d="M3 9h12M9 3v12" stroke={TEAL[200]} strokeWidth="1.6" strokeLinecap="round" opacity="0.6" transform="rotate(45 9 9)"/></svg>
+            </div>
+            <p style={{ margin: "0 0 4px", fontSize: 12, fontWeight: 600, color: "#030213" }}>No recovery summary yet</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 240, marginLeft: "auto", marginRight: "auto" }}>
+              A summary is generated when a distraction is detected. You can head back and continue writing.
+            </p>
+          </div>
         )}
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
