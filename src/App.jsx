@@ -99,20 +99,6 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
   if (variant === "danger") return <button style={{ ...base, background: "transparent", color: "#d4183d", border: "1px solid rgba(212,24,61,0.25)" }} onClick={onClick}>{children}</button>;
 }
 
-// Placeholder until the Claude integration lands — both RecoveryScreen and
-// ActiveMonitoringScreen's inline card read from this single mock so there's
-// one source of truth to swap for real ff_recovery data later.
-const MOCK_RECOVERY_SUMMARY = {
-  whatYouWereDoing: "Actively drafting the body paragraphs — you were in a translating phase with a steady typing rhythm.",
-  whereYouLeftOff: "“…artificial intelligence has begun reshaping traditional classroom paradigms, offering personalized learning pathways that adapt to—”",
-  suggestions: [
-    "Continue the sentence you were drafting about AI's personalization capabilities.",
-    "Expand on the point about student engagement metrics from paragraph 2.",
-    "Outline the counterargument section you planned in your objective.",
-    "Review and revise the thesis statement before moving forward.",
-  ],
-};
-
 function RecoverySummaryContent({ summary }) {
   return (
     <>
@@ -146,6 +132,7 @@ function RecoverySummaryContent({ summary }) {
 function TaskInitScreen({ onStart }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
+  const [nameError, setNameError] = useState(false); // shown on a Start attempt with an empty name
   const [isActive, setIsActive] = useState(false);
   const [isInterrupted, setIsInterrupted] = useState(false);
   // "baseline" = no recovery prompts (control condition); "intervention" =
@@ -184,8 +171,19 @@ function TaskInitScreen({ onStart }) {
     }
   }, []);
 
+  // Soft input validation: the task name is required (it identifies the
+  // session and anchors the AI prompt); the objective is optional but nudged
+  // when very short, since it feeds recovery generation. Warn, never block —
+  // a false positive that stops a participant from starting a session is
+  // worse for the study than weak input reaching the (hardened) prompt.
+  const objectiveWordCount = objective.trim().split(/\s+/).filter(Boolean).length;
+  const showObjectiveNudge = !isActive && objectiveWordCount > 0 && objectiveWordCount < 3;
+
   function handleStartTask() {
-    if (!taskName.trim()) return;
+    if (!taskName.trim()) {
+      setNameError(true);
+      return;
+    }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -204,6 +202,7 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
         chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
+        chrome.storage.local.remove("ff_generating");
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -230,10 +229,12 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_idle");
       chrome.storage.local.remove("ff_interrupted");
       chrome.storage.local.remove("ff_recovery");
+      chrome.storage.local.remove("ff_generating");
     }
 
     setTaskName("");
     setObjective("");
+    setNameError(false);
     setIsActive(false);
   }
 
@@ -244,18 +245,28 @@ function TaskInitScreen({ onStart }) {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
-          onChange={e => !isActive && setTaskName(e.target.value)}
+          onChange={e => { if (!isActive) { setTaskName(e.target.value); if (nameError) setNameError(false); } }}
           placeholder="e.g. Research Essay Draft"
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${nameError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: nameError ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
         />
+        {nameError && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter a task name — it identifies this session.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Objective</p>
         <textarea
           value={objective}
           onChange={e => !isActive && setObjective(e.target.value)}
           placeholder="Briefly describe what you aim to accomplish in this session…"
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: showObjectiveNudge ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
+        {showObjectiveNudge && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#B45309", lineHeight: 1.5 }}>
+            A more specific objective helps FrictionFlow give better recovery tips — but you can start anyway.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Session condition</p>
         <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
           <button
@@ -467,7 +478,7 @@ function ContextPrepScreen({ setScreen }) {
 // up to App and passed in as props — they must survive this component
 // unmounting when navigating to Recovery/Break and remounting on return,
 // otherwise a still-"Distracted" phase immediately re-triggers the modal.
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -531,18 +542,19 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setDistractionCount(s.distractionCount ?? 0);
           setTotalDocWords(s.totalDocWords ?? 0);
 
-          // Auto-trigger the distraction prompt while the phase reads
-          // "Distracted", once per episode — reset once the user leaves
-          // that state (whether on their own or via the prompt). Behavioral
-          // logging (phase classification) runs identically in both
-          // conditions — only the baseline condition suppresses the prompt
-          // itself, since that's the study's independent variable.
+          // Auto-trigger the distraction prompt when the phase reads
+          // "Distracted", once per episode. The prompt is STICKY by owner
+          // decision: it never dismisses itself — not on returning to the
+          // doc, not on typing — only the user's button click closes it
+          // (see the three handlers). Leaving Distracted merely re-arms the
+          // trigger for the next episode. Behavioral logging runs
+          // identically in both conditions — only baseline suppresses the
+          // prompt itself, since that's the study's independent variable.
           const isBaseline = (t?.condition ?? "intervention") === "baseline";
           if (s.currentPhase === "Distracted") {
             if (!isBaseline && !promptDismissedRef.current) setShowDistractionPrompt(true);
           } else {
             promptDismissedRef.current = false;
-            setShowDistractionPrompt(false);
           }
         });
       }
@@ -579,6 +591,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   function handleTakeBreakFromPrompt() {
     promptDismissedRef.current = true;
     setShowDistractionPrompt(false);
+    breakOriginRef.current = "prompt";
     setScreen("break");
   }
 
@@ -620,6 +633,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_recovery");
+        chrome.storage.local.remove("ff_generating");
       }
 
       setScreen("analytics");
@@ -679,7 +693,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 8 }}>
-          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; setScreen("break"); }}>Take a break</Btn>
           <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
         </div>
         {hasRecoverySummary && (
@@ -714,15 +728,20 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
 // ─── Screen 4: Recovery Interface ────────────────────────────────────────────
 
+// A generation-in-flight marker older than this is treated as dead (e.g. the
+// service worker was killed mid-call and never cleared it).
+const GENERATING_STALE_MS = 30000;
+
 function RecoveryScreen({ setScreen }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [summary, setSummary] = useState(null);
+  const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_recovery"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating"], (result) => {
         const t = result.ff_task;
         const r = result.ff_recovery;
         if (t) {
@@ -736,11 +755,36 @@ function RecoveryScreen({ setScreen }) {
             suggestions: r.suggestedNextSteps ?? [],
           });
         }
+        setGenerating(typeof result.ff_generating === "number" && Date.now() - result.ff_generating < GENERATING_STALE_MS);
         setLoading(false);
       });
     } else {
       setLoading(false);
     }
+  }, []);
+
+  // Generation is often still in flight when the user arrives here (it
+  // starts when the Distracted episode starts) — show a generating state
+  // and swap in the real summary the moment background.js writes it.
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome.storage) return;
+    function onStorageChange(changes, area) {
+      if (area !== "local") return;
+      if (changes.ff_recovery?.newValue) {
+        const r = changes.ff_recovery.newValue;
+        setSummary({
+          whatYouWereDoing: r.whatYouWereDoing,
+          whereYouLeftOff: r.whereYouLeftOff,
+          suggestions: r.suggestedNextSteps ?? [],
+        });
+      }
+      if ("ff_generating" in changes) {
+        const v = changes.ff_generating.newValue;
+        setGenerating(typeof v === "number" && Date.now() - v < GENERATING_STALE_MS);
+      }
+    }
+    chrome.storage.onChanged.addListener(onStorageChange);
+    return () => chrome.storage.onChanged.removeListener(onStorageChange);
   }, []);
 
   return (
@@ -755,10 +799,30 @@ function RecoveryScreen({ setScreen }) {
           <div style={{ textAlign: "center", padding: "32px 0", color: "#717182", fontSize: 12 }}>
             Loading recovery summary…
           </div>
+        ) : generating ? (
+          // While a fresh summary is generating, never show the previous
+          // (now-outdated) one — the whole point is current context. If
+          // generation fails, ff_generating clears and we fall back to
+          // whatever summary exists below.
+          <div style={{ textAlign: "center", padding: "36px 0" }}>
+            <div style={{ width: 32, height: 32, borderRadius: 10, border: `3px solid ${TEAL[100]}`, borderTopColor: TEAL[400], animation: "spin 0.9s linear infinite", margin: "0 auto 14px" }} />
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[600] }}>Generating your recovery summary…</p>
+            <p style={{ margin: "6px 0 0", fontSize: 11, color: "#717182" }}>Reading your recent activity and progress</p>
+          </div>
         ) : summary ? (
           <RecoverySummaryContent summary={summary} />
         ) : (
-          <RecoverySummaryContent summary={MOCK_RECOVERY_SUMMARY} />
+          // Honest empty state — no filler content pretending to be a real
+          // summary (no key configured, generation failed, or none yet).
+          <div style={{ textAlign: "center", padding: "36px 16px" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+              <svg width="18" height="18" fill="none" viewBox="0 0 18 18"><path d="M3 9h12M9 3v12" stroke={TEAL[200]} strokeWidth="1.6" strokeLinecap="round" opacity="0.6" transform="rotate(45 9 9)"/></svg>
+            </div>
+            <p style={{ margin: "0 0 4px", fontSize: 12, fontWeight: 600, color: "#030213" }}>No recovery summary yet</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 240, marginLeft: "auto", marginRight: "auto" }}>
+              A summary is generated when a distraction is detected or a break starts. You can head back and continue writing.
+            </p>
+          </div>
         )}
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
@@ -772,9 +836,19 @@ function RecoveryScreen({ setScreen }) {
 
 // ─── Screen 5: Break Mode ─────────────────────────────────────────────────────
 
-function BreakScreen({ setScreen, setHasRecoverySummary }) {
+// A voluntary break shorter than this is a false start (misclick, quick
+// stretch), not a real break: it's logged as a pause only, generates no
+// recovery summary, and returns straight to monitoring. Matches content.js's
+// PAUSE_THRESHOLD_MS — below it, the gap wouldn't even qualify as a pause
+// worth special treatment.
+const SHORT_BREAK_THRESHOLD_MS = 30000;
+
+function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
   const [secs, setSecs] = useState(0);
   const breakStartRef = useRef(Date.now()); // track when break started for totalBreakMs
+  // Read inside effects/handlers only (never during render): the origin is
+  // fixed for the lifetime of this mount, set by whichever control opened it.
+  const isPromptBreak = () => breakOriginRef?.current === "prompt";
 
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
@@ -785,14 +859,60 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
   // doesn't pollute phase durations, pauses, or distraction episodes.
   useEffect(() => {
     sendToTaskTab({ type: "FF_BREAK_START" });
+
+    // Pre-generate a recovery summary for AFTER the break, so "what you were
+    // doing / where you left off / next steps" survive the memory gap. All
+    // gates (baseline condition, no key, concurrency) live in background.js —
+    // fire and forget, must never affect the break.
+    //
+    // Timing depends on the break's origin: prompt-path breaks generate
+    // immediately (a distraction already happened); voluntary breaks wait out
+    // SHORT_BREAK_THRESHOLD_MS first — a sub-30s break is only a pause, and
+    // generating for it would waste a call on a summary nobody will see.
+    // Ending the break early unmounts this screen and cancels the timer.
+    function requestGeneration() {
+      if (typeof chrome !== "undefined" && chrome.runtime) {
+        try {
+          chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK", reason: "break" }, () => void chrome.runtime.lastError);
+        } catch (e) {
+          // dev preview / dead context — the break itself is unaffected
+        }
+      }
+    }
+
+    if (isPromptBreak()) {
+      requestGeneration();
+      return;
+    }
+    const genTimer = setTimeout(requestGeneration, SHORT_BREAK_THRESHOLD_MS);
+    return () => clearTimeout(genTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleContinue() {
     const breakMs = Date.now() - breakStartRef.current;
+    const promptBreak = isPromptBreak();
+    const isShortVoluntary = !promptBreak && breakMs < SHORT_BREAK_THRESHOLD_MS;
 
-    // Ends the tracking suspension and reports the break length so
-    // content.js can accumulate totalBreakMs — logged in both conditions.
-    sendToTaskTab({ type: "FF_BREAK_END", breakMs });
+    // Ends the tracking suspension and tells content.js how to account for
+    // this break (logged in both conditions):
+    //   prompt break        → break only (the distraction episode already
+    //                         represents the event — a pause would double-count)
+    //   voluntary >= 30s    → break AND pause (self-initiated disengagement)
+    //   voluntary < 30s     → pause only (false start, not a real break)
+    sendToTaskTab({
+      type: "FF_BREAK_END",
+      breakMs,
+      countAsBreak: !isShortVoluntary,
+      countAsPause: !promptBreak,
+    });
+
+    // A short voluntary break generated nothing (the timer was cancelled) —
+    // straight back to monitoring, no recovery screen in either condition.
+    if (isShortVoluntary) {
+      setScreen("monitoring");
+      return;
+    }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.get("ff_task", (result) => {
@@ -961,7 +1081,7 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
   const screenMap = {
     init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
@@ -986,9 +1106,10 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       showDistractionPrompt={showDistractionPrompt}
       setShowDistractionPrompt={setShowDistractionPrompt}
       promptDismissedRef={promptDismissedRef}
+      breakOriginRef={breakOriginRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
-    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
+    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} breakOriginRef={breakOriginRef} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
@@ -1009,6 +1130,11 @@ export default function App() {
   // and back to Monitoring, which otherwise unmounts and remounts that screen.
   const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
   const promptDismissedRef = useRef(false);
+  // How the current break was entered: "voluntary" (Take a break button) or
+  // "prompt" (the distraction prompt's Take a Break option). Lifted here
+  // because it's set in ActiveMonitoringScreen and read in BreakScreen —
+  // it decides pause-vs-break accounting and summary-generation timing.
+  const breakOriginRef = useRef("voluntary");
 
   // On popup open, check storage to decide the correct starting screen:
   // - ff_interrupted = true means the Docs tab was closed mid-session → init with interrupted notice
@@ -1049,6 +1175,7 @@ export default function App() {
           showDistractionPrompt={showDistractionPrompt}
           setShowDistractionPrompt={setShowDistractionPrompt}
           promptDismissedRef={promptDismissedRef}
+          breakOriginRef={breakOriginRef}
         />
       </div>
     </div>
