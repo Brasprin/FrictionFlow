@@ -12,6 +12,15 @@ const TAB_SWITCH_WINDOW_MS = 60000;       // rolling window for switch-frequency
 const RAPID_SWITCH_THRESHOLD = 3;         // >= this many switches in the window = Distracted
                                           // (a switch every ~20s — attention residue never
                                           // clears between switches; cf. Leroy 2009)
+const TAB_AWAY_THRESHOLD_MS = 60000;      // single tab-away tolerated up to this long; beyond
+                                          // it the away-stretch is Distracted. Short reference
+                                          // hops are free — frequency (above) catches repeats.
+const REVIEW_SIGNAL_WINDOW_MS = 60000;    // rolling window for revision signals (Reviewing rule)
+const DELETE_REVIEW_THRESHOLD = 5;        // >=5 deletions in the window (with low WPM) = revising,
+                                          // not typo-fixing — flow typos co-occur with high WPM,
+                                          // which the WPM gate already excludes
+const SELECT_REVIEW_THRESHOLD = 2;        // >=2 distinct selection gestures in the window =
+                                          // deliberate text manipulation, not a stray click
 
 
 //------------------- State --------------------------//
@@ -29,6 +38,12 @@ let lastPauseMs = 0;
 let isTyping = false;               // when state change since last flush
 let isTracking = false;             // whether tracking is currently active
 let listenerAttached = false;       // whether event listeners have been attached
+
+// Revision Signal Variables — deletions and text-selection gestures feed the
+// Reviewing rule (Flower & Hayes' reviewing = evaluating + revising; scroll
+// alone only captures the evaluating half, and misses short docs entirely).
+let deleteTimeStamps = [];      // one entry per Backspace/Delete keydown
+let selectionTimeStamps = [];   // one entry per selection gesture (debounced)
 
 // Scrolling Variables
 let scrollTimeStamps = [];
@@ -99,6 +114,34 @@ function rollingWPM() {
   // Normalize words-in-window to a per-minute rate — without the 60s/window
   // factor this reported words-per-30s as WPM (half the real value).
   return Math.round((keyStrokeTimeStamps.length / CHARS_PER_WORD) * (60000 / WPM_WINDOW_MS));
+}
+
+function rollingDeleteFrequency() {
+  const cutOff = Date.now() - REVIEW_SIGNAL_WINDOW_MS;
+  while (deleteTimeStamps.length > 0 && deleteTimeStamps[0] < cutOff) {
+    deleteTimeStamps.shift();
+  }
+  return deleteTimeStamps.length;
+}
+
+function rollingSelectionFrequency() {
+  const cutOff = Date.now() - REVIEW_SIGNAL_WINDOW_MS;
+  while (selectionTimeStamps.length > 0 && selectionTimeStamps[0] < cutOff) {
+    selectionTimeStamps.shift();
+  }
+  return selectionTimeStamps.length;
+}
+
+// Debounced: a held shift+arrow fires keydown repeats many times per second,
+// but one continuous extend-the-selection motion is ONE gesture. Signals
+// less than 1s apart merge into the previous gesture.
+function pushSelectionSignal(now) {
+  if (selectionTimeStamps.length === 0 || now - selectionTimeStamps[selectionTimeStamps.length - 1] > 1000) {
+    selectionTimeStamps.push(now);
+  }
+  // Selecting text is engagement — keep it from reading as idle.
+  lastActivityTime = now;
+  isTyping = true;
 }
 
 function rollingTabSwitchFrequency() {
@@ -231,7 +274,12 @@ function classifyPhase(scrollFreq) {
   // but the distraction EPISODE stays open until the first keystroke — see
   // finalizeDistractionEpisode, called from the keydown handler. Phase
   // drives the UI; the episode drives the H1 resumption measurement.
-  if (document.hidden) return "Distracted";
+  // A single tab-away is tolerated up to TAB_AWAY_THRESHOLD_MS (quick
+  // reference checks shouldn't flag) — beyond that the away-stretch is
+  // Distracted. While hidden, Chrome throttles our intervals to ~1/min,
+  // which still evaluates this rule in time for any meaningful away-stretch;
+  // repeated short hops are caught by the rapid-switch rule below instead.
+  if (document.hidden && tabHiddenAt !== null && now - tabHiddenAt > TAB_AWAY_THRESHOLD_MS) return "Distracted";
   if (currentPauseSec > 120) return "Distracted";
 
   // Distracted — rapid tab switching: >= RAPID_SWITCH_THRESHOLD switches in
@@ -241,8 +289,17 @@ function classifyPhase(scrollFreq) {
   // it the panel would show "Distracted" through genuine writing.
   if (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD && rollingWPM() < 10) return "Distracted";
 
-  // Reviewing — scrolling a lot with low typing
-  if (scrollFreq >= 5 && rollingWPM() < 10) return "Reviewing";
+  // Reviewing — rereading OR revising while production typing is low:
+  // heavy scrolling (evaluating a long doc), a run of deletions (pruning
+  // text — flow typo-fixes co-occur with high WPM, which the gate excludes),
+  // or repeated selection gestures (deliberate text manipulation). Any one
+  // signal suffices; each threshold is individually meaningful.
+  if (
+    (scrollFreq >= 5 ||
+      rollingDeleteFrequency() >= DELETE_REVIEW_THRESHOLD ||
+      rollingSelectionFrequency() >= SELECT_REVIEW_THRESHOLD) &&
+    rollingWPM() < 10
+  ) return "Reviewing";
 
   // Planning — pausing but still on the doc, low WPM, short bursts
   if (currentPauseSec > 15 && rollingWPM() < 10) return "Planning";
@@ -286,15 +343,17 @@ function updatePhaseTracking() {
   }
 }
 
-function startDistractionEpisode(now) {
+// triggerOverride is used by the retroactive tab-away catch in the
+// visibilitychange handler, where document.hidden is already false again.
+function startDistractionEpisode(now, triggerOverride) {
   if (activeDistraction) return;
   activeDistraction = {
     startedAt: now,
     // Three causes, distinguished for the export: hidden tab, rapid
     // switching while visible, or a long idle pause on the doc.
-    trigger: document.hidden
+    trigger: triggerOverride ?? (document.hidden
       ? "tab-away"
-      : (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD ? "rapid-switch" : "idle"),
+      : (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD ? "rapid-switch" : "idle")),
     returnedAt: null,
   };
 
@@ -396,6 +455,10 @@ function attachTypingListener() {
       netChars++;
     } else if (e.key === "Backspace" || e.key === "Delete") {
       netChars = Math.max(0, netChars - 1);
+      deleteTimeStamps.push(now); // revision signal for the Reviewing rule
+    } else if (e.shiftKey && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) {
+      // Keyboard text selection — a revision signal (debounced inside).
+      pushSelectionSignal(now);
     }
 
     // Pause detection if gap exceeds threshold
@@ -470,6 +533,38 @@ function attachScrollListener() {
   });
 }
 
+// Google Docs renders text on canvas, so there is no DOM selection to
+// observe — detect the selection GESTURE instead: a click-drag across the
+// editor, or a double-click (select word). Caveat: a scrollbar drag also
+// registers as one gesture, but two scrollbar drags in a minute while not
+// typing is doc navigation — Reviewing is the right call there anyway.
+function attachSelectionListener() {
+  const editor = document.querySelector(".kix-appview-editor");
+
+  if (!editor) {
+    setTimeout(attachSelectionListener, 500);
+    return;
+  }
+
+  let dragStart = null;
+
+  editor.addEventListener("mousedown", (e) => {
+    dragStart = { x: e.clientX, y: e.clientY };
+  });
+
+  editor.addEventListener("mouseup", (e) => {
+    if (!isTracking || !dragStart) return;
+    const moved = Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y);
+    dragStart = null;
+    if (moved > 8) pushSelectionSignal(Date.now()); // drag, not a plain caret click
+  });
+
+  editor.addEventListener("dblclick", () => {
+    if (!isTracking) return;
+    pushSelectionSignal(Date.now());
+  });
+}
+
 function attachTabSwitchListener() {
   document.addEventListener("visibilitychange", () => {
     if (!isTracking) return; // ignore activity once tracking has stopped
@@ -481,13 +576,32 @@ function attachTabSwitchListener() {
       lastTabSwitchTime = Date.now();
 
       // Classify + persist NOW — the phase interval may be throttled or
-      // frozen by Chrome once this tab is hidden, so waiting for the next
-      // tick can miss the distraction entirely.
+      // frozen by Chrome once this tab is hidden. This banks the pre-hide
+      // segment while state is fresh, and catches the rapid-switch rule
+      // immediately on the switch that crosses the threshold. (A single
+      // tab-away no longer flags here — see TAB_AWAY_THRESHOLD_MS.)
       if (!isOnBreak) {
         updatePhaseTracking();
         flushPhaseToStorage();
       }
     } else {
+      // Retroactive catch: if Chrome throttled/froze our intervals while the
+      // tab was hidden, an over-threshold away-stretch may never have been
+      // classified. Flip the segment to Distracted here, backdated to when
+      // the tolerance ran out, so the away time is attributed correctly.
+      // Must run before tabHiddenAt is cleared.
+      if (tabHiddenAt !== null && !isOnBreak) {
+        const awayMs = Date.now() - tabHiddenAt;
+        if (awayMs > TAB_AWAY_THRESHOLD_MS && currentTrackedPhase !== "Distracted") {
+          const flipAt = tabHiddenAt + TAB_AWAY_THRESHOLD_MS;
+          if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
+            phaseDurationsMs[currentTrackedPhase] += flipAt - phaseSegmentStartTime;
+          }
+          currentTrackedPhase = "Distracted";
+          phaseSegmentStartTime = flipAt;
+          startDistractionEpisode(flipAt, "tab-away");
+        }
+      }
       if (tabHiddenAt !== null) {
         totalTabAwayMs += Date.now() - tabHiddenAt;
         tabHiddenAt = null;
@@ -517,6 +631,7 @@ function attachListenersOnce() {
 
   attachTypingListener();
   attachScrollListener();
+  attachSelectionListener();
   attachTabSwitchListener();
 }
 
@@ -533,6 +648,9 @@ function resetSessionState() {
   longestPauseMs = 0;
   lastPauseMs = 0;
   isTyping = false;
+
+  deleteTimeStamps = [];
+  selectionTimeStamps = [];
 
   scrollTimeStamps = [];
   lastScrollTop = 0;
@@ -633,10 +751,26 @@ function startBreak() {
   finalizeDistractionEpisode(now);
 }
 
-function endBreak(breakMs) {
+// Break accounting is decided by the side panel (it knows the break's origin
+// and duration) and arrives as flags:
+//   countAsBreak — add to totalBreakMs (real breaks: prompt-path, or
+//                  voluntary >= 30s; a shorter voluntary break is a false
+//                  start, not a break)
+//   countAsPause — tally a pause event (voluntary breaks only: they're
+//                  self-initiated disengagement. Prompt-path breaks are
+//                  never pauses — they're already represented as a
+//                  distraction episode, and counting both would double-count
+//                  one event)
+function endBreak(breakMs, countAsBreak = true, countAsPause = false) {
   if (!isOnBreak) return;
   isOnBreak = false;
-  totalBreakMs += breakMs ?? 0;
+  if (countAsBreak) totalBreakMs += breakMs ?? 0;
+
+  if (countAsPause && (breakMs ?? 0) > 0) {
+    totalPauses++;
+    lastPauseMs = breakMs;
+    longestPauseMs = Math.max(longestPauseMs, breakMs);
+  }
 
   // Don't let the break gap read as a typing pause, an idle stretch, or a
   // continuing burst once tracking resumes.
@@ -647,7 +781,7 @@ function endBreak(breakMs) {
   // Persist immediately — the user may finish the session before typing again.
   safeStorageGet("ff_session", (result) => {
     const existing = (result && result.ff_session) ?? {};
-    safeStorageSet({ ff_session: { ...existing, totalBreakMs } });
+    safeStorageSet({ ff_session: { ...existing, totalBreakMs, totalPauses, longestPauseMs } });
   });
 }
 
@@ -681,6 +815,10 @@ function startIntervals() {
         if (scrollFreq < 10)  return "Medium";
         return "High";
       })(),
+
+      // Revision signals (counts only — feeds Reviewing analysis in export)
+      deleteFrequency: rollingDeleteFrequency(),
+      selectionFrequency: rollingSelectionFrequency(),
 
       // Tab Switching
       tabSwitchCount,
@@ -784,7 +922,7 @@ if (isExtensionContextValid()) {
     } else if (message?.type === "FF_BREAK_START") {
       startBreak();
     } else if (message?.type === "FF_BREAK_END") {
-      endBreak(message.breakMs ?? 0);
+      endBreak(message.breakMs ?? 0, message.countAsBreak ?? true, message.countAsPause ?? false);
     }
   });
 }

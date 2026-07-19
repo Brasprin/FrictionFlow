@@ -135,8 +135,9 @@ Thresholds are at **study values** (idle → Distracted after 120 s of no typing
 ## Known limitations
 
 - Word count is API-anchored when Docs API auth is configured (synced every 30 s, session-baseline-subtracted so pre-existing prompt text isn't counted); between syncs — and always, if OAuth isn't set up — it falls back to keystroke approximation (paste, undo, and autocorrect not counted)
-- Any tab-away counts as Distracted — the system cannot distinguish legitimate reference-checking from distraction (mitigate by using self-contained writing prompts in study sessions). Additionally, ≥3 tab switches within a rolling 60 s window classify the phase as Distracted even while on the doc (fragmented attention; suppressed while typing at ≥10 WPM so genuine writing is never misclassified)
+- Tab-aways count as Distracted on two thresholds: a single tab-away longer than 60 s, or ≥3 switches within a rolling 60 s window (fragmented attention — even while on the doc, though suppressed while typing at ≥10 WPM so genuine writing is never misclassified). Brief solitary hops (< 60 s, < 3/min) are tolerated, but the system still cannot verify that they were legitimate reference-checking (mitigate with self-contained writing prompts in study sessions)
 - Switching to another *application* (not just another tab) is detected via `document.hidden` and is indistinguishable from a tab switch
+- Reviewing is detected from scrolling, deletion runs (≥5/min), and text-selection gestures (≥2/min, via click-drag/double-click/shift+arrows — Docs renders on canvas, so gestures stand in for DOM selection). Motionless rereading (eyes only, no interaction) remains indistinguishable from a Planning pause — a fundamental limit of behavioral sensing without eye-tracking
 - Only Google Docs is supported as the writing environment
 
 ## Privacy

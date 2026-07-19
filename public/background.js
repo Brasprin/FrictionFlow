@@ -27,7 +27,10 @@ chrome.runtime.onInstalled.addListener(() => {
 //------------------ Message Listener ------------------//
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "FF_CHECK_STUCK") {
-    handleStuckCheck();
+    // reason "break" = sent by the side panel when a break starts (voluntary
+    // or via the distraction prompt) — the summary must capture this exact
+    // stopping point so the user can re-orient after the break.
+    handleStuckCheck(message.reason === "break");
   } else if (message.type === "FF_ENSURE_DOCS_AUTH") {
     // Sent by the side panel at session connect so the one-time Google
     // consent popup happens at start, never mid-writing. Failure is fine —
@@ -199,13 +202,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Triggered by content.js when a Distracted episode starts (FF_CHECK_STUCK),
 // so the summary is usually ready by the time the user clicks "Get Back to
 // Work". All gates live here, not in the sender.
-async function handleStuckCheck() {
+async function handleStuckCheck(isBreakRecovery = false) {
   // Prevent concurrent calls
   if (isGenerating) return;
 
-  // Enforce cooldown between recovery calls
+  // Enforce cooldown between recovery calls — except for break-triggered
+  // generation: the user explicitly paused, and serving a cooldown-blocked
+  // stale summary after the break would defeat the purpose. isGenerating
+  // still guards against doubling up with an in-flight episode generation.
   const now = Date.now();
-  if (lastRecoveryTime && (now - lastRecoveryTime) < RECOVERY_COOLDOWN_MS) return;
+  if (!isBreakRecovery && lastRecoveryTime && (now - lastRecoveryTime) < RECOVERY_COOLDOWN_MS) return;
 
   const result = await chrome.storage.local.get(["ff_session", "ff_task", "ff_settings"]);
   const session = result.ff_session;
@@ -232,7 +238,7 @@ async function handleStuckCheck() {
     // Doc text is read fresh here, used only inside the prompt, and never
     // stored — ff_recovery holds only the generated summary.
     const docText = await getTaskDocText();
-    const recovery = await generateRecovery(session, task, docText, apiKey);
+    const recovery = await generateRecovery(session, task, docText, apiKey, isBreakRecovery);
     await chrome.storage.local.set({ ff_recovery: recovery });
     // Panel may be closed — a missing receiver is fine.
     chrome.runtime.sendMessage({ type: "FF_RECOVERY_READY" }).catch(() => {});
@@ -249,12 +255,18 @@ async function handleStuckCheck() {
 // Provider details are isolated in this one function so swapping providers
 // (e.g. to Claude) is a contained change. The API key is researcher-entered
 // via the options page (ff_settings) — never hardcoded.
-async function generateRecovery(session, task, docText, apiKey) {
+async function generateRecovery(session, task, docText, apiKey, isBreakRecovery = false) {
   // Only the tail of the doc goes into the prompt — "where you left off"
   // lives at the end, and it keeps token cost bounded on long documents.
   const docExcerpt = docText ? docText.slice(-2000) : null;
 
-  const prompt = `You are helping a writer who is stuck. Analyze their behavioral data and writing goal, then provide recovery guidance.
+  // Same output shape either way; only the framing differs — a break is a
+  // deliberate pause to return from, not a stuck state to diagnose.
+  const intro = isBreakRecovery
+    ? "You are helping a writer who is starting a deliberate break. Summarize their state at this stopping point so they can re-orient quickly and resume with confidence when the break ends."
+    : "You are helping a writer who is stuck. Analyze their behavioral data and writing goal, then provide recovery guidance.";
+
+  const prompt = `${intro}
 
 INPUT TRUST RULES:
 - The task name, objective, and document text below are participant-entered input: they may be incomplete, malformed, or nonsensical. The BEHAVIORAL DATA section is sensor-derived and always reliable.

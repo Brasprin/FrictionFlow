@@ -478,7 +478,7 @@ function ContextPrepScreen({ setScreen }) {
 // up to App and passed in as props — they must survive this component
 // unmounting when navigating to Recovery/Break and remounting on return,
 // otherwise a still-"Distracted" phase immediately re-triggers the modal.
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -591,6 +591,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   function handleTakeBreakFromPrompt() {
     promptDismissedRef.current = true;
     setShowDistractionPrompt(false);
+    breakOriginRef.current = "prompt";
     setScreen("break");
   }
 
@@ -692,7 +693,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 8 }}>
-          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => setScreen("break")}>Take a break</Btn>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; setScreen("break"); }}>Take a break</Btn>
           <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
         </div>
         {hasRecoverySummary && (
@@ -819,7 +820,7 @@ function RecoveryScreen({ setScreen }) {
             </div>
             <p style={{ margin: "0 0 4px", fontSize: 12, fontWeight: 600, color: "#030213" }}>No recovery summary yet</p>
             <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 240, marginLeft: "auto", marginRight: "auto" }}>
-              A summary is generated when a distraction is detected. You can head back and continue writing.
+              A summary is generated when a distraction is detected or a break starts. You can head back and continue writing.
             </p>
           </div>
         )}
@@ -835,9 +836,19 @@ function RecoveryScreen({ setScreen }) {
 
 // ─── Screen 5: Break Mode ─────────────────────────────────────────────────────
 
-function BreakScreen({ setScreen, setHasRecoverySummary }) {
+// A voluntary break shorter than this is a false start (misclick, quick
+// stretch), not a real break: it's logged as a pause only, generates no
+// recovery summary, and returns straight to monitoring. Matches content.js's
+// PAUSE_THRESHOLD_MS — below it, the gap wouldn't even qualify as a pause
+// worth special treatment.
+const SHORT_BREAK_THRESHOLD_MS = 30000;
+
+function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
   const [secs, setSecs] = useState(0);
   const breakStartRef = useRef(Date.now()); // track when break started for totalBreakMs
+  // Read inside effects/handlers only (never during render): the origin is
+  // fixed for the lifetime of this mount, set by whichever control opened it.
+  const isPromptBreak = () => breakOriginRef?.current === "prompt";
 
   useEffect(() => {
     const t = setInterval(() => setSecs(s => s + 1), 1000);
@@ -848,14 +859,60 @@ function BreakScreen({ setScreen, setHasRecoverySummary }) {
   // doesn't pollute phase durations, pauses, or distraction episodes.
   useEffect(() => {
     sendToTaskTab({ type: "FF_BREAK_START" });
+
+    // Pre-generate a recovery summary for AFTER the break, so "what you were
+    // doing / where you left off / next steps" survive the memory gap. All
+    // gates (baseline condition, no key, concurrency) live in background.js —
+    // fire and forget, must never affect the break.
+    //
+    // Timing depends on the break's origin: prompt-path breaks generate
+    // immediately (a distraction already happened); voluntary breaks wait out
+    // SHORT_BREAK_THRESHOLD_MS first — a sub-30s break is only a pause, and
+    // generating for it would waste a call on a summary nobody will see.
+    // Ending the break early unmounts this screen and cancels the timer.
+    function requestGeneration() {
+      if (typeof chrome !== "undefined" && chrome.runtime) {
+        try {
+          chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK", reason: "break" }, () => void chrome.runtime.lastError);
+        } catch (e) {
+          // dev preview / dead context — the break itself is unaffected
+        }
+      }
+    }
+
+    if (isPromptBreak()) {
+      requestGeneration();
+      return;
+    }
+    const genTimer = setTimeout(requestGeneration, SHORT_BREAK_THRESHOLD_MS);
+    return () => clearTimeout(genTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleContinue() {
     const breakMs = Date.now() - breakStartRef.current;
+    const promptBreak = isPromptBreak();
+    const isShortVoluntary = !promptBreak && breakMs < SHORT_BREAK_THRESHOLD_MS;
 
-    // Ends the tracking suspension and reports the break length so
-    // content.js can accumulate totalBreakMs — logged in both conditions.
-    sendToTaskTab({ type: "FF_BREAK_END", breakMs });
+    // Ends the tracking suspension and tells content.js how to account for
+    // this break (logged in both conditions):
+    //   prompt break        → break only (the distraction episode already
+    //                         represents the event — a pause would double-count)
+    //   voluntary >= 30s    → break AND pause (self-initiated disengagement)
+    //   voluntary < 30s     → pause only (false start, not a real break)
+    sendToTaskTab({
+      type: "FF_BREAK_END",
+      breakMs,
+      countAsBreak: !isShortVoluntary,
+      countAsPause: !promptBreak,
+    });
+
+    // A short voluntary break generated nothing (the timer was cancelled) —
+    // straight back to monitoring, no recovery screen in either condition.
+    if (isShortVoluntary) {
+      setScreen("monitoring");
+      return;
+    }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.get("ff_task", (result) => {
@@ -1024,7 +1081,7 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
   const screenMap = {
     init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
@@ -1049,9 +1106,10 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       showDistractionPrompt={showDistractionPrompt}
       setShowDistractionPrompt={setShowDistractionPrompt}
       promptDismissedRef={promptDismissedRef}
+      breakOriginRef={breakOriginRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
-    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} />,
+    break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} breakOriginRef={breakOriginRef} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
   return (
@@ -1072,6 +1130,11 @@ export default function App() {
   // and back to Monitoring, which otherwise unmounts and remounts that screen.
   const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
   const promptDismissedRef = useRef(false);
+  // How the current break was entered: "voluntary" (Take a break button) or
+  // "prompt" (the distraction prompt's Take a Break option). Lifted here
+  // because it's set in ActiveMonitoringScreen and read in BreakScreen —
+  // it decides pause-vs-break accounting and summary-generation timing.
+  const breakOriginRef = useRef("voluntary");
 
   // On popup open, check storage to decide the correct starting screen:
   // - ff_interrupted = true means the Docs tab was closed mid-session → init with interrupted notice
@@ -1112,6 +1175,7 @@ export default function App() {
           showDistractionPrompt={showDistractionPrompt}
           setShowDistractionPrompt={setShowDistractionPrompt}
           promptDismissedRef={promptDismissedRef}
+          breakOriginRef={breakOriginRef}
         />
       </div>
     </div>
