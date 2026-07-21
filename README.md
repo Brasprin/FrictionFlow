@@ -125,11 +125,11 @@ Thresholds are at **study values** (idle → Distracted after 120 s of no typing
 
 ## Current status
 
-**Working:** behavioral logging, phase classification, time-in-phase analytics, distraction episodes with resumption times (H1 measure), baseline/intervention conditions, distraction prompt, break mode (tracking suspended during breaks), session interruption/resume, session analytics, real word counts via the Docs API, **AI recovery summaries (Gemini, pre-generated at distraction onset; honest empty state when no API key is configured or generation fails)**.
+**Working:** behavioral logging, phase classification, time-in-phase analytics, distraction episodes with resumption times (H1 measure), baseline/intervention conditions, distraction prompt, break mode (tracking suspended during breaks), session interruption/resume, session analytics, real word counts via the Docs API, **AI recovery summaries (Gemini, pre-generated at distraction onset; honest empty state when no API key is configured or generation fails)** with **three distinct next-step suggestions (goal-anchored / doc-driven / bridge)**, **participant selection of a next step (shown live below the phase while writing), and per-session tallying of which stance was chosen — full choice records plus a `suggestionTally` are attached to the session summary, ready for export**.
 
 **Not yet implemented:**
-- Session data export + participant ID (needed before data collection)
-- Intervention-event logging (prompt shown / response chosen / summary generated) for the export
+- Session data export file + participant ID (needed before data collection) — the chosen-suggestion records and tally are already captured in the session summary; the remaining work is the participant ID and the actual export/download
+- Intervention-event logging (prompt shown / summary generated) for the export — response-chosen is now logged; prompt-shown and summary-generated events are still pending
 - Post-session questionnaires (administered externally)
 
 ## Known limitations

@@ -99,7 +99,31 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
   if (variant === "danger") return <button style={{ ...base, background: "transparent", color: "#d4183d", border: "1px solid rgba(212,24,61,0.25)" }} onClick={onClick}>{children}</button>;
 }
 
-function RecoverySummaryContent({ summary }) {
+// Upsert the participant's chosen next-step for the current recovery episode.
+// Keyed by the episode's generatedAt so re-picking (including later via "View
+// last recovery summary") UPDATES the same record instead of adding a duplicate
+// — one distraction episode contributes at most one choice to the export tally.
+// A record freezes on its own once the next episode generates (a new
+// generatedAt is never written back to) or the session ends; there is no
+// separate "commit" step. The choice log (ff_suggestion_choices) is owned
+// solely by the panel — kept OUT of ff_session, which content.js
+// read-modify-writes continuously, so the two never race.
+function recordSuggestionChoice({ generatedAt, chosenIndex, options }) {
+  if (typeof chrome === "undefined" || !chrome.storage || !generatedAt) return;
+  chrome.storage.local.get("ff_suggestion_choices", (result) => {
+    const log = Array.isArray(result.ff_suggestion_choices) ? result.ff_suggestion_choices : [];
+    // chosenIndex IS the stance (0 = goal-anchored, 1 = doc-driven, 2 = bridge)
+    // because the suggestions array is generated in that fixed order. options
+    // preserves the two not-chosen suggestions for the export record.
+    const record = { at: Date.now(), generatedAt, chosenIndex, chosenText: options[chosenIndex], options };
+    const idx = log.findIndex((r) => r.generatedAt === generatedAt);
+    if (idx >= 0) log[idx] = record; else log.push(record);
+    chrome.storage.local.set({ ff_suggestion_choices: log });
+  });
+}
+
+function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
+  const selectable = typeof onSelect === "function";
   return (
     <>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
@@ -112,16 +136,31 @@ function RecoverySummaryContent({ summary }) {
           <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6, fontStyle: "italic" }}>{summary.whereYouLeftOff}</p>
         </div>
       </div>
-      <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Suggested next steps</p>
+      <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: selectable ? 3 : 8 }}>Suggested next steps</p>
+      {selectable && (
+        <p style={{ margin: "0 0 8px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>
+          Pick the one you'll work on — it'll show while you write. You can change it anytime here.
+        </p>
+      )}
       <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        {summary.suggestions.map((s, i) => (
-          <div key={i} style={{ background: "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${TEAL[100]}`, display: "flex", gap: 8, alignItems: "flex-start" }}>
-            <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[50], border: `1px solid ${TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
-              <span style={{ fontSize: 9, fontWeight: 700, color: TEAL[600] }}>{i + 1}</span>
+        {summary.suggestions.map((s, i) => {
+          const selected = selectedIndex === i;
+          return (
+            <div
+              key={i}
+              onClick={selectable ? () => onSelect(i) : undefined}
+              role={selectable ? "button" : undefined}
+              tabIndex={selectable ? 0 : undefined}
+              onKeyDown={selectable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(i); } } : undefined}
+              style={{ background: selected ? TEAL[50] : "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${selected ? TEAL[400] : TEAL[100]}`, boxShadow: selected ? `0 0 0 1px ${TEAL[400]}` : "none", display: "flex", gap: 8, alignItems: "flex-start", cursor: selectable ? "pointer" : "default", transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s" }}
+            >
+              <div style={{ width: 18, height: 18, borderRadius: 999, background: selected ? TEAL[400] : TEAL[50], border: `1px solid ${selected ? TEAL[400] : TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                <span style={{ fontSize: 9, fontWeight: 700, color: selected ? "#fff" : TEAL[600] }}>{i + 1}</span>
+              </div>
+              <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
             </div>
-            <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </>
   );
@@ -203,6 +242,7 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_interrupted");
         chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
         chrome.storage.local.remove("ff_generating");
+        chrome.storage.local.remove("ff_suggestion_choices"); // and neither must last session's choices
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -230,6 +270,7 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_interrupted");
       chrome.storage.local.remove("ff_recovery");
       chrome.storage.local.remove("ff_generating");
+      chrome.storage.local.remove("ff_suggestion_choices");
     }
 
     setTaskName("");
@@ -474,11 +515,18 @@ function ContextPrepScreen({ setScreen }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-// showDistractionPrompt/setShowDistractionPrompt/promptDismissedRef are lifted
-// up to App and passed in as props — they must survive this component
-// unmounting when navigating to Recovery/Break and remounting on return,
-// otherwise a still-"Distracted" phase immediately re-triggers the modal.
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
+// After the user dismisses the Gentle Reminder, suppress re-showing it for this
+// long. Dismissing silences the CURRENT instance but must not disable detection:
+// if the writer is still distracted once the cooldown passes, the reminder
+// returns. A genuinely new distraction episode bypasses the cooldown entirely.
+const PROMPT_COOLDOWN_MS = 60000;
+
+// showDistractionPrompt/setShowDistractionPrompt and the two prompt refs
+// (promptSuppressUntilRef, lastDistractionOnsetRef) are lifted up to App and
+// passed in as props — they must survive this component unmounting when
+// navigating to Recovery/Break and remounting on return, otherwise the
+// dismiss cooldown and last-seen episode would reset and re-trigger the modal.
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -493,6 +541,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [currentPhase, setCurrentPhase] = useState("Planning");
   const [condition, setCondition] = useState("intervention");
   const [distractionCount, setDistractionCount] = useState(0);
+  // The next-step the participant chose for the CURRENT recovery episode, shown
+  // between the phase and the active context. Null once a new episode generates
+  // (its generatedAt no longer matches any choice) until they pick again.
+  const [activeStep, setActiveStep] = useState(null);
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -521,7 +573,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.get(["ff_session", "ff_task"], (result) => {
+        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices"], (result) => {
           const s = result.ff_session;
           const t = result.ff_task;
 
@@ -530,6 +582,15 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             setObjective(t.objective ?? "");
             setCondition(t.condition ?? "intervention");
           }
+
+          // Show the chosen step only for the current episode: match the choice
+          // record to the live ff_recovery.generatedAt. A newer generation has
+          // no matching record yet, so this clears until they re-pick.
+          const gen = result.ff_recovery?.generatedAt;
+          const rec = gen && Array.isArray(result.ff_suggestion_choices)
+            ? result.ff_suggestion_choices.find((c) => c.generatedAt === gen)
+            : null;
+          setActiveStep(rec ? rec.chosenText : null);
 
           if (!s) return;
           setWpm(s.wpm ?? 0);
@@ -542,19 +603,37 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setDistractionCount(s.distractionCount ?? 0);
           setTotalDocWords(s.totalDocWords ?? 0);
 
-          // Auto-trigger the distraction prompt when the phase reads
-          // "Distracted", once per episode. The prompt is STICKY by owner
-          // decision: it never dismisses itself — not on returning to the
-          // doc, not on typing — only the user's button click closes it
-          // (see the three handlers). Leaving Distracted merely re-arms the
-          // trigger for the next episode. Behavioral logging runs
-          // identically in both conditions — only baseline suppresses the
-          // prompt itself, since that's the study's independent variable.
+          // Auto-trigger the distraction prompt. Two independent triggers, so a
+          // dismiss silences the current instance without disabling detection:
+          //   1. A NEW distraction episode began (distractionOnsetCount rose) —
+          //      fires immediately, bypassing the cooldown. This also covers
+          //      tab-away, whose phase flips back to non-Distracted on return
+          //      before this poll ever sees "Distracted"; the onset still fires.
+          //   2. The writer is STILL "Distracted" and the post-dismiss cooldown
+          //      has elapsed — re-nudges a continuing distraction (e.g. repeated
+          //      tab-switching that never lets the phase leave "Distracted").
+          // The prompt is STICKY by owner decision: it never dismisses itself —
+          // only the user's button click closes it (see the three handlers).
+          // Behavioral logging runs identically in both conditions — only
+          // baseline suppresses the prompt, since that's the independent variable.
           const isBaseline = (t?.condition ?? "intervention") === "baseline";
-          if (s.currentPhase === "Distracted") {
-            if (!isBaseline && !promptDismissedRef.current) setShowDistractionPrompt(true);
-          } else {
-            promptDismissedRef.current = false;
+          if (!isBaseline) {
+            const onset = s.distractionOnsetCount ?? 0;
+            const isDistracted = s.currentPhase === "Distracted";
+            // Establish the baseline on first read so reopening the panel
+            // mid-episode doesn't retro-fire for an already-known distraction.
+            let newEpisode = false;
+            if (lastDistractionOnsetRef.current === null) {
+              lastDistractionOnsetRef.current = onset;
+            } else if (onset > lastDistractionOnsetRef.current) {
+              lastDistractionOnsetRef.current = onset;
+              newEpisode = true;
+            }
+            const cooldownElapsed = Date.now() >= promptSuppressUntilRef.current;
+            if (newEpisode || (isDistracted && cooldownElapsed)) {
+              promptSuppressUntilRef.current = 0; // clear any spent cooldown
+              setShowDistractionPrompt(true);
+            }
           }
         });
       }
@@ -562,7 +641,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     readStorage();
     const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
-  }, [promptDismissedRef, setShowDistractionPrompt]);
+  }, [promptSuppressUntilRef, lastDistractionOnsetRef, setShowDistractionPrompt]);
 
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
@@ -578,25 +657,26 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
-  // All three responses acknowledge the current distraction episode — none
-  // of them should cause the modal to reappear until the phase leaves
-  // "Distracted" and a new episode begins later.
+  // All three responses acknowledge the current distraction episode: start the
+  // dismiss cooldown so the modal doesn't immediately reappear, while still
+  // allowing a re-nudge if the writer stays distracted past the cooldown, or a
+  // genuinely new episode begins (both handled in the poll above).
   function handleGetBackToWork() {
-    promptDismissedRef.current = true;
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     setHasRecoverySummary(true);
     setScreen("recovery");
   }
 
   function handleTakeBreakFromPrompt() {
-    promptDismissedRef.current = true;
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     breakOriginRef.current = "prompt";
     setScreen("break");
   }
 
   function handleDismissPrompt() {
-    promptDismissedRef.current = true;
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
   }
 
@@ -606,7 +686,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       : elapsed;
 
     // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
-    function buildAndNavigate(sessionSnapshot = {}) {
+    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = []) {
+      // Finalize the suggestion tally. chosenIndex is the stance
+      // (0 = goal-anchored, 1 = doc-driven, 2 = bridge); every remaining record
+      // is a frozen per-episode choice, so summing by index gives the export
+      // counts. suggestionChoices keeps the full record (incl. the not-chosen
+      // options) for the study's data export.
+      const suggestionTally = suggestionChoices.reduce((acc, c) => {
+        if (typeof c.chosenIndex === "number") acc[c.chosenIndex] = (acc[c.chosenIndex] ?? 0) + 1;
+        return acc;
+      }, {});
       const finishedSummary = {
         taskName,
         condition,
@@ -622,6 +711,8 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         distractionCount: sessionSnapshot.distractionCount ?? 0,
         distractionEpisodes: sessionSnapshot.distractionEpisodes ?? [],
         avgResumptionMs: sessionSnapshot.avgResumptionMs ?? 0,
+        suggestionChoices,
+        suggestionTally,
       };
       setSummary(finishedSummary);
 
@@ -634,17 +725,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_recovery");
         chrome.storage.local.remove("ff_generating");
+        chrome.storage.local.remove("ff_suggestion_choices");
       }
 
       setScreen("analytics");
     }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get("ff_session", (result) => {
-        buildAndNavigate(result.ff_session ?? {});
+      chrome.storage.local.get(["ff_session", "ff_suggestion_choices"], (result) => {
+        buildAndNavigate(result.ff_session ?? {}, result.ff_suggestion_choices ?? []);
       });
     } else {
-      buildAndNavigate({});
+      buildAndNavigate({}, []);
     }
   }
 
@@ -683,6 +775,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             <div style={{ flex: 1, background: activePhase.color, transition: "background 0.5s" }} />
           </div>
         </div>
+        {/* Chosen next step (current recovery episode) */}
+        {activeStep && (
+          <>
+            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Your next step</p>
+            <div style={{ background: "#fff", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[200]}`, display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[400], display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5l2.2 2.2L9.5 3.8" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </div>
+              <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.5 }}>{activeStep}</p>
+            </div>
+          </>
+        )}
         {/* Task context */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active context</p>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
@@ -738,10 +842,14 @@ function RecoveryScreen({ setScreen }) {
   const [summary, setSummary] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Which of the 3 suggestions this episode's choice currently sits on (null =
+  // no pick yet). Reloaded from the choice log so revisiting via "View last
+  // recovery summary" shows — and lets the participant change — their pick.
+  const [selectedIndex, setSelectedIndex] = useState(null);
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating", "ff_suggestion_choices"], (result) => {
         const t = result.ff_task;
         const r = result.ff_recovery;
         if (t) {
@@ -753,7 +861,12 @@ function RecoveryScreen({ setScreen }) {
             whatYouWereDoing: r.whatYouWereDoing,
             whereYouLeftOff: r.whereYouLeftOff,
             suggestions: r.suggestedNextSteps ?? [],
+            generatedAt: r.generatedAt,
           });
+          const prior = Array.isArray(result.ff_suggestion_choices)
+            ? result.ff_suggestion_choices.find((c) => c.generatedAt === r.generatedAt)
+            : null;
+          setSelectedIndex(prior ? prior.chosenIndex : null);
         }
         setGenerating(typeof result.ff_generating === "number" && Date.now() - result.ff_generating < GENERATING_STALE_MS);
         setLoading(false);
@@ -762,6 +875,12 @@ function RecoveryScreen({ setScreen }) {
       setLoading(false);
     }
   }, []);
+
+  function handleSelectSuggestion(i) {
+    if (!summary) return;
+    setSelectedIndex(i);
+    recordSuggestionChoice({ generatedAt: summary.generatedAt, chosenIndex: i, options: summary.suggestions });
+  }
 
   // Generation is often still in flight when the user arrives here (it
   // starts when the Distracted episode starts) — show a generating state
@@ -776,7 +895,11 @@ function RecoveryScreen({ setScreen }) {
           whatYouWereDoing: r.whatYouWereDoing,
           whereYouLeftOff: r.whereYouLeftOff,
           suggestions: r.suggestedNextSteps ?? [],
+          generatedAt: r.generatedAt,
         });
+        // A freshly generated episode has no pick yet; the previous episode's
+        // record is left frozen in the log for the tally.
+        setSelectedIndex(null);
       }
       if ("ff_generating" in changes) {
         const v = changes.ff_generating.newValue;
@@ -810,7 +933,7 @@ function RecoveryScreen({ setScreen }) {
             <p style={{ margin: "6px 0 0", fontSize: 11, color: "#717182" }}>Reading your recent activity and progress</p>
           </div>
         ) : summary ? (
-          <RecoverySummaryContent summary={summary} />
+          <RecoverySummaryContent summary={summary} selectedIndex={selectedIndex} onSelect={handleSelectSuggestion} />
         ) : (
           // Honest empty state — no filler content pretending to be a real
           // summary (no key configured, generation failed, or none yet).
@@ -1081,12 +1204,13 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
   const screenMap = {
     init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
       setShowDistractionPrompt(false);
-      promptDismissedRef.current = false;
+      promptSuppressUntilRef.current = 0;
+      lastDistractionOnsetRef.current = null;
       if (typeof chrome !== "undefined" && chrome.storage) {
         chrome.storage.local.remove("ff_interrupted");
       }
@@ -1105,7 +1229,8 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       setHasRecoverySummary={setHasRecoverySummary}
       showDistractionPrompt={showDistractionPrompt}
       setShowDistractionPrompt={setShowDistractionPrompt}
-      promptDismissedRef={promptDismissedRef}
+      promptSuppressUntilRef={promptSuppressUntilRef}
+      lastDistractionOnsetRef={lastDistractionOnsetRef}
       breakOriginRef={breakOriginRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
@@ -1129,7 +1254,14 @@ export default function App() {
   // distraction-prompt acknowledgment survives navigating to Recovery/Break
   // and back to Monitoring, which otherwise unmounts and remounts that screen.
   const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
-  const promptDismissedRef = useRef(false);
+  // Timestamp until which the reminder stays suppressed after a dismiss (0 = not
+  // suppressed). A timestamp, not a boolean, so dismissing silences the current
+  // instance for PROMPT_COOLDOWN_MS without permanently disabling detection.
+  const promptSuppressUntilRef = useRef(0);
+  // Highest distractionOnsetCount the panel has already reacted to, so each NEW
+  // episode re-arms the reminder exactly once. Null until the first storage read
+  // establishes the baseline.
+  const lastDistractionOnsetRef = useRef(null);
   // How the current break was entered: "voluntary" (Take a break button) or
   // "prompt" (the distraction prompt's Take a Break option). Lifted here
   // because it's set in ActiveMonitoringScreen and read in BreakScreen —
@@ -1174,7 +1306,8 @@ export default function App() {
           setHasRecoverySummary={setHasRecoverySummary}
           showDistractionPrompt={showDistractionPrompt}
           setShowDistractionPrompt={setShowDistractionPrompt}
-          promptDismissedRef={promptDismissedRef}
+          promptSuppressUntilRef={promptSuppressUntilRef}
+          lastDistractionOnsetRef={lastDistractionOnsetRef}
           breakOriginRef={breakOriginRef}
         />
       </div>

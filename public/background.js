@@ -300,7 +300,10 @@ Field guidance:
 - whereYouLeftOff: ${docExcerpt
     ? "one sentence pointing at the last thing they wrote — quote a short fragment ONLY if the recent text is coherent; if it isn't, estimate their position from the timing and phase data instead"
     : "one sentence estimating where they were in the task based on timing and phase data"}
-- suggestedNextSteps: exactly 3 specific, actionable suggestions tailored to their task`;
+- suggestedNextSteps: exactly 3 specific, actionable suggestions, each taking a DISTINCT stance. They must be meaningfully different from one another — not three rephrasings of the same idea. Return them in this fixed order:
+    1. GOAL-ANCHORED: steers the writer back toward their stated Objective. Grounded in the objective regardless of any drift in the recent text.
+    2. DOC-DRIVEN: takes its direction from what the recent DOCUMENT text is ACTUALLY about, even where that has drifted from the objective — propose the next move that continues the thread they are really writing. If there is no document text, or the recent text is too incoherent to read a direction from (see INPUT TRUST RULES), fall back to a fresh angle on the objective that clearly differs from suggestion 1.
+    3. BRIDGE: explicitly connects the objective with the direction of the recent text — a next step that ties the two together (comparing, contrasting, or relating them). If the recent text has not drifted from the objective, instead synthesize two distinct sub-aspects of the objective.`;
 
   // responseSchema guarantees parseable JSON — no prompt-begging needed.
   const responseSchema = {

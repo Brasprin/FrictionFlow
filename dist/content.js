@@ -92,6 +92,12 @@ let phaseSegmentStartTime = null;
 // (for tab-away episodes) or the full episode length (for idle episodes).
 let distractionEpisodes = [];
 let activeDistraction = null; // { startedAt, trigger, returnedAt } while an episode is ongoing
+// Monotonic count of distraction episodes STARTED (incremented at onset, unlike
+// distractionEpisodes.length which only grows when an episode CLOSES on the next
+// keystroke). The panel watches this to re-arm the Gentle Reminder per episode —
+// it fires even for tab-away episodes, whose phase flips back to non-Distracted
+// on return before the panel's poll would ever observe "Distracted".
+let distractionOnsetCount = 0;
 
 // Interval handles — needed so we can clear them on extension context invalidation
 let flushIntervalId = null;
@@ -347,6 +353,7 @@ function updatePhaseTracking() {
 // visibilitychange handler, where document.hidden is already false again.
 function startDistractionEpisode(now, triggerOverride) {
   if (activeDistraction) return;
+  distractionOnsetCount++; // onset signal for the panel's per-episode re-arm
   activeDistraction = {
     startedAt: now,
     // Three causes, distinguished for the export: hidden tab, rapid
@@ -417,6 +424,7 @@ function flushPhaseToStorage() {
         currentPhase: currentTrackedPhase,
         phaseDurationsMs: getPhaseDurationsMsSnapshot(),
         distractionCount: distractionEpisodes.length,
+        distractionOnsetCount,
         distractionEpisodes,
         avgResumptionMs: getAvgResumptionMs(),
       }
@@ -682,6 +690,7 @@ function resetSessionState() {
 
   distractionEpisodes = [];
   activeDistraction = null;
+  distractionOnsetCount = 0;
 }
 
 function startTracking() {
@@ -718,6 +727,10 @@ function resumeTracking(snapshot, task) {
       phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
     }
     distractionEpisodes = snapshot.distractionEpisodes ?? [];
+    // Preserve the onset baseline across reinjection so the panel doesn't
+    // treat a resumed session as a brand-new episode. Fall back to the closed-
+    // episode count if an older snapshot predates this field.
+    distractionOnsetCount = snapshot.distractionOnsetCount ?? distractionEpisodes.length;
   }
 
   isTracking = true;
@@ -836,6 +849,7 @@ function startIntervals() {
 
       // Distraction episodes
       distractionCount: distractionEpisodes.length,
+      distractionOnsetCount,
       distractionEpisodes,
       avgResumptionMs: getAvgResumptionMs(),
 
