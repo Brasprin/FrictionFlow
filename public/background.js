@@ -165,14 +165,23 @@ async function getTaskDocText() {
 //------------------ Tab Closure / Navigation Detection ------------------//
 // Fires when any tab is closed. If it matches the session tab, mark interrupted.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  chrome.storage.local.get("ff_task", (result) => {
+  chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
     const task = result.ff_task;
     if (!task) return;
 
     if (task.tabId === tabId) {
-      chrome.storage.local.set({ ff_interrupted: true });
-      chrome.storage.local.remove("ff_session");
-      chrome.storage.local.remove("ff_idle");
+      // Preserve ff_session (and ff_idle) so "Resume session" can restore the
+      // accumulated metrics. Deleting them here silently zeroed a resumed
+      // session's data while the clock kept running. Fresh starts and the
+      // "Discard session" path clear these keys themselves, so a leftover
+      // snapshot is only ever read by Resume — which is exactly what we want.
+      //
+      // Timestamp the interruption so resume can measure the offline gap and
+      // subtract it from writing time. Keep the earliest `at` if an
+      // interruption is already open (doc reopened, then closed again before
+      // resuming) so the whole offline stretch is counted, not just the last.
+      const at = result.ff_interrupted?.at ?? Date.now();
+      chrome.storage.local.set({ ff_interrupted: { at } });
       console.log("FrictionFlow: session tab closed — marked as interrupted.");
     }
   });
@@ -182,16 +191,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.url) return;
 
-  chrome.storage.local.get("ff_task", (result) => {
+  chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
     const task = result.ff_task;
     if (!task) return;
     if (task.tabId !== tabId) return;
 
     const isStillOnDocs = changeInfo.url.startsWith("https://docs.google.com/");
     if (!isStillOnDocs) {
-      chrome.storage.local.set({ ff_interrupted: true });
-      chrome.storage.local.remove("ff_session");
-      chrome.storage.local.remove("ff_idle");
+      // Preserve ff_session (and ff_idle) so the session can be resumed with
+      // its metrics intact — see the tab-close handler above for the rationale.
+      // Timestamp the interruption (earliest `at` wins) so resume can subtract
+      // the offline gap from writing time.
+      const at = result.ff_interrupted?.at ?? Date.now();
+      chrome.storage.local.set({ ff_interrupted: { at } });
       console.log("FrictionFlow: session tab left Docs — marked as interrupted.");
     }
   });

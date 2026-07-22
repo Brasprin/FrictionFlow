@@ -31,7 +31,7 @@ function resumeTaskTracking() {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const active = tabs[0];
     const isDocsTab = !!active?.url?.startsWith("https://docs.google.com/");
-    chrome.storage.local.get("ff_task", (result) => {
+    chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
       const task = result.ff_task;
       if (!task) return;
       if (isDocsTab && active.id !== task.tabId) {
@@ -39,7 +39,19 @@ function resumeTaskTracking() {
       }
       const targetId = isDocsTab ? active.id : task.tabId;
       if (!targetId) return;
-      chrome.tabs.sendMessage(targetId, { type: "FF_RESUME_TASK" }).catch(() => {});
+      // If this resume follows an interruption (Docs tab closed/left), measure
+      // the offline gap here — where ff_interrupted is still readable — and
+      // pass it to the content script so it's subtracted from writing time.
+      // Clearing ff_interrupted is owned by this function (only on a confirmed
+      // resume), so it isn't cleared out from under this read by a racing
+      // remove() elsewhere.
+      const wasInterrupted = !!result.ff_interrupted;
+      const interruptedMs = result.ff_interrupted?.at
+        ? Math.max(0, Date.now() - result.ff_interrupted.at)
+        : 0;
+      chrome.tabs.sendMessage(targetId, { type: "FF_RESUME_TASK", interruptedMs })
+        .then(() => { if (wasInterrupted) chrome.storage.local.remove("ff_interrupted"); })
+        .catch(() => {});
     });
   });
 }
@@ -122,6 +134,153 @@ function recordSuggestionChoice({ generatedAt, chosenIndex, options }) {
   });
 }
 
+// Appends a distraction-prompt intervention event (the "Gentle Reminder" shown,
+// or the participant's response: get_back_to_work / take_a_break / dismiss) to a
+// panel-owned log. Kept OUT of ff_session — which content.js read-modify-writes
+// continuously — so the two never race. Feeds the intervention-event export.
+function logInterventionEvent(type, detail = {}) {
+  if (typeof chrome === "undefined" || !chrome.storage) return;
+  chrome.storage.local.get("ff_events", (result) => {
+    const log = Array.isArray(result.ff_events) ? result.ff_events : [];
+    log.push({ at: Date.now(), type, ...detail });
+    chrome.storage.local.set({ ff_events: log });
+  });
+}
+
+// ─── Session data export ──────────────────────────────────────────────────────
+
+// Triggers a file download from the side panel via an in-memory blob — no
+// "downloads" permission needed, since the panel is a normal extension page.
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Quote a CSV cell and escape embedded quotes, so free-text fields (task name,
+// objective) with commas/quotes/newlines don't break the row.
+function csvCell(value) {
+  const str = value === null || value === undefined ? "" : String(value);
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+// Slugs a value for use in a filename (participant id, condition).
+function fileSlug(value, fallback) {
+  const s = String(value ?? "").trim().replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return s || fallback;
+}
+
+// Builds the per-session export payloads (rich JSON + one flat CSV row) from the
+// finish summary. Kept as one function so the two formats can never drift.
+function buildSessionExport(s) {
+  const sec = (ms) => Math.round((ms ?? 0) / 1000);
+  const totalSec = s.elapsedSeconds ?? 0;
+  const breakSec = sec(s.totalBreakMs);
+  const offlineSec = sec(s.totalInterruptedMs);
+  const writingSec = Math.max(0, totalSec - breakSec - offlineSec);
+  const phases = s.phaseDurationsMs ?? {};
+  const translatingSec = sec(phases.Translating);
+  const typedWords = s.typedWordCount ?? 0;
+  // Overall pace = words over all engaged time (dragged down by every pause).
+  // Focused pace = words over active drafting time (the Translating phase), the
+  // genuine typing pace. Both exported; UI shows focused.
+  const avgWpmOverall = writingSec > 0 ? Math.round(typedWords / (writingSec / 60)) : 0;
+  const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
+  const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
+  const respCount = (r) => events.filter((e) => e.type === "response" && e.response === r).length;
+  const tally = s.suggestionTally ?? {};
+
+  const json = {
+    participantId: s.participantId || "",
+    condition: s.condition || "",
+    task: { name: s.taskName || "", objective: s.objective || "" },
+    session: {
+      startedAt: s.startedAt ? new Date(s.startedAt).toISOString() : null,
+      endedAt: s.endedAt ? new Date(s.endedAt).toISOString() : null,
+      totalTimeSec: totalSec,
+      writingTimeSec: writingSec,
+      breakTimeSec: breakSec,
+      offlineTimeSec: offlineSec,
+      interrupted: offlineSec > 0,
+    },
+    words: { docWords: s.wordCount ?? 0, typedWords },
+    typing: {
+      avgWpmOverall,
+      avgWpmFocused,
+      totalPauses: s.totalPauses ?? 0,
+      longestPauseSec: sec(s.longestPauseMs),
+      burstCount: s.burstCount ?? 0,
+      avgBurstSec: s.avgBurstDurationSec ?? 0,
+      scrollFrequency: s.scrollFrequency ?? 0,
+      tabSwitchCount: s.tabSwitchCount ?? 0,
+    },
+    phasesMs: {
+      Planning: phases.Planning ?? 0,
+      Translating: phases.Translating ?? 0,
+      Reviewing: phases.Reviewing ?? 0,
+      Distracted: phases.Distracted ?? 0,
+    },
+    distractions: {
+      count: s.distractionCount ?? 0,
+      avgResumptionSec: sec(s.avgResumptionMs),
+      episodes: s.distractionEpisodes ?? [],
+    },
+    promptResponses: {
+      promptsShown: events.filter((e) => e.type === "prompt_shown").length,
+      getBackToWork: respCount("get_back_to_work"),
+      takeABreak: respCount("take_a_break"),
+      dismiss: respCount("dismiss"),
+    },
+    recoverySuggestions: { tally, choices: s.suggestionChoices ?? [] },
+    interventionEvents: events,
+    exportedAt: new Date().toISOString(),
+  };
+
+  const cols = [
+    ["participantId", json.participantId],
+    ["condition", json.condition],
+    ["taskName", json.task.name],
+    ["startedAt", json.session.startedAt],
+    ["endedAt", json.session.endedAt],
+    ["totalTimeSec", totalSec],
+    ["writingTimeSec", writingSec],
+    ["breakTimeSec", breakSec],
+    ["offlineTimeSec", offlineSec],
+    ["interrupted", json.session.interrupted ? 1 : 0],
+    ["docWords", json.words.docWords],
+    ["typedWords", typedWords],
+    ["avgWpmOverall", avgWpmOverall],
+    ["avgWpmFocused", avgWpmFocused],
+    ["totalPauses", json.typing.totalPauses],
+    ["longestPauseSec", json.typing.longestPauseSec],
+    ["planningSec", sec(phases.Planning)],
+    ["translatingSec", sec(phases.Translating)],
+    ["reviewingSec", sec(phases.Reviewing)],
+    ["distractedSec", sec(phases.Distracted)],
+    ["distractionCount", json.distractions.count],
+    ["avgResumptionSec", json.distractions.avgResumptionSec],
+    ["promptsShown", json.promptResponses.promptsShown],
+    ["respGetBackToWork", json.promptResponses.getBackToWork],
+    ["respTakeBreak", json.promptResponses.takeABreak],
+    ["respDismiss", json.promptResponses.dismiss],
+    ["suggestStance0", tally[0] ?? 0],
+    ["suggestStance1", tally[1] ?? 0],
+    ["suggestStance2", tally[2] ?? 0],
+  ];
+  const csv = cols.map(([k]) => csvCell(k)).join(",") + "\r\n" + cols.map(([, v]) => csvCell(v)).join(",") + "\r\n";
+
+  const datePart = (s.startedAt ? new Date(s.startedAt) : new Date()).toISOString().slice(0, 10);
+  const base = `${fileSlug(s.participantId, "session")}_${fileSlug(s.condition, "cond")}_${datePart}`;
+
+  return { json, csv, base };
+}
+
 function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
   const selectable = typeof onSelect === "function";
   return (
@@ -169,19 +328,26 @@ function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
 // ─── Screen 1: Task Initialization ───────────────────────────────────────────
 
 function TaskInitScreen({ onStart }) {
+  const [participantId, setParticipantId] = useState(""); // stamped on the data export
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
-  const [nameError, setNameError] = useState(false); // shown on a Start attempt with an empty name
+  // All three fields are required — shown on a Start attempt with any empty.
+  const [participantIdError, setParticipantIdError] = useState(false);
+  const [nameError, setNameError] = useState(false);
+  const [objectiveError, setObjectiveError] = useState(false);
   const [isActive, setIsActive] = useState(false);
   const [isInterrupted, setIsInterrupted] = useState(false);
   // "baseline" = no recovery prompts (control condition); "intervention" =
   // recovery prompts enabled. This is the study's independent variable.
   const [condition, setCondition] = useState("intervention");
 
+  // Self-contained senior high school writing prompts — opinion/reflection
+  // based, so participants can write from their own knowledge without needing
+  // to leave the doc to research (tab-switching would register as distraction).
   const templates = [
-    { name: "Research Essay", obj: "Write a 500-word essay on the impact of AI in education." },
-    { name: "Lab Report", obj: "Summarize findings from Experiment 3 with discussion." },
-    { name: "Reflection Paper", obj: "Reflect on this week's readings on cognitive load theory." },
+    { name: "Position Paper", obj: "Argue for or against allowing students to use AI tools for schoolwork. Take a clear stance and support it with at least three reasons." },
+    { name: "Reflective Essay", obj: "Reflect on a challenge you faced this school year and what it taught you about yourself as a student." },
+    { name: "Argumentative Essay", obj: "Should senior high school students be required to wear uniforms? Defend your position with clear arguments." },
   ];
 
   useEffect(() => {
@@ -189,6 +355,7 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft"], (result) => {
         const t = result.ff_task;
         if (t) {
+          setParticipantId(t.participantId ?? "");
           setTaskName(t.taskName ?? "");
           setObjective(t.objective ?? "");
           setCondition(t.condition ?? "intervention");
@@ -201,6 +368,7 @@ function TaskInitScreen({ onStart }) {
         // resurface in unrelated future sessions.
         const d = result.ff_draft;
         if (d) {
+          setParticipantId(d.participantId ?? "");
           setTaskName(d.taskName ?? "");
           setObjective(d.objective ?? "");
           setCondition(d.condition ?? "intervention");
@@ -219,8 +387,14 @@ function TaskInitScreen({ onStart }) {
   const showObjectiveNudge = !isActive && objectiveWordCount > 0 && objectiveWordCount < 3;
 
   function handleStartTask() {
-    if (!taskName.trim()) {
-      setNameError(true);
+    // All three fields are required before a session can start.
+    const missingPid = !participantId.trim();
+    const missingName = !taskName.trim();
+    const missingObjective = !objective.trim();
+    if (missingPid || missingName || missingObjective) {
+      setParticipantIdError(missingPid);
+      setNameError(missingName);
+      setObjectiveError(missingObjective);
       return;
     }
 
@@ -229,6 +403,7 @@ function TaskInitScreen({ onStart }) {
         const tabId = tabs[0]?.id ?? null;
 
         const taskMetadata = {
+          participantId: participantId.trim(),
           taskName,
           objective,
           condition,
@@ -243,6 +418,7 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
         chrome.storage.local.remove("ff_generating");
         chrome.storage.local.remove("ff_suggestion_choices"); // and neither must last session's choices
+        chrome.storage.local.remove("ff_events"); // nor last session's intervention events
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -271,11 +447,15 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_recovery");
       chrome.storage.local.remove("ff_generating");
       chrome.storage.local.remove("ff_suggestion_choices");
+      chrome.storage.local.remove("ff_events");
     }
 
+    setParticipantId("");
     setTaskName("");
     setObjective("");
+    setParticipantIdError(false);
     setNameError(false);
+    setObjectiveError(false);
     setIsActive(false);
   }
 
@@ -283,6 +463,18 @@ function TaskInitScreen({ onStart }) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 0" }}>
+        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Participant ID</p>
+        <input
+          value={participantId}
+          onChange={e => { if (!isActive) { setParticipantId(e.target.value); if (participantIdError) setParticipantIdError(false); } }}
+          placeholder="e.g. P01"
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${participantIdError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: participantIdError ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
+        />
+        {participantIdError && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter a participant ID.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
@@ -298,12 +490,16 @@ function TaskInitScreen({ onStart }) {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Objective</p>
         <textarea
           value={objective}
-          onChange={e => !isActive && setObjective(e.target.value)}
+          onChange={e => { if (!isActive) { setObjective(e.target.value); if (objectiveError) setObjectiveError(false); } }}
           placeholder="Briefly describe what you aim to accomplish in this session…"
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: showObjectiveNudge ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${objectiveError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: (objectiveError || showObjectiveNudge) ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
-        {showObjectiveNudge && (
+        {objectiveError ? (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter an objective — it anchors the recovery prompts.
+          </p>
+        ) : showObjectiveNudge && (
           <p style={{ margin: "0 0 12px", fontSize: 11, color: "#B45309", lineHeight: 1.5 }}>
             A more specific objective helps FrictionFlow give better recovery tips — but you can start anyway.
           </p>
@@ -455,7 +651,7 @@ function ContextPrepScreen({ setScreen }) {
         const t = result.ff_task;
         if (t) {
           chrome.storage.local.set({
-            ff_draft: { taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
+            ff_draft: { participantId: t.participantId ?? "", taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
           });
         }
         chrome.storage.local.remove("ff_task");
@@ -541,6 +737,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [currentPhase, setCurrentPhase] = useState("Planning");
   const [condition, setCondition] = useState("intervention");
   const [distractionCount, setDistractionCount] = useState(0);
+  const [participantId, setParticipantId] = useState(""); // carried into the export
   // The next-step the participant chose for the CURRENT recovery episode, shown
   // between the phase and the active context. Null once a new episode generates
   // (its generatedAt no longer matches any choice) until they pick again.
@@ -578,6 +775,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           const t = result.ff_task;
 
           if (t) {
+            setParticipantId(t.participantId ?? "");
             setTaskName(t.taskName ?? "");
             setObjective(t.objective ?? "");
             setCondition(t.condition ?? "intervention");
@@ -657,11 +855,21 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
+  // Log each time the Gentle Reminder actually appears. This effect only re-runs
+  // when showDistractionPrompt flips, and the poll's setShowDistractionPrompt(true)
+  // is a no-op when already true — so this fires once per appearance, not every
+  // 2s poll while the modal is open.
+  useEffect(() => {
+    if (showDistractionPrompt) logInterventionEvent("prompt_shown");
+  }, [showDistractionPrompt]);
+
   // All three responses acknowledge the current distraction episode: start the
   // dismiss cooldown so the modal doesn't immediately reappear, while still
   // allowing a re-nudge if the writer stays distracted past the cooldown, or a
-  // genuinely new episode begins (both handled in the poll above).
+  // genuinely new episode begins (both handled in the poll above). Each logs the
+  // chosen response for the intervention-event export.
   function handleGetBackToWork() {
+    logInterventionEvent("response", { response: "get_back_to_work" });
     promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     setHasRecoverySummary(true);
@@ -669,6 +877,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   }
 
   function handleTakeBreakFromPrompt() {
+    logInterventionEvent("response", { response: "take_a_break" });
     promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     breakOriginRef.current = "prompt";
@@ -676,6 +885,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   }
 
   function handleDismissPrompt() {
+    logInterventionEvent("response", { response: "dismiss" });
     promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
   }
@@ -686,7 +896,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       : elapsed;
 
     // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
-    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = []) {
+    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = []) {
       // Finalize the suggestion tally. chosenIndex is the stance
       // (0 = goal-anchored, 1 = doc-driven, 2 = bridge); every remaining record
       // is a frozen per-episode choice, so summing by index gives the export
@@ -697,14 +907,23 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         return acc;
       }, {});
       const finishedSummary = {
+        participantId,
         taskName,
+        objective,
         condition,
+        startedAt: sessionStartTime,
+        endedAt: Date.now(),
         elapsedSeconds: finalElapsedSeconds,
         totalBreakMs: sessionSnapshot.totalBreakMs ?? 0,
-        wordCount: words,
+        totalInterruptedMs: sessionSnapshot.totalInterruptedMs ?? 0,
+        wordCount: words, // doc words added this session (incl. paste)
+        typedWordCount: sessionSnapshot.typedWordCount ?? 0, // keystroke-typed only (excludes paste)
         wpm,
         totalPauses,
         longestPauseMs: longestPause,
+        burstCount: sessionSnapshot.burstCount ?? 0,
+        avgBurstDurationSec: sessionSnapshot.avgBurstDurationSec ?? 0,
+        tabSwitchCount: sessionSnapshot.tabSwitchCount ?? 0,
         scrollFrequency,
         scrollFrequencyLabel,
         phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
@@ -713,6 +932,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         avgResumptionMs: sessionSnapshot.avgResumptionMs ?? 0,
         suggestionChoices,
         suggestionTally,
+        interventionEvents,
       };
       setSummary(finishedSummary);
 
@@ -726,17 +946,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_recovery");
         chrome.storage.local.remove("ff_generating");
         chrome.storage.local.remove("ff_suggestion_choices");
+        chrome.storage.local.remove("ff_events");
       }
 
       setScreen("analytics");
     }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_session", "ff_suggestion_choices"], (result) => {
-        buildAndNavigate(result.ff_session ?? {}, result.ff_suggestion_choices ?? []);
+      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events"], (result) => {
+        buildAndNavigate(result.ff_session ?? {}, result.ff_suggestion_choices ?? [], result.ff_events ?? []);
       });
     } else {
-      buildAndNavigate({}, []);
+      buildAndNavigate({}, [], []);
     }
   }
 
@@ -1095,7 +1316,10 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const totalSecs = s.elapsedSeconds ?? 0;
   const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
-  const writingSecs = Math.max(0, totalSecs - breakSecs);
+  // Time the Docs tab was closed/away (fully offline, untracked). Excluded from
+  // writing time so a resumed session's avg WPM isn't diluted by dead air.
+  const interruptedSecs = Math.floor((s.totalInterruptedMs ?? 0) / 1000);
+  const writingSecs = Math.max(0, totalSecs - breakSecs - interruptedSecs);
 
   function fmt(seconds) {
     const m = Math.floor(seconds / 60);
@@ -1105,20 +1329,33 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const avgResumptionSecs = Math.round((s.avgResumptionMs ?? 0) / 1000);
 
-  // True session average — words over active writing time. (s.wpm is only
-  // the last rolling-window value at the moment the session was finished.)
-  const avgWpm = writingSecs > 0 ? Math.round((s.wordCount ?? 0) / (writingSecs / 60)) : 0;
+  const docWords = s.wordCount ?? 0;        // words added to the document (includes paste)
+  const typedWords = s.typedWordCount ?? 0; // keystroke-typed words (excludes paste)
+
+  // Two typing rates, both from TYPED words (paste can't inflate them). Both are
+  // exported; the tile shows only the focused one.
+  //   overall — words over all engaged time (total − breaks − offline); dragged
+  //             down by every on-doc pause (planning, reviewing, distraction).
+  //   focused — words over active drafting time (the Translating phase), so it
+  //             reflects genuine typing pace, not time spent thinking/rereading.
+  const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
+  const avgWpmOverall = writingSecs > 0 ? Math.round(typedWords / (writingSecs / 60)) : 0;
+  const avgWpmFocused = translatingSecs > 0 ? Math.round(typedWords / (translatingSecs / 60)) : 0;
 
   // Stats backed by real tracked data from content.js
   const stats = [
     { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
     { label: "Writing time",  value: fmt(writingSecs),  icon: "✍️" },
-    { label: "Words written", value: s.wordCount ?? 0,  icon: "📝" },
-    { label: "Avg. WPM",      value: avgWpm,            icon: "⚡" },
+    { label: "Doc words",     value: docWords,          icon: "📝" },
+    { label: "Typed words",   value: typedWords,        icon: "⌨️" },
+    { label: "Avg. WPM",      value: avgWpmFocused,     icon: "⚡" },
     { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
     { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
     { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
     { label: "Avg. recovery", value: (s.distractionCount ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
+    // Only surfaced when the session was interrupted (Docs tab closed/left),
+    // so a clean session's grid stays uncluttered.
+    ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs), icon: "🔌" }] : []),
   ];
   const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
   const PHASE_ORDER = ["Planning", "Translating", "Reviewing", "Distracted"];
@@ -1139,6 +1376,16 @@ function AnalyticsScreen({ setScreen, summary }) {
   const dominantPhase = phases.length > 0
     ? phases.reduce((max, p) => (p.pct > max.pct ? p : max))
     : null;
+
+  const [downloaded, setDownloaded] = useState(false);
+  function handleExport() {
+    const { json, csv, base } = buildSessionExport(s);
+    downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
+    // Small stagger so the browser reliably fires both downloads in a row.
+    setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    setDownloaded(true);
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid rgba(0,0,0,0.06)", textAlign: "center" }}>
@@ -1195,7 +1442,10 @@ function AnalyticsScreen({ setScreen, summary }) {
           </p>
         </div>
       </div>
-      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        <Btn variant="outline" style={{ width: "100%" }} onClick={handleExport}>
+          {downloaded ? "Downloaded ✓ — download again" : "Download session data (JSON + CSV)"}
+        </Btn>
         <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
       </div>
     </div>
@@ -1211,13 +1461,14 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       setShowDistractionPrompt(false);
       promptSuppressUntilRef.current = 0;
       lastDistractionOnsetRef.current = null;
-      if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.remove("ff_interrupted");
-      }
       if (mode === "resume") {
+        // resumeTaskTracking reads ff_interrupted to measure the offline gap,
+        // then clears it once resume is confirmed — so it must NOT be removed
+        // here first (that race previously discarded the timestamp).
         resumeTaskTracking(); // content script may have been re-injected — restart tracking
         setScreen("monitoring");
       } else {
+        // Fresh start: handleStartTask already clears ff_interrupted.
         setScreen("contextPrep");
       }
     }}/>,

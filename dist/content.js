@@ -7,7 +7,10 @@ const STORAGE_FLUSH_MS = 2000;            // 2s interval to write to storage
 const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
 const BURST_MIN_DURATION_MS = 10000;      // Minimum 10s of activity to consider a burst
-const WORD_SYNC_INTERVAL_MS = 30000;      // 30s cadence for real word count via the Docs API
+const WORD_SYNC_INTERVAL_MS = 2000;       // 2s cadence so the displayed count tracks the exact
+                                          // Google Docs API word count in near-real time. An
+                                          // in-flight guard (wordSyncInFlight) prevents requests
+                                          // from stacking if a fetch runs slow.
 const TAB_SWITCH_WINDOW_MS = 60000;       // rolling window for switch-frequency classification
 const RAPID_SWITCH_THRESHOLD = 3;         // >= this many switches in the window = Distracted
                                           // (a switch every ~20s — attention residue never
@@ -68,6 +71,12 @@ let lastCompletedBurstMs = 0;
 let totalBreakMs = 0;
 let isOnBreak = false;   // phase/episode tracking is suspended while true
 
+// Interruption Variables — total ms the Docs tab was closed or navigated away
+// from Docs (fully offline, no tracking) across all interrupt→resume cycles
+// this session. Subtracted from writing time in analytics so the offline gap
+// doesn't dilute avg WPM. Distinct from breaks (a sanctioned in-app pause).
+let totalInterruptedMs = 0;
+
 // Word Count Sync Variables — background.js reads the real count via the
 // Google Docs API; only the number crosses into this script (never the text).
 // Until the first successful sync (or if OAuth isn't configured) the word
@@ -80,6 +89,7 @@ let netCharsAtSync = 0;       // netChars at that moment, for the live delta
 // required, or a tab refresh mid-session would re-baseline and zero the count.
 let docWordBaseline = null;
 let totalDocWords = 0;        // total words in the doc (baseline + written) — for display only
+let wordSyncInFlight = false; // true while a Docs API word-count request is pending
 
 // Phase Duration Variables — accumulated ms spent in each classified phase
 let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
@@ -180,14 +190,26 @@ function getLiveWordCount() {
   return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
 }
 
+// Pure typed-word count from keystrokes. Unlike getLiveWordCount (which is
+// Docs-API-anchored and therefore reflects whatever ends up in the document),
+// this counts only what the participant actually typed — a paste is a single
+// non-printable Ctrl+V, so pasted/imported text adds ~nothing here. Used as the
+// "typed words" study measure and for avg WPM, so pasting can't inflate either.
+function getTypedWordCount() {
+  return Math.max(0, Math.round(netChars / CHARS_PER_WORD));
+}
+
 // Asks background.js for the real word count (Docs API). Silently keeps the
 // keystroke approximation on any failure — no auth, background asleep, API
 // error — so this can never block or break tracking.
 function syncWordCount() {
   if (!isTracking) return;
   if (!isExtensionContextValid()) { stopAllTracking(); return; }
+  if (wordSyncInFlight) return; // a request is still pending — don't stack another
+  wordSyncInFlight = true;
   try {
     chrome.runtime.sendMessage({ type: "FF_SYNC_WORD_COUNT" }, (response) => {
+      wordSyncInFlight = false;
       if (chrome.runtime.lastError) return; // keep approximation
       if (response && typeof response.wordCount === "number") {
         if (docWordBaseline === null) {
@@ -202,6 +224,7 @@ function syncWordCount() {
       }
     });
   } catch (e) {
+    wordSyncInFlight = false;
     stopAllTracking();
   }
 }
@@ -426,6 +449,7 @@ function flushPhaseToStorage() {
         distractionCount: distractionEpisodes.length,
         distractionOnsetCount,
         distractionEpisodes,
+        activeDistraction, // persist the open episode so a resume can continue it
         avgResumptionMs: getAvgResumptionMs(),
       }
     });
@@ -678,11 +702,13 @@ function resetSessionState() {
 
   totalBreakMs = 0;
   isOnBreak = false;
+  totalInterruptedMs = 0;
 
   syncedWordCount = null;
   netCharsAtSync = 0;
   docWordBaseline = null;
   totalDocWords = 0;
+  wordSyncInFlight = false;
 
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
@@ -706,14 +732,18 @@ function startTracking() {
 // accumulated counters from the last ff_session snapshot, so the session
 // continues instead of restarting from zero. Callers must check isTracking
 // first — if tracking is already alive, resuming would be a data-losing reset.
-function resumeTracking(snapshot, task) {
+function resumeTracking(snapshot, task, interruptedMs = 0) {
   resetSessionState();
 
   // Keep the original session anchor so elapsed time stays continuous.
   if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
 
   if (snapshot) {
-    netChars = (snapshot.wordCount ?? 0) * CHARS_PER_WORD;
+    // Restore the typed-keystroke count (not the doc word count) so the typed-
+    // words metric stays paste-free across a resume — reconstructing netChars
+    // from the doc count would fold pasted text into "typed". Older snapshots
+    // without typedWordCount fall back to the doc count.
+    netChars = (snapshot.typedWordCount ?? snapshot.wordCount ?? 0) * CHARS_PER_WORD;
     docWordBaseline = snapshot.docWordBaseline ?? null;
     totalPauses = snapshot.totalPauses ?? 0;
     longestPauseMs = snapshot.longestPauseMs ?? 0;
@@ -723,6 +753,7 @@ function resumeTracking(snapshot, task) {
     totalBurstDurationMs = (snapshot.avgBurstDurationSec ?? 0) * 1000 * burstCount;
     lastCompletedBurstMs = (snapshot.lastCompletedBurstSec ?? 0) * 1000;
     totalBreakMs = snapshot.totalBreakMs ?? 0;
+    totalInterruptedMs = snapshot.totalInterruptedMs ?? 0;
     if (snapshot.phaseDurationsMs) {
       phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
     }
@@ -731,11 +762,30 @@ function resumeTracking(snapshot, task) {
     // treat a resumed session as a brand-new episode. Fall back to the closed-
     // episode count if an older snapshot predates this field.
     distractionOnsetCount = snapshot.distractionOnsetCount ?? distractionEpisodes.length;
+    // Restore an in-progress distraction episode (refresh happened mid-
+    // distraction) so it can still be finalized on the next keystroke with its
+    // original startedAt — otherwise the episode and its resumption time are
+    // silently lost. startDistractionEpisode's `if (activeDistraction) return`
+    // guard then prevents the re-classified phase from opening a duplicate.
+    activeDistraction = snapshot.activeDistraction ?? null;
   }
+
+  // Fold this interruption's offline gap (Docs tab closed/away from Docs) into
+  // the running total so analytics can subtract it from writing time.
+  totalInterruptedMs += interruptedMs ?? 0;
 
   isTracking = true;
   attachListenersOnce();
   startIntervals();
+
+  // Persist the interruption total immediately — the participant may finish the
+  // session before the first flush, and handleFinishSession reads it from the
+  // ff_session snapshot.
+  safeStorageGet("ff_session", (result) => {
+    const existing = (result && result.ff_session) ?? {};
+    safeStorageSet({ ff_session: { ...existing, totalInterruptedMs } });
+  });
+
   console.log("FrictionFlow: tracking resumed from stored session snapshot.");
 }
 
@@ -811,9 +861,10 @@ function startIntervals() {
     const payLoad = {
       // Keystroke
       wpm: rollingWPM(),
-      wordCount: getLiveWordCount(),
+      wordCount: getLiveWordCount(), // doc words added this session (incl. paste), API-anchored
+      typedWordCount: getTypedWordCount(), // keystroke-typed words only (excludes paste)
       docWordBaseline, // number only — survives reinjection so resume doesn't re-baseline
-      totalDocWords, // for display only, not used in calculations
+      totalDocWords, // exact whole-doc count from the last Docs API sync
       elapsedSeconds: elapsedSeconds(),
 
       // Pauses
@@ -851,10 +902,12 @@ function startIntervals() {
       distractionCount: distractionEpisodes.length,
       distractionOnsetCount,
       distractionEpisodes,
+      activeDistraction, // in-progress episode — carried so a mid-distraction refresh doesn't drop it
       avgResumptionMs: getAvgResumptionMs(),
 
-      // Breaks
+      // Breaks & interruptions
       totalBreakMs,
+      totalInterruptedMs,
 
       lastUpdated: Date.now(),
     };
@@ -892,11 +945,13 @@ function startIntervals() {
     flushPhaseToStorage();
   }, 2000);
 
-  // Real word count sync via the Docs API (through background.js). First
-  // sync fires shortly after start so a doc with existing text doesn't show
-  // "0 words" for 30s; the guard inside syncWordCount handles early stops.
+  // Real word count sync via the Docs API (through background.js), on a 2s
+  // cadence so the displayed count stays aligned with the exact Docs count.
+  // An early first sync fills in a doc's existing word count right away
+  // instead of waiting a full interval; the guard inside syncWordCount
+  // handles early stops and prevents overlapping requests.
   wordSyncIntervalId = setInterval(syncWordCount, WORD_SYNC_INTERVAL_MS);
-  setTimeout(syncWordCount, 3000);
+  setTimeout(syncWordCount, 800);
 
   // Idle watcher
   idleIntervalId = setInterval(() => {
@@ -928,7 +983,7 @@ if (isExtensionContextValid()) {
         // Freshly injected script (isTracking starts false) — restore
         // counters from the last snapshot and restart tracking.
         safeStorageGet(["ff_session", "ff_task"], (result) => {
-          resumeTracking(result?.ff_session, result?.ff_task);
+          resumeTracking(result?.ff_session, result?.ff_task, message.interruptedMs ?? 0);
         });
       }
     } else if (message?.type === "FF_CANCEL_TASK") {
