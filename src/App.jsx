@@ -190,15 +190,19 @@ function fileSlug(value, fallback) {
 // the published comparison norms both depend on it.
 
 // NASA-TLX (Hart & Staveland 1988), raw/unweighted. Each 0-100 in steps of 5.
-// Performance is anchored Perfect→Failure so that, like the others, a HIGHER
-// value means more workload — the six are therefore directly averageable.
+// Wording is the official rating-scale description, trimmed to the FIRST
+// question of each (the follow-up clauses — "Was the task easy or demanding,
+// simple or complex..." — are dropped to keep the side panel readable).
+// Performance is anchored Good→Poor per the original, which means that like the
+// other five a HIGHER value is the worse/heavier end — so the six are directly
+// averageable with no reverse-scoring.
 const TLX_ITEMS = [
-  { id: "mental", label: "Mental Demand", question: "How mentally demanding was the task?", low: "Very low", high: "Very high" },
-  { id: "physical", label: "Physical Demand", question: "How physically demanding was the task?", low: "Very low", high: "Very high" },
-  { id: "temporal", label: "Temporal Demand", question: "How hurried or rushed was the pace of the task?", low: "Very low", high: "Very high" },
-  { id: "performance", label: "Performance", question: "How successful were you in accomplishing what you were asked to do?", low: "Perfect", high: "Failure" },
-  { id: "effort", label: "Effort", question: "How hard did you have to work to accomplish your level of performance?", low: "Very low", high: "Very high" },
-  { id: "frustration", label: "Frustration", question: "How insecure, discouraged, irritated, stressed, and annoyed were you?", low: "Very low", high: "Very high" },
+  { id: "mental", label: "Mental Demand", question: "How much mental and perceptual activity was required (e.g. thinking, deciding, calculating, remembering, looking, searching, etc)?", low: "Low", high: "High" },
+  { id: "physical", label: "Physical Demand", question: "How much physical activity was required (e.g. pushing, pulling, turning, controlling, activating, etc)?", low: "Low", high: "High" },
+  { id: "temporal", label: "Temporal Demand", question: "How much time pressure did you feel due to the rate of pace at which the tasks or task elements occurred?", low: "Low", high: "High" },
+  { id: "performance", label: "Performance", question: "How successful do you think you were in accomplishing the goals of the task set by the experimenter (or yourself)?", low: "Good", high: "Poor" },
+  { id: "effort", label: "Effort", question: "How hard did you have to work (mentally and physically) to accomplish your level of performance?", low: "Low", high: "High" },
+  { id: "frustration", label: "Frustration", question: "How insecure, discouraged, irritated, stressed and annoyed versus secure, gratified, content, relaxed and complacent did you feel during the task?", low: "Low", high: "High" },
 ];
 
 // Flow Short Scale (Rheinberg, Vollmeyer & Engeser 2003), 10 flow items, 1-7.
@@ -289,6 +293,39 @@ function buildSessionExport(s) {
   // voluntary = the monitoring-screen "Take a break" (self-initiated, both
   // conditions). total is the convenience sum. Merging them would confound the
   // baseline↔intervention comparison, since prompted breaks can't occur in baseline.
+  // H1 measurement correction. resumptionMs runs return-to-doc → first
+  // keystroke, so in the INTERVENTION arm it also contains the time spent
+  // reading the prompt and the recovery summary — time baseline participants
+  // never spend. Left uncorrected, using the intervention makes the
+  // intervention look slower. Computed here rather than in analysis so the
+  // number can't be derived inconsistently; every input stays exported, so a
+  // disagreement with this formula is always recomputable from raw.
+  const choices = s.suggestionChoices ?? [];
+  const episodesOut = (s.distractionEpisodes ?? []).map((ep) => {
+    if (typeof ep.endedAt !== "number") return { ...ep };
+    // Not stored on the episode, but exact: resumptionMs was measured from it.
+    const returnedAt = ep.endedAt - (ep.resumptionMs ?? 0);
+    // Latest intervention interaction that falls INSIDE the resumption window.
+    // Two clamps matter: an interaction before returnedAt (they read the prompt
+    // while still on the other tab) cost no resumption time; and one after
+    // endedAt is real — the prompt is sticky, so it can be dismissed after
+    // typing already resumed — but must not produce a negative result.
+    const marks = [
+      ...events.filter((e) => e.type === "response").map((e) => e.at),
+      ...choices.map((c) => c.at),
+    ].filter((at) => typeof at === "number" && at >= returnedAt && at <= ep.endedAt);
+    const cut = marks.length > 0 ? Math.max(returnedAt, ...marks) : returnedAt;
+    return { ...ep, returnedAt, adjustedResumptionMs: ep.endedAt - cut };
+  });
+  // Baseline has no intervention events, so adjusted === raw there — which is
+  // what makes the two arms comparable on this measure.
+  const adjustedList = episodesOut
+    .map((e) => e.adjustedResumptionMs)
+    .filter((n) => typeof n === "number" && n >= 0);
+  const avgAdjustedResumptionMs = adjustedList.length > 0
+    ? Math.round(adjustedList.reduce((a, b) => a + b, 0) / adjustedList.length)
+    : 0;
+
   const promptedBreaks = respCount("take_a_break");
   const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
   const tally = s.suggestionTally ?? {};
@@ -343,7 +380,11 @@ function buildSessionExport(s) {
       count: s.distractionCount ?? 0,              // occurrences (onset)
       recovered: s.distractionsRecovered ?? 0,     // episodes that resumed (have a resumptionMs)
       avgResumptionSec: sec(s.avgResumptionMs),    // averaged over recovered episodes only
-      episodes: s.distractionEpisodes ?? [],
+      // H1 with prompt-reading time removed (identical to raw in baseline).
+      avgAdjustedResumptionSec: sec(avgAdjustedResumptionMs),
+      // Each episode carries returnedAt + adjustedResumptionMs alongside the raw
+      // values, so the correction is auditable per episode, not just in aggregate.
+      episodes: episodesOut,
     },
     promptResponses: {
       promptsShown: events.filter((e) => e.type === "prompt_shown").length,
@@ -396,6 +437,7 @@ function buildSessionExport(s) {
     ["distractionCount", json.distractions.count],
     ["distractionsRecovered", json.distractions.recovered],
     ["avgResumptionSec", json.distractions.avgResumptionSec],
+    ["avgAdjustedResumptionSec", json.distractions.avgAdjustedResumptionSec],
     ["promptsShown", json.promptResponses.promptsShown],
     ["respGetBackToWork", json.promptResponses.getBackToWork],
     ["respTakeBreak", json.promptResponses.takeABreak], // prompt-driven breaks
