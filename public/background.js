@@ -30,7 +30,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // reason "break" = sent by the side panel when a break starts (voluntary
     // or via the distraction prompt) — the summary must capture this exact
     // stopping point so the user can re-orient after the break.
-    handleStuckCheck(message.reason === "break");
+    // content.js additionally carries trigger + lastActivePhase on the message
+    // (see below) because reading them from ff_session would race its flush.
+    handleStuckCheck(message.reason === "break", {
+      trigger: message.trigger,
+      lastActivePhase: message.lastActivePhase,
+    });
   } else if (message.type === "FF_ENSURE_DOCS_AUTH") {
     // Sent by the side panel at session connect so the one-time Google
     // consent popup happens at start, never mid-writing. Failure is fine —
@@ -214,31 +219,45 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Triggered by content.js when a Distracted episode starts (FF_CHECK_STUCK),
 // so the summary is usually ready by the time the user clicks "Get Back to
 // Work". All gates live here, not in the sender.
-async function handleStuckCheck(isBreakRecovery = false) {
+// `context` carries episode facts the sender knows but storage may not have
+// yet: { trigger, lastActivePhase }. Empty for break-triggered generation,
+// which falls back to ff_session.
+async function handleStuckCheck(isBreakRecovery = false, context = {}) {
+  // Every gate below announces why it skipped. Without this, "it didn't
+  // generate" is indistinguishable from "it was never triggered" — see the
+  // service worker console (chrome://extensions → FrictionFlow → service
+  // worker). If NOTHING logs here, the trigger never arrived at all.
+  const skip = (why) => console.log(`FrictionFlow: recovery generation skipped — ${why}.`);
+
   // Prevent concurrent calls
-  if (isGenerating) return;
+  if (isGenerating) return skip("a generation is already in flight");
 
   // Enforce cooldown between recovery calls — except for break-triggered
   // generation: the user explicitly paused, and serving a cooldown-blocked
   // stale summary after the break would defeat the purpose. isGenerating
   // still guards against doubling up with an in-flight episode generation.
   const now = Date.now();
-  if (!isBreakRecovery && lastRecoveryTime && (now - lastRecoveryTime) < RECOVERY_COOLDOWN_MS) return;
+  if (!isBreakRecovery && lastRecoveryTime && (now - lastRecoveryTime) < RECOVERY_COOLDOWN_MS) {
+    const leftSec = Math.ceil((RECOVERY_COOLDOWN_MS - (now - lastRecoveryTime)) / 1000);
+    return skip(`cooldown active, ${leftSec}s left (the previous summary stays on screen)`);
+  }
 
   const result = await chrome.storage.local.get(["ff_session", "ff_task", "ff_settings"]);
   const session = result.ff_session;
   const task = result.ff_task;
 
-  if (!session || !task) return;
+  if (!session || !task) return skip("no active session (ff_session/ff_task missing)");
 
   // Independent variable: the baseline (control) condition never receives
   // recovery content — behavioral logging is identical in both conditions.
-  if ((task.condition ?? "intervention") === "baseline") return;
+  if ((task.condition ?? "intervention") === "baseline") {
+    return skip("baseline condition — recovery content is suppressed by design");
+  }
 
-  // No key configured → skip silently; the recovery screen keeps its
-  // placeholder content. Generation must never block a session.
+  // No key configured → skip; the recovery screen shows its "summaries are off"
+  // state. Generation must never block a session.
   const apiKey = result.ff_settings?.geminiApiKey;
-  if (!apiKey) return;
+  if (!apiKey) return skip("no Gemini API key configured (add one in the extension Options)");
 
   isGenerating = true;
   lastRecoveryTime = now;
@@ -246,12 +265,20 @@ async function handleStuckCheck(isBreakRecovery = false) {
   // worker ever dies mid-generation — the UI treats >30s-old as not running.
   await chrome.storage.local.set({ ff_generating: now });
 
+  console.log(`FrictionFlow: generating recovery summary (${isBreakRecovery ? "break" : "distraction"})…`);
+
   try {
     // Doc text is read fresh here, used only inside the prompt, and never
     // stored — ff_recovery holds only the generated summary.
     const docText = await getTaskDocText();
-    const recovery = await generateRecovery(session, task, docText, apiKey, isBreakRecovery);
+    if (docText === null) {
+      // Not fatal: the prompt falls back to behavioral data only, so
+      // "where you left off" becomes an estimate instead of a quote.
+      console.log("FrictionFlow: doc text unavailable (auth/permission) — generating from behavioral data only.");
+    }
+    const recovery = await generateRecovery(session, task, docText, apiKey, isBreakRecovery, context);
     await chrome.storage.local.set({ ff_recovery: recovery });
+    console.log("FrictionFlow: recovery summary ready.");
     // Panel may be closed — a missing receiver is fine.
     chrome.runtime.sendMessage({ type: "FF_RECOVERY_READY" }).catch(() => {});
   } catch (err) {
@@ -267,10 +294,29 @@ async function handleStuckCheck(isBreakRecovery = false) {
 // Provider details are isolated in this one function so swapping providers
 // (e.g. to Claude) is a contained change. The API key is researcher-entered
 // via the options page (ff_settings) — never hardcoded.
-async function generateRecovery(session, task, docText, apiKey, isBreakRecovery = false) {
+async function generateRecovery(session, task, docText, apiKey, isBreakRecovery = false, context = {}) {
   // Only the tail of the doc goes into the prompt — "where you left off"
   // lives at the end, and it keeps token cost bounded on long documents.
   const docExcerpt = docText ? docText.slice(-2000) : null;
+
+  // What the writer was doing when the interruption hit. session.currentPhase
+  // cannot answer this — generation fires AT distraction onset, so it reads
+  // "Distracted" (or, racing the flush, whatever preceded it). lastActivePhase
+  // is the last non-Distracted phase, which is what the prompt actually asks
+  // the model to describe.
+  const interruptedPhase = context.lastActivePhase ?? session.lastActivePhase ?? null;
+  // How the distraction began: tab-away | rapid-switch | idle. Materially
+  // changes the guidance — leaving for another tab is a different re-entry
+  // problem than stalling in place.
+  const trigger = isBreakRecovery
+    ? "break"
+    : (context.trigger ?? session.activeDistraction?.trigger ?? null);
+  const triggerLabel = {
+    "tab-away": "left the document for another tab",
+    "rapid-switch": "switched tabs repeatedly while barely typing",
+    idle: "stopped typing and stayed idle in the document",
+    break: "chose to take a break",
+  }[trigger] ?? "unknown";
 
   // Same output shape either way; only the framing differs — a break is a
   // deliberate pause to return from, not a stuck state to diagnose.
@@ -295,20 +341,30 @@ ${docExcerpt}
 """
 ` : ""}
 BEHAVIORAL DATA:
-- Current phase: ${session.currentPhase}
+- Phase they were interrupted in: ${interruptedPhase ?? "unknown"}
+- How this interruption started: ${triggerLabel}
+- Current phase: ${session.currentPhase ?? "unknown"}
 - Current pause: ${session.currentPauseSec ?? 0} seconds
-- WPM (last 30s): ${session.wpm}
-- Total pauses: ${session.totalPauses}
+- WPM (last 30s): ${session.wpm ?? 0}
+- Words written this session: ${session.typedWordCount ?? 0} typed (${session.wordCount ?? 0} net added to the document)
+- Interruptions so far this session: ${session.distractionOnsetCount ?? 0}
+- Total pauses: ${session.totalPauses ?? 0}
 - Longest pause: ${Math.round((session.longestPauseMs ?? 0) / 1000)}s
-- Burst count: ${session.burstCount}
-- Avg burst duration: ${session.avgBurstDurationSec}s
-- Scroll frequency: ${session.scrollFrequencyLabel}
-- Tab switches: ${session.tabSwitchCount}
+- Burst count: ${session.burstCount ?? 0}
+- Avg burst duration: ${session.avgBurstDurationSec ?? 0}s
+- Scroll frequency: ${session.scrollFrequencyLabel ?? "None"}
+- Tab switches: ${session.tabSwitchCount ?? 0}
 - Session time: ${Math.round((session.elapsedSeconds ?? 0) / 60)} minutes
+
+Phase meanings (Flower & Hayes cognitive process model) — tailor the guidance to the phase they were INTERRUPTED in, not to "Distracted":
+- Planning: organizing ideas and goals, little text produced yet → help them re-orient to the goal and name the next idea to commit to.
+- Translating: actively turning ideas into prose → point them back into the specific sentence or paragraph they were mid-way through.
+- Reviewing: rereading and revising existing text → remind them what they were revising and what to check next.
+- unknown: rely on the remaining behavioral data instead of guessing a phase.
 
 Field guidance:
 - condition: one short phrase describing the writer's current state, e.g. "stuck on word choice", "overwhelmed by scope", "losing momentum"
-- whatYouWereDoing: one sentence describing what the behavioral data suggests they were doing before getting stuck
+- whatYouWereDoing: one sentence describing what they were doing before getting stuck, based on the interrupted phase and the behavioral data
 - whereYouLeftOff: ${docExcerpt
     ? "one sentence pointing at the last thing they wrote — quote a short fragment ONLY if the recent text is coherent; if it isn't, estimate their position from the timing and phase data instead"
     : "one sentence estimating where they were in the task based on timing and phase data"}

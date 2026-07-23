@@ -47,6 +47,12 @@ let listenerAttached = false;       // whether event listeners have been attache
 // alone only captures the evaluating half, and misses short docs entirely).
 let deleteTimeStamps = [];      // one entry per Backspace/Delete keydown
 let selectionTimeStamps = [];   // one entry per selection gesture (debounced)
+// Session-lifetime totals. The arrays above are pruned to a 60s rolling window
+// (that's what the Reviewing rule needs), so they can't answer "how much
+// revision happened this session" — a value read at finish would only cover the
+// last minute. These counters never prune; they are what the export carries.
+let totalDeletes = 0;
+let totalSelections = 0;
 
 // Scrolling Variables
 let scrollTimeStamps = [];
@@ -100,6 +106,13 @@ let docsConnected = false;
 let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
 let currentTrackedPhase = null;
 let phaseSegmentStartTime = null;
+// The most recent NON-Distracted phase — i.e. what the writer was doing right
+// before a distraction began. Passed to the LLM so recovery guidance can be
+// tailored to the interrupted cognitive state (Flower & Hayes): planning →
+// re-orient to the goal, translating → the unfinished sentence, reviewing →
+// the revision in progress. currentPhase can't answer this: at generation time
+// it is "Distracted", which says nothing about what was interrupted.
+let lastActivePhase = null;
 
 // Distraction Episode Variables — one entry per completed "Distracted" phase
 // episode: { startedAt, endedAt, durationMs, trigger, resumptionMs }.
@@ -159,6 +172,9 @@ function rollingSelectionFrequency() {
 function pushSelectionSignal(now) {
   if (selectionTimeStamps.length === 0 || now - selectionTimeStamps[selectionTimeStamps.length - 1] > 1000) {
     selectionTimeStamps.push(now);
+    // Incremented INSIDE the debounce guard so the session total counts
+    // gestures, the same unit the rolling metric and threshold use.
+    totalSelections++;
   }
   // Selecting text is engagement — keep it from reading as idle.
   lastActivityTime = now;
@@ -359,6 +375,11 @@ function updatePhaseTracking() {
   const phase = classifyPhase(rollingScrollFrequency());
   const now = Date.now();
 
+  // Remember what they were doing while they're still doing it. Once the phase
+  // flips to Distracted this stops updating, so it holds the interrupted phase
+  // for the episode that starts below.
+  if (phase !== "Distracted") lastActivePhase = phase;
+
   if (currentTrackedPhase === null) {
     currentTrackedPhase = phase;
     phaseSegmentStartTime = now;
@@ -401,8 +422,16 @@ function startDistractionEpisode(now, triggerOverride) {
   // it's ready by the time the user clicks "Get Back to Work". All gates
   // (intervention condition, cooldown, key configured) live in background —
   // this is fire-and-forget and must never affect tracking.
+  //
+  // trigger + lastActivePhase ride ON THE MESSAGE rather than being read from
+  // ff_session: the flush that would carry them happens AFTER this call, so a
+  // storage read in background would race it and could see stale values.
   try {
-    chrome.runtime.sendMessage({ type: "FF_CHECK_STUCK" }, () => void chrome.runtime.lastError);
+    chrome.runtime.sendMessage({
+      type: "FF_CHECK_STUCK",
+      trigger: activeDistraction.trigger,
+      lastActivePhase,
+    }, () => void chrome.runtime.lastError);
   } catch (e) {
     // Extension context died mid-call — the interval guards will handle it.
   }
@@ -455,6 +484,7 @@ function flushPhaseToStorage() {
       ff_session: {
         ...existing,
         currentPhase: currentTrackedPhase,
+        lastActivePhase,
         phaseDurationsMs: getPhaseDurationsMsSnapshot(),
         distractionCount: distractionEpisodes.length,
         distractionOnsetCount,
@@ -499,6 +529,7 @@ function attachTypingListener() {
     } else if (e.key === "Backspace" || e.key === "Delete") {
       netChars = Math.max(0, netChars - 1);
       deleteTimeStamps.push(now); // revision signal for the Reviewing rule
+      totalDeletes++;             // session total (never pruned) — exported
     } else if (e.shiftKey && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) {
       // Keyboard text selection — a revision signal (debounced inside).
       pushSelectionSignal(now);
@@ -694,6 +725,8 @@ function resetSessionState() {
 
   deleteTimeStamps = [];
   selectionTimeStamps = [];
+  totalDeletes = 0;
+  totalSelections = 0;
 
   scrollTimeStamps = [];
   lastScrollTop = 0;
@@ -725,6 +758,7 @@ function resetSessionState() {
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
   phaseSegmentStartTime = null;
+  lastActivePhase = null;
 
   distractionEpisodes = [];
   activeDistraction = null;
@@ -769,6 +803,11 @@ function resumeTracking(snapshot, task, interruptedMs = 0) {
     if (snapshot.phaseDurationsMs) {
       phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
     }
+    lastActivePhase = snapshot.lastActivePhase ?? null;
+    // Cumulative revision totals must survive reinjection — the rolling arrays
+    // deliberately restart (a 60s window has no meaning across a gap).
+    totalDeletes = snapshot.totalDeletes ?? 0;
+    totalSelections = snapshot.totalSelections ?? 0;
     distractionEpisodes = snapshot.distractionEpisodes ?? [];
     // Preserve the onset baseline across reinjection so the panel doesn't
     // treat a resumed session as a brand-new episode. Fall back to the closed-
@@ -882,6 +921,11 @@ function startIntervals() {
       // Pauses
       totalPauses,
       longestPauseMs,
+      // Included here as well as in the pause interval's merge: this flush
+      // REPLACES ff_session wholesale, so omitting it wiped the value every
+      // time this ran (and syncWordCount sets isTyping, so it ran even with no
+      // typing) — leaving the LLM to read "current pause: 0" mid-pause.
+      currentPauseSec: lastKeyTime ? Math.round((Date.now() - lastKeyTime) / 1000) : 0,
 
       // Scroll
       scrollFrequency: scrollFreq,
@@ -892,9 +936,12 @@ function startIntervals() {
         return "High";
       })(),
 
-      // Revision signals (counts only — feeds Reviewing analysis in export)
+      // Revision signals. The rolling pair drives the Reviewing rule live; the
+      // totals are the session-lifetime counts that reach the export.
       deleteFrequency: rollingDeleteFrequency(),
       selectionFrequency: rollingSelectionFrequency(),
+      totalDeletes,
+      totalSelections,
 
       // Tab Switching
       tabSwitchCount,
@@ -908,6 +955,7 @@ function startIntervals() {
 
       // Phase
       currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
+      lastActivePhase, // last non-Distracted phase — what a distraction interrupted
       phaseDurationsMs: getPhaseDurationsMsSnapshot(),
 
       // Distraction episodes

@@ -186,13 +186,18 @@ function buildSessionExport(s) {
   const totalSec = s.elapsedSeconds ?? 0;
   const breakSec = sec(s.totalBreakMs);
   const offlineSec = sec(s.totalInterruptedMs);
-  const writingSec = Math.max(0, totalSec - breakSec - offlineSec);
   const phases = s.phaseDurationsMs ?? {};
   const translatingSec = sec(phases.Translating);
+  const reviewingSec = sec(phases.Reviewing);
+  // Writing time = Translating + Reviewing — time actually working on the text
+  // (producing it, or re-reading/revising it), per Flower & Hayes (1981).
+  // Planning and Distracted are excluded but still reported in phasesMs, and
+  // total/break/offline are all exported, so any other time base is derivable.
+  const writingSec = translatingSec + reviewingSec;
   const typedWords = s.typedWordCount ?? 0;
-  // Overall pace = words over all engaged time (dragged down by every pause).
-  // Focused pace = words over active drafting time (the Translating phase), the
-  // genuine typing pace. Both exported; UI shows focused.
+  // Overall pace = words over all writing work (Translating + Reviewing).
+  // Focused pace = words over active drafting only (Translating), where new text
+  // is actually produced. Both exported; UI shows focused.
   const avgWpmOverall = writingSec > 0 ? Math.round(typedWords / (writingSec / 60)) : 0;
   const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
   const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
@@ -219,7 +224,11 @@ function buildSessionExport(s) {
       offlineTimeSec: offlineSec,
       interrupted: offlineSec > 0,
     },
-    words: { docWords: s.wordCount ?? 0, typedWords },
+    words: {
+      docWords: s.wordCount ?? 0,        // words ADDED this session (API-anchored, incl. paste)
+      typedWords,                        // keystroke-typed only (excludes paste)
+      docTotalWords: s.totalDocWords ?? 0, // exact whole-document count (Docs API), incl. pre-loaded prompt
+    },
     typing: {
       avgWpmOverall,
       avgWpmFocused,
@@ -229,6 +238,16 @@ function buildSessionExport(s) {
       avgBurstSec: s.avgBurstDurationSec ?? 0,
       scrollFrequency: s.scrollFrequency ?? 0,
       tabSwitchCount: s.tabSwitchCount ?? 0,
+      tabAwaySec: sec(s.totalTabAwayMs), // cumulative time the Docs tab was hidden
+    },
+    // Raw revision signals behind the Reviewing phase classification: the rule
+    // is (scroll >=5 OR deletes >=5 OR selections >=2) AND WPM <10 over a 60s
+    // window, so these are the session-lifetime counts of the two keystroke
+    // signals it tests. Exported so the classification is auditable, not just
+    // asserted.
+    revision: {
+      totalDeletes: s.totalDeletes ?? 0,       // Backspace/Delete presses
+      totalSelections: s.totalSelections ?? 0, // debounced selection gestures
     },
     phasesMs: {
       Planning: phases.Planning ?? 0,
@@ -271,14 +290,21 @@ function buildSessionExport(s) {
     ["interrupted", json.session.interrupted ? 1 : 0],
     ["docWords", json.words.docWords],
     ["typedWords", typedWords],
+    ["docTotalWords", json.words.docTotalWords],
     ["avgWpmOverall", avgWpmOverall],
     ["avgWpmFocused", avgWpmFocused],
     ["totalPauses", json.typing.totalPauses],
     ["longestPauseSec", json.typing.longestPauseSec],
+    ["totalDeletes", json.revision.totalDeletes],
+    ["totalSelections", json.revision.totalSelections],
     ["planningSec", sec(phases.Planning)],
     ["translatingSec", sec(phases.Translating)],
     ["reviewingSec", sec(phases.Reviewing)],
     ["distractedSec", sec(phases.Distracted)],
+    // tabSwitchCount rides along because tabAwaySec is hard to read without it
+    // (10 min away over 2 switches means something different than over 40).
+    ["tabSwitchCount", json.typing.tabSwitchCount],
+    ["tabAwaySec", json.typing.tabAwaySec],
     ["distractionCount", json.distractions.count],
     ["distractionsRecovered", json.distractions.recovered],
     ["avgResumptionSec", json.distractions.avgResumptionSec],
@@ -964,16 +990,28 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         elapsedSeconds: finalElapsedSeconds,
         totalBreakMs: sessionSnapshot.totalBreakMs ?? 0,
         totalInterruptedMs: sessionSnapshot.totalInterruptedMs ?? 0,
-        wordCount: words, // doc words added this session (incl. paste)
+        // All behavioral fields read from the FRESH ff_session snapshot, not the
+        // panel's React state (which lags up to one 2s poll). Mixing the two
+        // made word count / WPM / pauses on the summary stale — and inconsistent
+        // with the snapshot-sourced fields beside them. State is only a
+        // dev-preview fallback (snapshot is {} when chrome.storage is absent).
+        wordCount: sessionSnapshot.wordCount ?? words, // session-added doc words (API-anchored, incl. paste)
+        totalDocWords: sessionSnapshot.totalDocWords ?? 0, // exact whole-doc count from the last Docs API sync
         typedWordCount: sessionSnapshot.typedWordCount ?? 0, // keystroke-typed only (excludes paste)
-        wpm,
-        totalPauses,
-        longestPauseMs: longestPause,
+        wpm: sessionSnapshot.wpm ?? wpm,
+        totalPauses: sessionSnapshot.totalPauses ?? totalPauses,
+        longestPauseMs: sessionSnapshot.longestPauseMs ?? longestPause,
         burstCount: sessionSnapshot.burstCount ?? 0,
         avgBurstDurationSec: sessionSnapshot.avgBurstDurationSec ?? 0,
         tabSwitchCount: sessionSnapshot.tabSwitchCount ?? 0,
-        scrollFrequency,
-        scrollFrequencyLabel,
+        totalTabAwayMs: sessionSnapshot.totalTabAwayMs ?? 0,
+        // Session-lifetime revision counts (NOT the rolling 60s values, which
+        // at finish would only describe the last minute). These are the raw
+        // signals behind the Reviewing classification.
+        totalDeletes: sessionSnapshot.totalDeletes ?? 0,
+        totalSelections: sessionSnapshot.totalSelections ?? 0,
+        scrollFrequency: sessionSnapshot.scrollFrequency ?? scrollFrequency,
+        scrollFrequencyLabel: sessionSnapshot.scrollFrequencyLabel ?? scrollFrequencyLabel,
         phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
         // distractionCount = occurrences (onset): matches the live tile and the
         // reminders, and includes any distraction still open at finish.
@@ -1403,10 +1441,17 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const totalSecs = s.elapsedSeconds ?? 0;
   const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
-  // Time the Docs tab was closed/away (fully offline, untracked). Excluded from
-  // writing time so a resumed session's avg WPM isn't diluted by dead air.
+  // Time the Docs tab was closed/away (fully offline, untracked).
   const interruptedSecs = Math.floor((s.totalInterruptedMs ?? 0) / 1000);
-  const writingSecs = Math.max(0, totalSecs - breakSecs - interruptedSecs);
+  // Writing time = Translating + Reviewing — the phases where the participant is
+  // actually working on the text (producing it, or re-reading/revising it), per
+  // Flower & Hayes (1981). Planning and Distracted are deliberately excluded:
+  // the old "total − breaks − offline" counted both, so on a session with no
+  // breaks it came out identical to Total time. Neither is lost — both still
+  // appear as their own slice in the phase breakdown below.
+  const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
+  const reviewingSecs = Math.round((s.phaseDurationsMs?.Reviewing ?? 0) / 1000);
+  const writingSecs = translatingSecs + reviewingSecs;
 
   function fmt(seconds) {
     const m = Math.floor(seconds / 60);
@@ -1416,17 +1461,16 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const avgResumptionSecs = Math.round((s.avgResumptionMs ?? 0) / 1000);
 
-  const docWords = s.wordCount ?? 0;        // words added to the document (includes paste)
+  // Whole-document word count from the Docs API — matches the monitoring
+  // "Words" tile. Falls back to the session-added keystroke count if the API
+  // wasn't connected (totalDocWords stays 0 without OAuth).
+  const docWords = (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : (s.wordCount ?? 0);
   const typedWords = s.typedWordCount ?? 0; // keystroke-typed words (excludes paste)
 
-  // Two typing rates, both from TYPED words (paste can't inflate them). Both are
-  // exported; the tile shows only the focused one.
-  //   overall — words over all engaged time (total − breaks − offline); dragged
-  //             down by every on-doc pause (planning, reviewing, distraction).
-  //   focused — words over active drafting time (the Translating phase), so it
-  //             reflects genuine typing pace, not time spent thinking/rereading.
-  const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
-  const avgWpmOverall = writingSecs > 0 ? Math.round(typedWords / (writingSecs / 60)) : 0;
+  // The tile shows the FOCUSED rate: typed words (paste can't inflate them) over
+  // active drafting only (Translating), where new text is actually produced, so
+  // it reflects genuine typing pace. The export carries this plus an overall
+  // rate over Translating + Reviewing — both computed in buildSessionExport.
   const avgWpmFocused = translatingSecs > 0 ? Math.round(typedWords / (translatingSecs / 60)) : 0;
 
   // Stats backed by real tracked data from content.js
