@@ -179,6 +179,85 @@ function fileSlug(value, fallback) {
   return s || fallback;
 }
 
+// ─── Post-session questionnaires ─────────────────────────────────────────────
+// Three validated instruments, administered in-panel right after Session
+// Complete so responses land in the SAME export as the behavioral data (no
+// separate form to reconcile by participant ID later).
+//
+// Variants fixed with the owners: Raw TLX (unweighted — no pairwise procedure),
+// FSS 10 flow items, UEQ-S (8 items). Item wording below is verbatim from the
+// published instruments — DO NOT reword or reorder: the subscale indices and
+// the published comparison norms both depend on it.
+
+// NASA-TLX (Hart & Staveland 1988), raw/unweighted. Each 0-100 in steps of 5.
+// Performance is anchored Perfect→Failure so that, like the others, a HIGHER
+// value means more workload — the six are therefore directly averageable.
+const TLX_ITEMS = [
+  { id: "mental", label: "Mental Demand", question: "How mentally demanding was the task?", low: "Very low", high: "Very high" },
+  { id: "physical", label: "Physical Demand", question: "How physically demanding was the task?", low: "Very low", high: "Very high" },
+  { id: "temporal", label: "Temporal Demand", question: "How hurried or rushed was the pace of the task?", low: "Very low", high: "Very high" },
+  { id: "performance", label: "Performance", question: "How successful were you in accomplishing what you were asked to do?", low: "Perfect", high: "Failure" },
+  { id: "effort", label: "Effort", question: "How hard did you have to work to accomplish your level of performance?", low: "Very low", high: "Very high" },
+  { id: "frustration", label: "Frustration", question: "How insecure, discouraged, irritated, stressed, and annoyed were you?", low: "Very low", high: "Very high" },
+];
+
+// Flow Short Scale (Rheinberg, Vollmeyer & Engeser 2003), 10 flow items, 1-7.
+const FSS_ITEMS = [
+  "I feel just the right amount of challenge.",
+  "My thoughts/activities run fluidly and smoothly.",
+  "I do not notice time passing.",
+  "I have no difficulty concentrating.",
+  "My mind is completely clear.",
+  "I am totally absorbed in what I am doing.",
+  "The right thoughts/movements occur of their own accord.",
+  "I know what I have to do each step of the way.",
+  "I feel that I have everything under control.",
+  "I am completely lost in thought.",
+];
+// Subscales per Engeser & Rheinberg (2008), 1-indexed item numbers.
+const FSS_FLUENCY = [2, 4, 5, 7, 8, 9];
+const FSS_ABSORPTION = [1, 3, 6, 10];
+
+// UEQ-S (Schrepp, Hinderks & Thomaschewski 2017), 8 semantic differentials
+// scored -3..+3. Items 1-4 = pragmatic quality, 5-8 = hedonic quality.
+const UEQS_ITEMS = [
+  { left: "obstructive", right: "supportive" },
+  { left: "complicated", right: "easy" },
+  { left: "inefficient", right: "efficient" },
+  { left: "confusing", right: "clear" },
+  { left: "boring", right: "exciting" },
+  { left: "not interesting", right: "interesting" },
+  { left: "conventional", right: "inventive" },
+  { left: "usual", right: "leading edge" },
+];
+
+// Turns raw responses into the stored survey object: every item preserved for
+// reanalysis (item-level data is needed for Cronbach's alpha), plus the
+// subscale means each instrument defines.
+function scoreSurvey({ tlx, fss, ueqs }) {
+  const mean = (arr) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 100) / 100 : null);
+  const fssItems = {};
+  FSS_ITEMS.forEach((_, i) => { fssItems[i + 1] = fss[i + 1]; });
+  const ueqsItems = {};
+  UEQS_ITEMS.forEach((_, i) => { ueqsItems[i + 1] = ueqs[i + 1]; });
+  return {
+    completedAt: Date.now(),
+    tlx: { items: { ...tlx }, rawScore: mean(TLX_ITEMS.map((i) => tlx[i.id])) },
+    fss: {
+      items: fssItems,
+      overall: mean(FSS_ITEMS.map((_, i) => fss[i + 1])),
+      fluency: mean(FSS_FLUENCY.map((n) => fss[n])),
+      absorption: mean(FSS_ABSORPTION.map((n) => fss[n])),
+    },
+    ueqs: {
+      items: ueqsItems,
+      overall: mean(UEQS_ITEMS.map((_, i) => ueqs[i + 1])),
+      pragmatic: mean([1, 2, 3, 4].map((n) => ueqs[n])),
+      hedonic: mean([5, 6, 7, 8].map((n) => ueqs[n])),
+    },
+  };
+}
+
 // Builds the per-session export payloads (rich JSON + one flat CSV row) from the
 // finish summary. Kept as one function so the two formats can never drift.
 function buildSessionExport(s) {
@@ -213,6 +292,7 @@ function buildSessionExport(s) {
   const promptedBreaks = respCount("take_a_break");
   const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
   const tally = s.suggestionTally ?? {};
+  const sv = s.survey ?? null;
 
   const json = {
     participantId: s.participantId || "",
@@ -278,6 +358,9 @@ function buildSessionExport(s) {
     },
     recoverySuggestions: { tally, choices: s.suggestionChoices ?? [] },
     interventionEvents: events,
+    // null when the participant hasn't completed the questionnaire yet — an
+    // explicit null, so a missing survey is distinguishable from a zero score.
+    survey: s.survey ?? null,
     exportedAt: new Date().toISOString(),
   };
 
@@ -322,6 +405,21 @@ function buildSessionExport(s) {
     ["suggestStance0", tally[0] ?? 0],
     ["suggestStance1", tally[1] ?? 0],
     ["suggestStance2", tally[2] ?? 0],
+    // Questionnaires. Subscale scores AND every raw item — item-level data is
+    // what reliability analysis (Cronbach's alpha) needs, and it lets the
+    // scores be recomputed if a scoring decision changes. Blank cells when the
+    // survey wasn't completed (csvCell renders null/undefined as "").
+    ["surveyCompleted", sv ? 1 : 0],
+    ["tlxRaw", sv?.tlx.rawScore],
+    ...TLX_ITEMS.map((i) => [`tlx_${i.id}`, sv?.tlx.items[i.id]]),
+    ["fssOverall", sv?.fss.overall],
+    ["fssFluency", sv?.fss.fluency],
+    ["fssAbsorption", sv?.fss.absorption],
+    ...FSS_ITEMS.map((_, i) => [`fss${i + 1}`, sv?.fss.items[i + 1]]),
+    ["ueqsOverall", sv?.ueqs.overall],
+    ["ueqsPragmatic", sv?.ueqs.pragmatic],
+    ["ueqsHedonic", sv?.ueqs.hedonic],
+    ...UEQS_ITEMS.map((_, i) => [`ueqs${i + 1}`, sv?.ueqs.items[i + 1]]),
   ];
   const csv = cols.map(([k]) => csvCell(k)).join(",") + "\r\n" + cols.map(([, v]) => csvCell(v)).join(",") + "\r\n";
 
@@ -390,6 +488,9 @@ function TaskInitScreen({ onStart }) {
   // "baseline" = no recovery prompts (control condition); "intervention" =
   // recovery prompts enabled. This is the study's independent variable.
   const [condition, setCondition] = useState("intervention");
+  // Last finished session, kept so a download missed on the analytics screen
+  // can still be recovered here. Null once a newer session overwrites it.
+  const [lastSummary, setLastSummary] = useState(null);
 
   // Self-contained senior high school writing prompts — opinion/reflection
   // based, so participants can write from their own knowledge without needing
@@ -402,7 +503,10 @@ function TaskInitScreen({ onStart }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary"], (result) => {
+        // Read before the early return below — a recoverable previous session
+        // matters just as much when a session is already active.
+        setLastSummary(result.ff_lastSummary ?? null);
         const t = result.ff_task;
         if (t) {
           setParticipantId(t.participantId ?? "");
@@ -485,6 +589,20 @@ function TaskInitScreen({ onStart }) {
     }
   }
 
+  // Re-download a previous session's export. Same builder as the analytics
+  // screen, so the two can never produce different files.
+  function handleDownloadLast() {
+    if (!lastSummary) return;
+    const { json, csv, base } = buildSessionExport(lastSummary);
+    downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
+    setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    const updated = { ...lastSummary, downloadedAt: Date.now() };
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.set({ ff_lastSummary: updated });
+    }
+    setLastSummary(updated);
+  }
+
   function handleCancelTask() {
     if (typeof chrome !== "undefined" && chrome.storage) {
       // Send before clearing ff_task — sendToTaskTab needs its tabId.
@@ -513,6 +631,19 @@ function TaskInitScreen({ onStart }) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 0" }}>
+        {/* Shown ONLY while a previous session's export is still outstanding —
+            it exists to catch data that would otherwise be lost. Once
+            downloaded it disappears entirely: a "download again" offer here is
+            noise on a screen whose job is starting the next session (re-download
+            still lives on the analytics screen, where it's the actual context). */}
+        {lastSummary && !lastSummary.downloadedAt && (
+          <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 11px", marginBottom: 14 }}>
+            <p style={{ margin: "0 0 7px", fontSize: 11, color: "#8A5A1B", lineHeight: 1.5 }}>
+              {`Previous session was not downloaded (${lastSummary.participantId || "no ID"} · ${lastSummary.condition === "baseline" ? "Baseline" : "Intervention"})`}
+            </p>
+            <Btn variant="outline" style={{ width: "100%" }} onClick={handleDownloadLast}>Download session data</Btn>
+          </div>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Participant ID</p>
         <input
           value={participantId}
@@ -1036,6 +1167,15 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         // Send before clearing ff_task — sendToTaskTab needs its tabId.
         sendToTaskTab({ type: "FF_CANCEL_TASK" });
 
+        // SAFETY NET (study-critical): everything below is about to be cleared,
+        // and finishedSummary otherwise lives only in React state — so closing
+        // the panel on the analytics screen before downloading would lose the
+        // participant's whole session with no way back. This copy survives until
+        // the NEXT session finishes and overwrites it, so a missed download is
+        // recoverable from the task-setup screen. Deliberately NOT cleared by
+        // handleStartTask or handleCancelTask.
+        chrome.storage.local.set({ ff_lastSummary: finishedSummary });
+
         chrome.storage.local.remove("ff_task");
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
@@ -1439,6 +1579,133 @@ function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
   );
 }
 
+// ─── Screen 7: Post-session questionnaires ───────────────────────────────────
+
+// One row of discrete choices. Used for FSS (1-7, numbered) and UEQ-S (-3..+3,
+// unlabelled circles, the semantic-differential convention).
+function ScaleRow({ points, value, onChange, showNumbers }) {
+  return (
+    <div style={{ display: "flex", gap: 4, justifyContent: "space-between", marginTop: 5 }}>
+      {points.map((p) => {
+        const on = value === p;
+        return (
+          <button
+            key={p}
+            type="button"
+            onClick={() => onChange(p)}
+            style={{ flex: 1, minWidth: 0, height: 26, borderRadius: 999, cursor: "pointer", fontSize: 10, fontWeight: 700, background: on ? TEAL[400] : "#fff", color: on ? "#fff" : "#717182", border: `1px solid ${on ? TEAL[400] : TEAL[100]}` }}
+          >
+            {showNumbers ? p : ""}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SurveyScreen({ initial, onDone, onBack }) {
+  const [step, setStep] = useState(0); // 0 = NASA-TLX, 1 = FSS, 2 = UEQ-S
+  // Prefilled from a previously completed survey so "review" actually reviews.
+  // Starting blank here meant re-submitting silently REPLACED good answers with
+  // whatever was re-entered — worse than not offering review at all.
+  const [tlx, setTlx] = useState(() => ({ ...(initial?.tlx?.items ?? {}) }));
+  const [fss, setFss] = useState(() => ({ ...(initial?.fss?.items ?? {}) }));
+  const [ueqs, setUeqs] = useState(() => ({ ...(initial?.ueqs?.items ?? {}) }));
+  const [error, setError] = useState(false);
+
+  // Every item must be answered before advancing. TLX sliders start UNSET
+  // rather than at 50 — a pre-filled midpoint would let a participant skip an
+  // item without noticing, and it would be indistinguishable from a real 50.
+  const complete = [
+    TLX_ITEMS.every((i) => typeof tlx[i.id] === "number"),
+    FSS_ITEMS.every((_, i) => typeof fss[i + 1] === "number"),
+    UEQS_ITEMS.every((_, i) => typeof ueqs[i + 1] === "number"),
+  ];
+
+  const titles = ["Workload (NASA-TLX)", "Flow (FSS)", "Experience (UEQ-S)"];
+  const intros = [
+    "Rate your experience of the writing session you just finished.",
+    "How well do these statements describe how you felt while writing?",
+    "Rate the FrictionFlow extension itself on each pair.",
+  ];
+
+  function handleNext() {
+    if (!complete[step]) { setError(true); return; }
+    setError(false);
+    if (step < 2) { setStep(step + 1); return; }
+    onDone(scoreSurvey({ tlx, fss, ueqs }));
+  }
+
+  function handleBack() {
+    setError(false);
+    if (step === 0) { onBack(); return; }
+    setStep(step - 1);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <SidePanelHeader title={initial ? "Review answers" : "Questionnaire"} subtitle={`Step ${step + 1} of 3 · ${titles[step]}`} />
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+        <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.6 }}>{intros[step]}</p>
+
+        {step === 0 && TLX_ITEMS.map((item) => (
+          <div key={item.id} style={{ marginBottom: 15 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+              <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: "#030213" }}>{item.label}</p>
+              <span style={{ fontSize: 11, fontWeight: 700, color: typeof tlx[item.id] === "number" ? TEAL[600] : "#B4B4BB" }}>
+                {typeof tlx[item.id] === "number" ? tlx[item.id] : "—"}
+              </span>
+            </div>
+            <p style={{ margin: "2px 0 6px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>{item.question}</p>
+            <input
+              type="range" min={0} max={100} step={5}
+              value={typeof tlx[item.id] === "number" ? tlx[item.id] : 50}
+              onChange={(e) => setTlx({ ...tlx, [item.id]: Number(e.target.value) })}
+              style={{ width: "100%", accentColor: TEAL[400], opacity: typeof tlx[item.id] === "number" ? 1 : 0.45 }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#717182" }}>
+              <span>{item.low}</span><span>{item.high}</span>
+            </div>
+          </div>
+        ))}
+
+        {step === 1 && (
+          <>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#717182", marginBottom: 8 }}>
+              <span>1 · Not at all</span><span>Very much · 7</span>
+            </div>
+            {FSS_ITEMS.map((text, i) => (
+              <div key={i} style={{ marginBottom: 13 }}>
+                <p style={{ margin: 0, fontSize: 11, color: "#030213", lineHeight: 1.5 }}>{i + 1}. {text}</p>
+                <ScaleRow points={[1, 2, 3, 4, 5, 6, 7]} value={fss[i + 1]} onChange={(v) => setFss({ ...fss, [i + 1]: v })} showNumbers />
+              </div>
+            ))}
+          </>
+        )}
+
+        {step === 2 && UEQS_ITEMS.map((pair, i) => (
+          <div key={i} style={{ marginBottom: 13 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#030213" }}>
+              <span>{pair.left}</span><span>{pair.right}</span>
+            </div>
+            <ScaleRow points={[-3, -2, -1, 0, 1, 2, 3]} value={ueqs[i + 1]} onChange={(v) => setUeqs({ ...ueqs, [i + 1]: v })} />
+          </div>
+        ))}
+
+        {error && (
+          <p style={{ margin: "4px 0 0", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please answer every item before continuing.
+          </p>
+        )}
+      </div>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", gap: 8 }}>
+        <Btn variant="outline" style={{ flex: 1 }} onClick={handleBack}>{step === 0 ? "Cancel" : "Back"}</Btn>
+        <Btn variant="primary" style={{ flex: 1 }} onClick={handleNext}>{step === 2 ? "Finish" : "Next"}</Btn>
+      </div>
+    </div>
+  );
+}
+
 // ─── Screen 6: Session Analytics ─────────────────────────────────────────────
 
 function AnalyticsScreen({ setScreen, summary }) {
@@ -1636,6 +1903,11 @@ function AnalyticsScreen({ setScreen, summary }) {
     // Small stagger so the browser reliably fires both downloads in a row.
     setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
     setDownloaded(true);
+    // Stamp the persisted copy as retrieved, so the setup screen stops flagging
+    // it as an un-downloaded session.
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.set({ ff_lastSummary: { ...s, downloadedAt: Date.now() } });
+    }
   }
 
   return (
@@ -1746,10 +2018,25 @@ function AnalyticsScreen({ setScreen, summary }) {
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
-        <Btn variant="outline" style={{ width: "100%" }} onClick={handleExport}>
-          {downloaded ? "Downloaded ✓ — download again" : "Download session data (JSON + CSV)"}
+        {/* The export embeds questionnaire responses, so downloading first
+            yields an incomplete file. Only ONE action is primary at a time,
+            walking the researcher through questionnaire → download → next task.
+            The gate is deliberately soft: a hard block would strand the
+            behavioral data whenever a participant can't finish the scales, so
+            the skip stays available as a plain link rather than a button. */}
+        <Btn variant={s.survey ? "outline" : "primary"} style={{ width: "100%" }} onClick={() => setScreen("survey")}>
+          {s.survey ? "Review answers ✓" : "Complete questionnaire (3 short scales)"}
         </Btn>
-        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
+        {s.survey ? (
+          <Btn variant={downloaded ? "outline" : "primary"} style={{ width: "100%" }} onClick={handleExport}>
+            {downloaded ? "Downloaded ✓ — download again" : "Download session data (JSON + CSV)"}
+          </Btn>
+        ) : (
+          <button onClick={handleExport} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: "#717182", textDecoration: "underline", padding: "2px 0", alignSelf: "center" }}>
+            Download without questionnaire
+          </button>
+        )}
+        <Btn variant={downloaded ? "primary" : "outline"} style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
       </div>
     </div>
   );
@@ -1788,6 +2075,21 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       breakOriginRef={breakOriginRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
+    survey: <SurveyScreen
+      initial={summary?.survey}
+      onBack={() => setScreen("analytics")}
+      onDone={(survey) => {
+        // Fold the responses into the summary so the existing export picks them
+        // up, and mirror to ff_lastSummary so a questionnaire completed but not
+        // downloaded is still recoverable from the setup screen.
+        const next = { ...(summary ?? {}), survey };
+        setSummary(next);
+        if (typeof chrome !== "undefined" && chrome.storage) {
+          chrome.storage.local.set({ ff_lastSummary: next });
+        }
+        setScreen("analytics");
+      }}
+    />,
     break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} breakOriginRef={breakOriginRef} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
