@@ -90,6 +90,11 @@ let netCharsAtSync = 0;       // netChars at that moment, for the live delta
 let docWordBaseline = null;
 let totalDocWords = 0;        // total words in the doc (baseline + written) — for display only
 let wordSyncInFlight = false; // true while a Docs API word-count request is pending
+// True once a Docs API word-count sync has actually returned a number this
+// session — i.e. OAuth is working. Stays false (or flips back) when syncs
+// return null (no/failed auth), which the panel surfaces so the researcher
+// can reconnect instead of silently getting keystroke-only word counts.
+let docsConnected = false;
 
 // Phase Duration Variables — accumulated ms spent in each classified phase
 let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
@@ -210,8 +215,9 @@ function syncWordCount() {
   try {
     chrome.runtime.sendMessage({ type: "FF_SYNC_WORD_COUNT" }, (response) => {
       wordSyncInFlight = false;
-      if (chrome.runtime.lastError) return; // keep approximation
+      if (chrome.runtime.lastError) return; // background asleep — keep last known status
       if (response && typeof response.wordCount === "number") {
+        docsConnected = true;
         if (docWordBaseline === null) {
           // First sync: everything in the doc beyond what this session's
           // keystrokes account for was already there — that's the baseline.
@@ -221,6 +227,10 @@ function syncWordCount() {
         netCharsAtSync = netChars;
         totalDocWords = response.wordCount;
         isTyping = true; // make the next flush write the corrected count
+      } else {
+        // Response arrived but no number → Docs API unavailable (no/failed
+        // OAuth, tab gone). Surface it so the panel can offer a reconnect.
+        docsConnected = false;
       }
     });
   } catch (e) {
@@ -451,6 +461,7 @@ function flushPhaseToStorage() {
         distractionEpisodes,
         activeDistraction, // persist the open episode so a resume can continue it
         avgResumptionMs: getAvgResumptionMs(),
+        docsConnected, // Docs API auth status, for the panel's connect indicator
       }
     });
   });
@@ -709,6 +720,7 @@ function resetSessionState() {
   docWordBaseline = null;
   totalDocWords = 0;
   wordSyncInFlight = false;
+  docsConnected = false;
 
   phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
   currentTrackedPhase = null;
@@ -904,6 +916,9 @@ function startIntervals() {
       distractionEpisodes,
       activeDistraction, // in-progress episode — carried so a mid-distraction refresh doesn't drop it
       avgResumptionMs: getAvgResumptionMs(),
+
+      // Docs API connection status (for the panel's connect indicator)
+      docsConnected,
 
       // Breaks & interruptions
       totalBreakMs,

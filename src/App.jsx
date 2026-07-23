@@ -134,10 +134,13 @@ function recordSuggestionChoice({ generatedAt, chosenIndex, options }) {
   });
 }
 
-// Appends a distraction-prompt intervention event (the "Gentle Reminder" shown,
-// or the participant's response: get_back_to_work / take_a_break / dismiss) to a
-// panel-owned log. Kept OUT of ff_session — which content.js read-modify-writes
-// continuously — so the two never race. Feeds the intervention-event export.
+// Appends an intervention event to a panel-owned log: the "Gentle Reminder"
+// shown (prompt_shown), the participant's response to it (response =
+// get_back_to_work / take_a_break / dismiss), or a self-initiated voluntary
+// break (voluntary_break — the monitoring-screen "Take a break" button, kept
+// distinct from the prompt-driven take_a_break so the two break origins can be
+// counted separately). Kept OUT of ff_session — which content.js
+// read-modify-writes continuously — so the two never race. Feeds the export.
 function logInterventionEvent(type, detail = {}) {
   if (typeof chrome === "undefined" || !chrome.storage) return;
   chrome.storage.local.get("ff_events", (result) => {
@@ -194,6 +197,13 @@ function buildSessionExport(s) {
   const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
   const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
   const respCount = (r) => events.filter((e) => e.type === "response" && e.response === r).length;
+  // Break counts by origin, kept separate: prompted = the distraction prompt's
+  // "Take a Break" (a response to the intervention, intervention condition only);
+  // voluntary = the monitoring-screen "Take a break" (self-initiated, both
+  // conditions). total is the convenience sum. Merging them would confound the
+  // baseline↔intervention comparison, since prompted breaks can't occur in baseline.
+  const promptedBreaks = respCount("take_a_break");
+  const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
   const tally = s.suggestionTally ?? {};
 
   const json = {
@@ -227,15 +237,21 @@ function buildSessionExport(s) {
       Distracted: phases.Distracted ?? 0,
     },
     distractions: {
-      count: s.distractionCount ?? 0,
-      avgResumptionSec: sec(s.avgResumptionMs),
+      count: s.distractionCount ?? 0,              // occurrences (onset)
+      recovered: s.distractionsRecovered ?? 0,     // episodes that resumed (have a resumptionMs)
+      avgResumptionSec: sec(s.avgResumptionMs),    // averaged over recovered episodes only
       episodes: s.distractionEpisodes ?? [],
     },
     promptResponses: {
       promptsShown: events.filter((e) => e.type === "prompt_shown").length,
       getBackToWork: respCount("get_back_to_work"),
-      takeABreak: respCount("take_a_break"),
+      takeABreak: promptedBreaks,
       dismiss: respCount("dismiss"),
+    },
+    breaks: {
+      voluntary: voluntaryBreaks,
+      prompted: promptedBreaks,
+      total: voluntaryBreaks + promptedBreaks,
     },
     recoverySuggestions: { tally, choices: s.suggestionChoices ?? [] },
     interventionEvents: events,
@@ -264,11 +280,14 @@ function buildSessionExport(s) {
     ["reviewingSec", sec(phases.Reviewing)],
     ["distractedSec", sec(phases.Distracted)],
     ["distractionCount", json.distractions.count],
+    ["distractionsRecovered", json.distractions.recovered],
     ["avgResumptionSec", json.distractions.avgResumptionSec],
     ["promptsShown", json.promptResponses.promptsShown],
     ["respGetBackToWork", json.promptResponses.getBackToWork],
-    ["respTakeBreak", json.promptResponses.takeABreak],
+    ["respTakeBreak", json.promptResponses.takeABreak], // prompt-driven breaks
     ["respDismiss", json.promptResponses.dismiss],
+    ["voluntaryBreaks", voluntaryBreaks],
+    ["totalBreaks", voluntaryBreaks + promptedBreaks],
     ["suggestStance0", tally[0] ?? 0],
     ["suggestStance1", tally[1] ?? 0],
     ["suggestStance2", tally[2] ?? 0],
@@ -738,6 +757,11 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [condition, setCondition] = useState("intervention");
   const [distractionCount, setDistractionCount] = useState(0);
   const [participantId, setParticipantId] = useState(""); // carried into the export
+  // Docs API connection status, mirrored from ff_session.docsConnected. When
+  // false, the word count is keystroke-approximated (pasted text uncounted)
+  // and the panel offers a manual reconnect.
+  const [docsConnected, setDocsConnected] = useState(false);
+  const [docsConnecting, setDocsConnecting] = useState(false);
   // The next-step the participant chose for the CURRENT recovery episode, shown
   // between the phase and the active context. Null once a new episode generates
   // (its generatedAt no longer matches any choice) until they pick again.
@@ -798,8 +822,13 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
-          setDistractionCount(s.distractionCount ?? 0);
+          // Show OCCURRENCES (onset), not closed episodes — so the tile ticks
+          // the moment a distraction begins (matching the reminder), instead of
+          // lagging until the resuming keystroke closes the episode.
+          setDistractionCount(s.distractionOnsetCount ?? 0);
           setTotalDocWords(s.totalDocWords ?? 0);
+          if (s.docsConnected) { setDocsConnected(true); setDocsConnecting(false); }
+          else setDocsConnected(false);
 
           // Auto-trigger the distraction prompt. Two independent triggers, so a
           // dismiss silences the current instance without disabling detection:
@@ -890,6 +919,25 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     setShowDistractionPrompt(false);
   }
 
+  // Manually (re)trigger the Google Docs consent. The session-start attempt is
+  // easy to miss (the popup is a separate window, or a stale grant fails
+  // non-interactively); this forces an interactive auth on demand. On success
+  // the next word-count sync flips docsConnected true and the banner clears.
+  function handleConnectDocs() {
+    if (typeof chrome === "undefined" || !chrome.runtime) return;
+    setDocsConnecting(true);
+    try {
+      chrome.runtime.sendMessage({ type: "FF_ENSURE_DOCS_AUTH" }, () => {
+        void chrome.runtime.lastError; // ignore; the poll reflects the real result
+        // Leave "connecting" until a sync confirms; time-box it so a
+        // dismissed popup doesn't spin forever.
+        setTimeout(() => setDocsConnecting(false), 8000);
+      });
+    } catch (e) {
+      setDocsConnecting(false);
+    }
+  }
+
   function handleFinishSession() {
     const finalElapsedSeconds = sessionStartTime
       ? Math.floor((Date.now() - sessionStartTime) / 1000)
@@ -927,7 +975,12 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         scrollFrequency,
         scrollFrequencyLabel,
         phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
-        distractionCount: sessionSnapshot.distractionCount ?? 0,
+        // distractionCount = occurrences (onset): matches the live tile and the
+        // reminders, and includes any distraction still open at finish.
+        // distractionsRecovered = episodes that closed on a resuming keystroke
+        // (the ones with a resumptionMs); avgResumptionMs is averaged over those.
+        distractionCount: sessionSnapshot.distractionOnsetCount ?? 0,
+        distractionsRecovered: sessionSnapshot.distractionCount ?? 0,
         distractionEpisodes: sessionSnapshot.distractionEpisodes ?? [],
         avgResumptionMs: sessionSnapshot.avgResumptionMs ?? 0,
         suggestionChoices,
@@ -984,6 +1037,22 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             </div>
           ))}
         </div>
+        {/* Docs connection banner — only once past a short grace (so it
+            doesn't flash before the first word-count sync lands) and only
+            while genuinely not connected. */}
+        {elapsed >= 5 && !docsConnected && (
+          <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 12px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <p style={{ margin: "0 0 2px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Google Docs not connected</p>
+              <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+                Word count is approximate and won't include pasted text. Connect to enable the exact count.
+              </p>
+            </div>
+            <Btn variant="outline" style={{ fontSize: 12, padding: "7px 12px", flexShrink: 0 }} onClick={handleConnectDocs}>
+              {docsConnecting ? "Connecting…" : "Connect"}
+            </Btn>
+          </div>
+        )}
         {/* Writing phase */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Detected writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
@@ -1018,7 +1087,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 8 }}>
-          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; setScreen("break"); }}>Take a break</Btn>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; logInterventionEvent("voluntary_break"); setScreen("break"); }}>Take a break</Btn>
           <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
         </div>
         {hasRecoverySummary && (
@@ -1063,6 +1132,11 @@ function RecoveryScreen({ setScreen }) {
   const [summary, setSummary] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Whether a Gemini API key is configured. When absent, no summary can ever
+  // generate, so the empty state says so (a config fix) instead of implying
+  // one is coming. Defaults true so the "no key" notice doesn't flash before
+  // ff_settings is read.
+  const [hasApiKey, setHasApiKey] = useState(true);
   // Which of the 3 suggestions this episode's choice currently sits on (null =
   // no pick yet). Reloaded from the choice log so revisiting via "View last
   // recovery summary" shows — and lets the participant change — their pick.
@@ -1070,7 +1144,8 @@ function RecoveryScreen({ setScreen }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating", "ff_suggestion_choices"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating", "ff_suggestion_choices", "ff_settings"], (result) => {
+        setHasApiKey(!!result.ff_settings?.geminiApiKey);
         const t = result.ff_task;
         const r = result.ff_recovery;
         if (t) {
@@ -1155,9 +1230,21 @@ function RecoveryScreen({ setScreen }) {
           </div>
         ) : summary ? (
           <RecoverySummaryContent summary={summary} selectedIndex={selectedIndex} onSelect={handleSelectSuggestion} />
+        ) : !hasApiKey ? (
+          // No API key → summaries can never generate. Say so (a setup fix),
+          // rather than implying one is on the way.
+          <div style={{ textAlign: "center", padding: "36px 16px" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "#FFF8F0", border: "1px solid #FDDCB5", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+              <svg width="20" height="20" fill="none" viewBox="0 0 20 20"><path d="M10 6v5M10 14h.01" stroke="#F4A261" strokeWidth="2" strokeLinecap="round" /></svg>
+            </div>
+            <p style={{ margin: "0 0 4px", fontSize: 12, fontWeight: 600, color: "#030213" }}>AI recovery summaries are off</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 250, marginLeft: "auto", marginRight: "auto" }}>
+              No Gemini API key is configured. A researcher can add one on the extension's Options page to enable recovery summaries. You can head back and keep writing.
+            </p>
+          </div>
         ) : (
           // Honest empty state — no filler content pretending to be a real
-          // summary (no key configured, generation failed, or none yet).
+          // summary (generation failed, or no episode yet).
           <div style={{ textAlign: "center", padding: "36px 16px" }}>
             <div style={{ width: 40, height: 40, borderRadius: 12, background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
               <svg width="18" height="18" fill="none" viewBox="0 0 18 18"><path d="M3 9h12M9 3v12" stroke={TEAL[200]} strokeWidth="1.6" strokeLinecap="round" opacity="0.6" transform="rotate(45 9 9)"/></svg>
@@ -1352,7 +1439,9 @@ function AnalyticsScreen({ setScreen, summary }) {
     { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
     { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
     { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
-    { label: "Avg. recovery", value: (s.distractionCount ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
+    // Guard on RECOVERED episodes (not occurrences): if the only distraction was
+    // still open at finish, there's no resumption time to average, so show "—".
+    { label: "Avg. recovery", value: (s.distractionEpisodes?.length ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
     // Only surfaced when the session was interrupted (Docs tab closed/left),
     // so a clean session's grid stays uncluttered.
     ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs), icon: "🔌" }] : []),
