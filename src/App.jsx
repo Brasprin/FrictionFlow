@@ -200,6 +200,9 @@ function buildSessionExport(s) {
   // is actually produced. Both exported; UI shows focused.
   const avgWpmOverall = writingSec > 0 ? Math.round(typedWords / (writingSec / 60)) : 0;
   const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
+  // Session pace = words over total wall-clock time (breaks and distraction
+  // included) — the most conservative of the three rates.
+  const avgWpmSession = totalSec > 0 ? Math.round(typedWords / (totalSec / 60)) : 0;
   const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
   const respCount = (r) => events.filter((e) => e.type === "response" && e.response === r).length;
   // Break counts by origin, kept separate: prompted = the distraction prompt's
@@ -232,6 +235,7 @@ function buildSessionExport(s) {
     typing: {
       avgWpmOverall,
       avgWpmFocused,
+      avgWpmSession,
       totalPauses: s.totalPauses ?? 0,
       longestPauseSec: sec(s.longestPauseMs),
       burstCount: s.burstCount ?? 0,
@@ -293,6 +297,7 @@ function buildSessionExport(s) {
     ["docTotalWords", json.words.docTotalWords],
     ["avgWpmOverall", avgWpmOverall],
     ["avgWpmFocused", avgWpmFocused],
+    ["avgWpmSession", avgWpmSession],
     ["totalPauses", json.typing.totalPauses],
     ["longestPauseSec", json.typing.longestPauseSec],
     ["totalDeletes", json.revision.totalDeletes],
@@ -1469,25 +1474,137 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   // The tile shows the FOCUSED rate: typed words (paste can't inflate them) over
   // active drafting only (Translating), where new text is actually produced, so
-  // it reflects genuine typing pace. The export carries this plus an overall
-  // rate over Translating + Reviewing — both computed in buildSessionExport.
+  // it reflects genuine typing pace. The OVERALL rate (over Translating +
+  // Reviewing) is shown in the tile's hover breakdown; both are exported.
   const avgWpmFocused = translatingSecs > 0 ? Math.round(typedWords / (translatingSecs / 60)) : 0;
+  const avgWpmOverall = writingSecs > 0 ? Math.round(typedWords / (writingSecs / 60)) : 0;
+  // Whole-session rate: same typed words over total wall-clock time, so breaks,
+  // planning and distracted time all count against it. The lowest of the three.
+  const avgWpmSession = totalSecs > 0 ? Math.round(typedWords / (totalSecs / 60)) : 0;
+
+  // ── Values used only by the hover breakdowns ──
+  // The tiles show one headline number each; the adviser asked for the
+  // components behind them to be inspectable without opening the export.
+  const planningSecs = Math.round((s.phaseDurationsMs?.Planning ?? 0) / 1000);
+  const distractedSecs = Math.round((s.phaseDurationsMs?.Distracted ?? 0) / 1000);
+  const tabAwaySecs = Math.round((s.totalTabAwayMs ?? 0) / 1000);
+  // Only CLOSED episodes are in this array, so it's the recovered set.
+  const episodes = s.distractionEpisodes ?? [];
+  const recoveredCount = s.distractionsRecovered ?? episodes.length;
+  const triggerCount = (t) => episodes.filter((e) => e.trigger === t).length;
+  const resumptionSecsList = episodes.map((e) => Math.round((e.resumptionMs ?? 0) / 1000));
+  const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
+  const promptedBreaks = events.filter((e) => e.type === "response" && e.response === "take_a_break").length;
+  const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
 
   // Stats backed by real tracked data from content.js
   const stats = [
-    { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
-    { label: "Writing time",  value: fmt(writingSecs),  icon: "✍️" },
-    { label: "Doc words",     value: docWords,          icon: "📝" },
-    { label: "Typed words",   value: typedWords,        icon: "⌨️" },
-    { label: "Avg. WPM",      value: avgWpmFocused,     icon: "⚡" },
-    { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
-    { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
-    { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
+    { label: "Total time", value: fmt(totalSecs), icon: "⏱",
+      detail: {
+        rows: [
+          { label: "Writing", value: fmt(writingSecs) },
+          { label: "Planning", value: fmt(planningSecs) },
+          { label: "Distracted", value: fmt(distractedSecs) },
+          { label: "Breaks", value: fmt(breakSecs) },
+          ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs) }] : []),
+        ],
+        note: "Parts won't sum to the total — tracking pauses during breaks and offline time.",
+      } },
+    { label: "Writing time", value: fmt(writingSecs), icon: "✍️",
+      detail: {
+        rows: [
+          { label: "Translating (drafting)", value: fmt(translatingSecs) },
+          { label: "Reviewing (revising)", value: fmt(reviewingSecs) },
+        ],
+      } },
+    { label: "Doc words", value: docWords, icon: "📝",
+      detail: {
+        rows: [
+          // "—" not 0 when the Docs API never connected: totalDocWords stays 0
+          // in that case, and printing 0 asserts the document is EMPTY when the
+          // truth is that we never found out. The headline silently falls back
+          // to the keystroke estimate here, so the panel must show the gap.
+          { label: "Whole document", value: (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : "—" },
+          // Siblings, NOT a parent with a split: these two count different
+          // things (Docs API word boundaries vs keystrokes/5), so "typed" can
+          // legitimately exceed "added" — a word extended in place grows the
+          // keystroke estimate but not the document's word count. An "added
+          // minus typed = pasted" row was here and was wrong: it implied a
+          // decomposition that only holds when the API count runs ahead.
+          { label: "Added this session", value: s.wordCount ?? 0 },
+          { label: "Typed", value: typedWords },
+        ],
+      } },
+    { label: "Typed words", value: typedWords, icon: "⌨️",
+      detail: {
+        rows: [
+          // No row for typedWords itself — it's the headline directly above.
+          // Same wording as the Doc words tile: it's the same quantity.
+          { label: "Added this session", value: s.wordCount ?? 0 },
+          // Units spelled out: these are keypress/gesture counts sitting beside
+          // word counts, and "Deletions: 47" reads as 47 words otherwise.
+          { label: "Delete keypresses", value: s.totalDeletes ?? 0 },
+          { label: "Text selections", value: s.totalSelections ?? 0 },
+        ],
+        note: "Counted from keystrokes, so pasted text is excluded.",
+      } },
+    { label: "Avg. WPM", value: avgWpmFocused, icon: "⚡",
+      detail: {
+        rows: [
+          // Same typed words over three widening time bases, named after the
+          // phases in the chart below. The duplication with the headline is the
+          // point here — it's a comparison set, so the reader can see which
+          // base the tile uses. No rows for the inputs (typed words, phase
+          // durations): those are breakdowns of other tiles, not of this one.
+          { label: "Translating only", value: avgWpmFocused },
+          { label: "Translating + reviewing", value: avgWpmOverall },
+          { label: "Whole session", value: avgWpmSession },
+        ],
+      } },
+    { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸",
+      detail: {
+        rows: [
+          { label: "Longest pause", value: fmt(Math.round((s.longestPauseMs ?? 0) / 1000)) },
+          { label: "Typing bursts", value: s.burstCount ?? 0 },
+          { label: "Avg. burst length", value: fmt(s.avgBurstDurationSec ?? 0) },
+        ],
+      } },
+    { label: "Break time", value: fmt(breakSecs), icon: "☕",
+      detail: {
+        rows: [
+          { label: "Voluntary breaks", value: voluntaryBreaks },
+          { label: "Prompted breaks", value: promptedBreaks },
+        ],
+      } },
+    { label: "Distractions", value: s.distractionCount ?? 0, icon: "💥",
+      detail: {
+        rows: [
+          { label: "Recovered", value: recoveredCount },
+          // Indented under Recovered, NOT under the headline: trigger counts
+          // come from closed episodes only, so they sum to recovered. Listed
+          // flat they looked like a breakdown of occurrences that didn't add up.
+          { label: "Left the tab", value: triggerCount("tab-away"), indent: true },
+          { label: "Idle on the doc", value: triggerCount("idle"), indent: true },
+          { label: "Rapid switching", value: triggerCount("rapid-switch"), indent: true },
+          // Tab switch COUNT was dropped: most switches never become a
+          // distraction, so it isn't a breakdown of this tile. Time off-tab
+          // stays — it quantifies the dominant trigger above it.
+          { label: "Time off-tab", value: fmt(tabAwaySecs) },
+        ],
+      } },
     // Guard on RECOVERED episodes (not occurrences): if the only distraction was
     // still open at finish, there's no resumption time to average, so show "—".
-    { label: "Avg. recovery", value: (s.distractionEpisodes?.length ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
+    { label: "Avg. recovery", value: episodes.length > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯",
+      detail: {
+        rows: [
+          { label: "Fastest", value: resumptionSecsList.length > 0 ? fmt(Math.min(...resumptionSecsList)) : "—" },
+          { label: "Slowest", value: resumptionSecsList.length > 0 ? fmt(Math.max(...resumptionSecsList)) : "—" },
+          { label: "Episodes measured", value: episodes.length },
+        ],
+      } },
     // Only surfaced when the session was interrupted (Docs tab closed/left),
     // so a clean session's grid stays uncluttered.
+    // No detail: the only thing to say is the number already on the tile.
     ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs), icon: "🔌" }] : []),
   ];
   const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
@@ -1510,6 +1627,8 @@ function AnalyticsScreen({ setScreen, summary }) {
     ? phases.reduce((max, p) => (p.pct > max.pct ? p : max))
     : null;
 
+  // Which tile's breakdown is showing (by label; null = none).
+  const [openStat, setOpenStat] = useState(null);
   const [downloaded, setDownloaded] = useState(false);
   function handleExport() {
     const { json, csv, base } = buildSessionExport(s);
@@ -1534,13 +1653,64 @@ function AnalyticsScreen({ setScreen, summary }) {
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
-          {stats.map(st => (
-            <div key={st.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
-              <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
-              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
-              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
-            </div>
-          ))}
+          {stats.map((st, i) => {
+            // A tile with no detail never highlights or opens — it just sits there.
+            const open = openStat === st.label && !!st.detail;
+            // Tiles on the last row open UPWARD — a panel hanging below them
+            // would sit at the bottom edge of the scroll area, half off-screen.
+            // The last row holds 2 tiles on an even count, 1 on an odd one.
+            const openUp = i >= stats.length - (stats.length % 2 === 0 ? 2 : 1);
+            // Left column anchors left, right column anchors right, so a panel
+            // wider than its tile still can't overflow the narrow side panel.
+            const anchorRight = i % 2 === 1;
+            return (
+              <div
+                key={st.label}
+                onMouseEnter={() => setOpenStat(st.label)}
+                onMouseLeave={() => setOpenStat(null)}
+                onFocus={() => setOpenStat(st.label)}
+                onBlur={() => setOpenStat(null)}
+                // Click toggles too: hover alone is unreachable by keyboard and
+                // unreliable on a trackpad-less setup during a study session.
+                onClick={() => setOpenStat(open ? null : st.label)}
+                tabIndex={st.detail ? 0 : undefined}
+                style={{ position: "relative", background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${open ? TEAL[200] : TEAL[50]}`, cursor: st.detail ? "help" : "default", outline: "none" }}
+              >
+                <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
+                <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
+                <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
+                {open && st.detail && (
+                  // The wrapper carries the gap as PADDING, not margin, so the
+                  // pointer never crosses dead space (which would fire
+                  // mouseleave and close the panel on the way to reading it).
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ position: "absolute", zIndex: 20, width: 216, [anchorRight ? "right" : "left"]: 0, [openUp ? "bottom" : "top"]: "100%", [openUp ? "paddingBottom" : "paddingTop"]: 6, textAlign: "left", cursor: "default" }}
+                  >
+                    <div style={{ background: "#fff", border: `1px solid ${TEAL[200]}`, borderRadius: 10, padding: "9px 11px", boxShadow: "0 6px 18px rgba(0,0,0,0.10)" }}>
+                      <p style={{ margin: "0 0 6px", fontSize: 10, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>{st.label}</p>
+                      {st.detail.rows.map(r => (
+                        // Sub-rows are indented with real padding + a rule, not
+                        // a leading "—": that character already means "no value"
+                        // in these panels (Fastest/Slowest with no episodes).
+                        <div key={r.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 3, paddingLeft: r.indent ? 9 : 0, borderLeft: r.indent ? `2px solid ${TEAL[100]}` : "none" }}>
+                          <span style={{ fontSize: 10, color: "#717182", lineHeight: 1.5 }}>{r.label}</span>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: TEAL[800], flexShrink: 0, lineHeight: 1.5 }}>{r.value}</span>
+                        </div>
+                      ))}
+                      {/* A note only earns its place when a number would
+                          otherwise read as a bug (parts that don't sum, a
+                          count that looks too low). Most rows explain
+                          themselves from their label, so most have none. */}
+                      {st.detail.note && (
+                        <p style={{ margin: "7px 0 0", paddingTop: 6, borderTop: "1px solid rgba(0,0,0,0.06)", fontSize: 10, color: "#717182", lineHeight: 1.55 }}>{st.detail.note}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Time in writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
