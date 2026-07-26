@@ -31,7 +31,7 @@ function resumeTaskTracking() {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const active = tabs[0];
     const isDocsTab = !!active?.url?.startsWith("https://docs.google.com/");
-    chrome.storage.local.get("ff_task", (result) => {
+    chrome.storage.local.get(["ff_task", "ff_interrupted"], (result) => {
       const task = result.ff_task;
       if (!task) return;
       if (isDocsTab && active.id !== task.tabId) {
@@ -39,7 +39,19 @@ function resumeTaskTracking() {
       }
       const targetId = isDocsTab ? active.id : task.tabId;
       if (!targetId) return;
-      chrome.tabs.sendMessage(targetId, { type: "FF_RESUME_TASK" }).catch(() => {});
+      // If this resume follows an interruption (Docs tab closed/left), measure
+      // the offline gap here — where ff_interrupted is still readable — and
+      // pass it to the content script so it's subtracted from writing time.
+      // Clearing ff_interrupted is owned by this function (only on a confirmed
+      // resume), so it isn't cleared out from under this read by a racing
+      // remove() elsewhere.
+      const wasInterrupted = !!result.ff_interrupted;
+      const interruptedMs = result.ff_interrupted?.at
+        ? Math.max(0, Date.now() - result.ff_interrupted.at)
+        : 0;
+      chrome.tabs.sendMessage(targetId, { type: "FF_RESUME_TASK", interruptedMs })
+        .then(() => { if (wasInterrupted) chrome.storage.local.remove("ff_interrupted"); })
+        .catch(() => {});
     });
   });
 }
@@ -99,7 +111,368 @@ function Btn({ children, variant = "primary", onClick, style = {} }) {
   if (variant === "danger") return <button style={{ ...base, background: "transparent", color: "#d4183d", border: "1px solid rgba(212,24,61,0.25)" }} onClick={onClick}>{children}</button>;
 }
 
-function RecoverySummaryContent({ summary }) {
+// Upsert the participant's chosen next-step for the current recovery episode.
+// Keyed by the episode's generatedAt so re-picking (including later via "View
+// last recovery summary") UPDATES the same record instead of adding a duplicate
+// — one distraction episode contributes at most one choice to the export tally.
+// A record freezes on its own once the next episode generates (a new
+// generatedAt is never written back to) or the session ends; there is no
+// separate "commit" step. The choice log (ff_suggestion_choices) is owned
+// solely by the panel — kept OUT of ff_session, which content.js
+// read-modify-writes continuously, so the two never race.
+function recordSuggestionChoice({ generatedAt, chosenIndex, options }) {
+  if (typeof chrome === "undefined" || !chrome.storage || !generatedAt) return;
+  chrome.storage.local.get("ff_suggestion_choices", (result) => {
+    const log = Array.isArray(result.ff_suggestion_choices) ? result.ff_suggestion_choices : [];
+    // chosenIndex IS the stance (0 = goal-anchored, 1 = doc-driven, 2 = bridge)
+    // because the suggestions array is generated in that fixed order. options
+    // preserves the two not-chosen suggestions for the export record.
+    const record = { at: Date.now(), generatedAt, chosenIndex, chosenText: options[chosenIndex], options };
+    const idx = log.findIndex((r) => r.generatedAt === generatedAt);
+    if (idx >= 0) log[idx] = record; else log.push(record);
+    chrome.storage.local.set({ ff_suggestion_choices: log });
+  });
+}
+
+// Appends an intervention event to a panel-owned log: the "Gentle Reminder"
+// shown (prompt_shown), the participant's response to it (response =
+// get_back_to_work / take_a_break / dismiss), or a self-initiated voluntary
+// break (voluntary_break — the monitoring-screen "Take a break" button, kept
+// distinct from the prompt-driven take_a_break so the two break origins can be
+// counted separately). Kept OUT of ff_session — which content.js
+// read-modify-writes continuously — so the two never race. Feeds the export.
+function logInterventionEvent(type, detail = {}) {
+  if (typeof chrome === "undefined" || !chrome.storage) return;
+  chrome.storage.local.get("ff_events", (result) => {
+    const log = Array.isArray(result.ff_events) ? result.ff_events : [];
+    log.push({ at: Date.now(), type, ...detail });
+    chrome.storage.local.set({ ff_events: log });
+  });
+}
+
+// ─── Session data export ──────────────────────────────────────────────────────
+
+// Triggers a file download from the side panel via an in-memory blob — no
+// "downloads" permission needed, since the panel is a normal extension page.
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Quote a CSV cell and escape embedded quotes, so free-text fields (task name,
+// objective) with commas/quotes/newlines don't break the row.
+function csvCell(value) {
+  const str = value === null || value === undefined ? "" : String(value);
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+// Slugs a value for use in a filename (participant id, condition).
+function fileSlug(value, fallback) {
+  const s = String(value ?? "").trim().replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return s || fallback;
+}
+
+// ─── Post-session questionnaires ─────────────────────────────────────────────
+// Three validated instruments, administered in-panel right after Session
+// Complete so responses land in the SAME export as the behavioral data (no
+// separate form to reconcile by participant ID later).
+//
+// Variants fixed with the owners: Raw TLX (unweighted — no pairwise procedure),
+// FSS 10 flow items, UEQ-S (8 items). Item wording below is verbatim from the
+// published instruments — DO NOT reword or reorder: the subscale indices and
+// the published comparison norms both depend on it.
+
+// NASA-TLX (Hart & Staveland 1988), raw/unweighted. Each 0-100 in steps of 5.
+// Wording is the official rating-scale description, trimmed to the FIRST
+// question of each (the follow-up clauses — "Was the task easy or demanding,
+// simple or complex..." — are dropped to keep the side panel readable).
+// Performance is anchored Good→Poor per the original, which means that like the
+// other five a HIGHER value is the worse/heavier end — so the six are directly
+// averageable with no reverse-scoring.
+const TLX_ITEMS = [
+  { id: "mental", label: "Mental Demand", question: "How much mental and perceptual activity was required (e.g. thinking, deciding, calculating, remembering, looking, searching, etc)?", low: "Low", high: "High" },
+  { id: "physical", label: "Physical Demand", question: "How much physical activity was required (e.g. pushing, pulling, turning, controlling, activating, etc)?", low: "Low", high: "High" },
+  { id: "temporal", label: "Temporal Demand", question: "How much time pressure did you feel due to the rate of pace at which the tasks or task elements occurred?", low: "Low", high: "High" },
+  { id: "performance", label: "Performance", question: "How successful do you think you were in accomplishing the goals of the task set by the experimenter (or yourself)?", low: "Good", high: "Poor" },
+  { id: "effort", label: "Effort", question: "How hard did you have to work (mentally and physically) to accomplish your level of performance?", low: "Low", high: "High" },
+  { id: "frustration", label: "Frustration", question: "How insecure, discouraged, irritated, stressed and annoyed versus secure, gratified, content, relaxed and complacent did you feel during the task?", low: "Low", high: "High" },
+];
+
+// Flow Short Scale (Rheinberg, Vollmeyer & Engeser 2003), 10 flow items, 1-7.
+const FSS_ITEMS = [
+  "I feel just the right amount of challenge.",
+  "My thoughts/activities run fluidly and smoothly.",
+  "I do not notice time passing.",
+  "I have no difficulty concentrating.",
+  "My mind is completely clear.",
+  "I am totally absorbed in what I am doing.",
+  "The right thoughts/movements occur of their own accord.",
+  "I know what I have to do each step of the way.",
+  "I feel that I have everything under control.",
+  "I am completely lost in thought.",
+];
+// Subscales per Engeser & Rheinberg (2008), 1-indexed item numbers.
+const FSS_FLUENCY = [2, 4, 5, 7, 8, 9];
+const FSS_ABSORPTION = [1, 3, 6, 10];
+
+// UEQ-S (Schrepp, Hinderks & Thomaschewski 2017), 8 semantic differentials
+// scored -3..+3. Items 1-4 = pragmatic quality, 5-8 = hedonic quality.
+const UEQS_ITEMS = [
+  { left: "obstructive", right: "supportive" },
+  { left: "complicated", right: "easy" },
+  { left: "inefficient", right: "efficient" },
+  { left: "confusing", right: "clear" },
+  { left: "boring", right: "exciting" },
+  { left: "not interesting", right: "interesting" },
+  { left: "conventional", right: "inventive" },
+  { left: "usual", right: "leading edge" },
+];
+
+// Turns raw responses into the stored survey object: every item preserved for
+// reanalysis (item-level data is needed for Cronbach's alpha), plus the
+// subscale means each instrument defines.
+function scoreSurvey({ tlx, fss, ueqs }) {
+  const mean = (arr) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 100) / 100 : null);
+  const fssItems = {};
+  FSS_ITEMS.forEach((_, i) => { fssItems[i + 1] = fss[i + 1]; });
+  const ueqsItems = {};
+  UEQS_ITEMS.forEach((_, i) => { ueqsItems[i + 1] = ueqs[i + 1]; });
+  return {
+    completedAt: Date.now(),
+    tlx: { items: { ...tlx }, rawScore: mean(TLX_ITEMS.map((i) => tlx[i.id])) },
+    fss: {
+      items: fssItems,
+      overall: mean(FSS_ITEMS.map((_, i) => fss[i + 1])),
+      fluency: mean(FSS_FLUENCY.map((n) => fss[n])),
+      absorption: mean(FSS_ABSORPTION.map((n) => fss[n])),
+    },
+    ueqs: {
+      items: ueqsItems,
+      overall: mean(UEQS_ITEMS.map((_, i) => ueqs[i + 1])),
+      pragmatic: mean([1, 2, 3, 4].map((n) => ueqs[n])),
+      hedonic: mean([5, 6, 7, 8].map((n) => ueqs[n])),
+    },
+  };
+}
+
+// Builds the per-session export payloads (rich JSON + one flat CSV row) from the
+// finish summary. Kept as one function so the two formats can never drift.
+function buildSessionExport(s) {
+  const sec = (ms) => Math.round((ms ?? 0) / 1000);
+  const totalSec = s.elapsedSeconds ?? 0;
+  const breakSec = sec(s.totalBreakMs);
+  const offlineSec = sec(s.totalInterruptedMs);
+  const phases = s.phaseDurationsMs ?? {};
+  const translatingSec = sec(phases.Translating);
+  const reviewingSec = sec(phases.Reviewing);
+  // Writing time = Translating + Reviewing — time actually working on the text
+  // (producing it, or re-reading/revising it), per Flower & Hayes (1981).
+  // Planning and Distracted are excluded but still reported in phasesMs, and
+  // total/break/offline are all exported, so any other time base is derivable.
+  const writingSec = translatingSec + reviewingSec;
+  const typedWords = s.typedWordCount ?? 0;
+  // Overall pace = words over all writing work (Translating + Reviewing).
+  // Focused pace = words over active drafting only (Translating), where new text
+  // is actually produced. Both exported; UI shows focused.
+  const avgWpmOverall = writingSec > 0 ? Math.round(typedWords / (writingSec / 60)) : 0;
+  const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
+  // Session pace = words over total wall-clock time (breaks and distraction
+  // included) — the most conservative of the three rates.
+  const avgWpmSession = totalSec > 0 ? Math.round(typedWords / (totalSec / 60)) : 0;
+  const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
+  const respCount = (r) => events.filter((e) => e.type === "response" && e.response === r).length;
+  // Break counts by origin, kept separate: prompted = the distraction prompt's
+  // "Take a Break" (a response to the intervention, intervention condition only);
+  // voluntary = the monitoring-screen "Take a break" (self-initiated, both
+  // conditions). total is the convenience sum. Merging them would confound the
+  // baseline↔intervention comparison, since prompted breaks can't occur in baseline.
+  // H1 measurement correction. resumptionMs runs return-to-doc → first
+  // keystroke, so in the INTERVENTION arm it also contains the time spent
+  // reading the prompt and the recovery summary — time baseline participants
+  // never spend. Left uncorrected, using the intervention makes the
+  // intervention look slower. Computed here rather than in analysis so the
+  // number can't be derived inconsistently; every input stays exported, so a
+  // disagreement with this formula is always recomputable from raw.
+  const choices = s.suggestionChoices ?? [];
+  const episodesOut = (s.distractionEpisodes ?? []).map((ep) => {
+    if (typeof ep.endedAt !== "number") return { ...ep };
+    // Not stored on the episode, but exact: resumptionMs was measured from it.
+    const returnedAt = ep.endedAt - (ep.resumptionMs ?? 0);
+    // Latest intervention interaction that falls INSIDE the resumption window.
+    // Two clamps matter: an interaction before returnedAt (they read the prompt
+    // while still on the other tab) cost no resumption time; and one after
+    // endedAt is real — the prompt is sticky, so it can be dismissed after
+    // typing already resumed — but must not produce a negative result.
+    const marks = [
+      ...events.filter((e) => e.type === "response").map((e) => e.at),
+      ...choices.map((c) => c.at),
+    ].filter((at) => typeof at === "number" && at >= returnedAt && at <= ep.endedAt);
+    const cut = marks.length > 0 ? Math.max(returnedAt, ...marks) : returnedAt;
+    return { ...ep, returnedAt, adjustedResumptionMs: ep.endedAt - cut };
+  });
+  // Baseline has no intervention events, so adjusted === raw there — which is
+  // what makes the two arms comparable on this measure.
+  const adjustedList = episodesOut
+    .map((e) => e.adjustedResumptionMs)
+    .filter((n) => typeof n === "number" && n >= 0);
+  const avgAdjustedResumptionMs = adjustedList.length > 0
+    ? Math.round(adjustedList.reduce((a, b) => a + b, 0) / adjustedList.length)
+    : 0;
+
+  const promptedBreaks = respCount("take_a_break");
+  const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
+  const tally = s.suggestionTally ?? {};
+  const sv = s.survey ?? null;
+
+  const json = {
+    participantId: s.participantId || "",
+    condition: s.condition || "",
+    task: { name: s.taskName || "", objective: s.objective || "" },
+    session: {
+      startedAt: s.startedAt ? new Date(s.startedAt).toISOString() : null,
+      endedAt: s.endedAt ? new Date(s.endedAt).toISOString() : null,
+      totalTimeSec: totalSec,
+      writingTimeSec: writingSec,
+      breakTimeSec: breakSec,
+      offlineTimeSec: offlineSec,
+      interrupted: offlineSec > 0,
+    },
+    words: {
+      docWords: s.wordCount ?? 0,        // words ADDED this session (API-anchored, incl. paste)
+      typedWords,                        // keystroke-typed only (excludes paste)
+      docTotalWords: s.totalDocWords ?? 0, // exact whole-document count (Docs API), incl. pre-loaded prompt
+    },
+    typing: {
+      avgWpmOverall,
+      avgWpmFocused,
+      avgWpmSession,
+      totalPauses: s.totalPauses ?? 0,
+      longestPauseSec: sec(s.longestPauseMs),
+      burstCount: s.burstCount ?? 0,
+      avgBurstSec: s.avgBurstDurationSec ?? 0,
+      scrollFrequency: s.scrollFrequency ?? 0,
+      tabSwitchCount: s.tabSwitchCount ?? 0,
+      tabAwaySec: sec(s.totalTabAwayMs), // cumulative time the Docs tab was hidden
+    },
+    // Raw revision signals behind the Reviewing phase classification: the rule
+    // is (scroll >=5 OR deletes >=5 OR selections >=2) AND WPM <10 over a 60s
+    // window, so these are the session-lifetime counts of the two keystroke
+    // signals it tests. Exported so the classification is auditable, not just
+    // asserted.
+    revision: {
+      totalDeletes: s.totalDeletes ?? 0,       // Backspace/Delete presses
+      totalSelections: s.totalSelections ?? 0, // debounced selection gestures
+    },
+    phasesMs: {
+      Planning: phases.Planning ?? 0,
+      Translating: phases.Translating ?? 0,
+      Reviewing: phases.Reviewing ?? 0,
+      Distracted: phases.Distracted ?? 0,
+    },
+    distractions: {
+      count: s.distractionCount ?? 0,              // occurrences (onset)
+      recovered: s.distractionsRecovered ?? 0,     // episodes that resumed (have a resumptionMs)
+      avgResumptionSec: sec(s.avgResumptionMs),    // averaged over recovered episodes only
+      // H1 with prompt-reading time removed (identical to raw in baseline).
+      avgAdjustedResumptionSec: sec(avgAdjustedResumptionMs),
+      // Each episode carries returnedAt + adjustedResumptionMs alongside the raw
+      // values, so the correction is auditable per episode, not just in aggregate.
+      episodes: episodesOut,
+    },
+    promptResponses: {
+      promptsShown: events.filter((e) => e.type === "prompt_shown").length,
+      getBackToWork: respCount("get_back_to_work"),
+      takeABreak: promptedBreaks,
+      dismiss: respCount("dismiss"),
+    },
+    breaks: {
+      voluntary: voluntaryBreaks,
+      prompted: promptedBreaks,
+      total: voluntaryBreaks + promptedBreaks,
+    },
+    recoverySuggestions: { tally, choices: s.suggestionChoices ?? [] },
+    interventionEvents: events,
+    // null when the participant hasn't completed the questionnaire yet — an
+    // explicit null, so a missing survey is distinguishable from a zero score.
+    survey: s.survey ?? null,
+    exportedAt: new Date().toISOString(),
+  };
+
+  const cols = [
+    ["participantId", json.participantId],
+    ["condition", json.condition],
+    ["taskName", json.task.name],
+    ["startedAt", json.session.startedAt],
+    ["endedAt", json.session.endedAt],
+    ["totalTimeSec", totalSec],
+    ["writingTimeSec", writingSec],
+    ["breakTimeSec", breakSec],
+    ["offlineTimeSec", offlineSec],
+    ["interrupted", json.session.interrupted ? 1 : 0],
+    ["docWords", json.words.docWords],
+    ["typedWords", typedWords],
+    ["docTotalWords", json.words.docTotalWords],
+    ["avgWpmOverall", avgWpmOverall],
+    ["avgWpmFocused", avgWpmFocused],
+    ["avgWpmSession", avgWpmSession],
+    ["totalPauses", json.typing.totalPauses],
+    ["longestPauseSec", json.typing.longestPauseSec],
+    ["totalDeletes", json.revision.totalDeletes],
+    ["totalSelections", json.revision.totalSelections],
+    ["planningSec", sec(phases.Planning)],
+    ["translatingSec", sec(phases.Translating)],
+    ["reviewingSec", sec(phases.Reviewing)],
+    ["distractedSec", sec(phases.Distracted)],
+    // tabSwitchCount rides along because tabAwaySec is hard to read without it
+    // (10 min away over 2 switches means something different than over 40).
+    ["tabSwitchCount", json.typing.tabSwitchCount],
+    ["tabAwaySec", json.typing.tabAwaySec],
+    ["distractionCount", json.distractions.count],
+    ["distractionsRecovered", json.distractions.recovered],
+    ["avgResumptionSec", json.distractions.avgResumptionSec],
+    ["avgAdjustedResumptionSec", json.distractions.avgAdjustedResumptionSec],
+    ["promptsShown", json.promptResponses.promptsShown],
+    ["respGetBackToWork", json.promptResponses.getBackToWork],
+    ["respTakeBreak", json.promptResponses.takeABreak], // prompt-driven breaks
+    ["respDismiss", json.promptResponses.dismiss],
+    ["voluntaryBreaks", voluntaryBreaks],
+    ["totalBreaks", voluntaryBreaks + promptedBreaks],
+    ["suggestStance0", tally[0] ?? 0],
+    ["suggestStance1", tally[1] ?? 0],
+    ["suggestStance2", tally[2] ?? 0],
+    // Questionnaires. Subscale scores AND every raw item — item-level data is
+    // what reliability analysis (Cronbach's alpha) needs, and it lets the
+    // scores be recomputed if a scoring decision changes. Blank cells when the
+    // survey wasn't completed (csvCell renders null/undefined as "").
+    ["surveyCompleted", sv ? 1 : 0],
+    ["tlxRaw", sv?.tlx.rawScore],
+    ...TLX_ITEMS.map((i) => [`tlx_${i.id}`, sv?.tlx.items[i.id]]),
+    ["fssOverall", sv?.fss.overall],
+    ["fssFluency", sv?.fss.fluency],
+    ["fssAbsorption", sv?.fss.absorption],
+    ...FSS_ITEMS.map((_, i) => [`fss${i + 1}`, sv?.fss.items[i + 1]]),
+    ["ueqsOverall", sv?.ueqs.overall],
+    ["ueqsPragmatic", sv?.ueqs.pragmatic],
+    ["ueqsHedonic", sv?.ueqs.hedonic],
+    ...UEQS_ITEMS.map((_, i) => [`ueqs${i + 1}`, sv?.ueqs.items[i + 1]]),
+  ];
+  const csv = cols.map(([k]) => csvCell(k)).join(",") + "\r\n" + cols.map(([, v]) => csvCell(v)).join(",") + "\r\n";
+
+  const datePart = (s.startedAt ? new Date(s.startedAt) : new Date()).toISOString().slice(0, 10);
+  const base = `${fileSlug(s.participantId, "session")}_${fileSlug(s.condition, "cond")}_${datePart}`;
+
+  return { json, csv, base };
+}
+
+function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
+  const selectable = typeof onSelect === "function";
   return (
     <>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
@@ -112,16 +485,31 @@ function RecoverySummaryContent({ summary }) {
           <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.6, fontStyle: "italic" }}>{summary.whereYouLeftOff}</p>
         </div>
       </div>
-      <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Suggested next steps</p>
+      <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: selectable ? 3 : 8 }}>Suggested next steps</p>
+      {selectable && (
+        <p style={{ margin: "0 0 8px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>
+          Pick the one you'll work on — it'll show while you write. You can change it anytime here.
+        </p>
+      )}
       <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        {summary.suggestions.map((s, i) => (
-          <div key={i} style={{ background: "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${TEAL[100]}`, display: "flex", gap: 8, alignItems: "flex-start" }}>
-            <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[50], border: `1px solid ${TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
-              <span style={{ fontSize: 9, fontWeight: 700, color: TEAL[600] }}>{i + 1}</span>
+        {summary.suggestions.map((s, i) => {
+          const selected = selectedIndex === i;
+          return (
+            <div
+              key={i}
+              onClick={selectable ? () => onSelect(i) : undefined}
+              role={selectable ? "button" : undefined}
+              tabIndex={selectable ? 0 : undefined}
+              onKeyDown={selectable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(i); } } : undefined}
+              style={{ background: selected ? TEAL[50] : "#fff", borderRadius: 9, padding: "9px 11px", border: `1px solid ${selected ? TEAL[400] : TEAL[100]}`, boxShadow: selected ? `0 0 0 1px ${TEAL[400]}` : "none", display: "flex", gap: 8, alignItems: "flex-start", cursor: selectable ? "pointer" : "default", transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s" }}
+            >
+              <div style={{ width: 18, height: 18, borderRadius: 999, background: selected ? TEAL[400] : TEAL[50], border: `1px solid ${selected ? TEAL[400] : TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                <span style={{ fontSize: 9, fontWeight: 700, color: selected ? "#fff" : TEAL[600] }}>{i + 1}</span>
+              </div>
+              <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
             </div>
-            <p style={{ margin: 0, fontSize: 11, color: "#444", lineHeight: 1.5 }}>{s}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </>
   );
@@ -130,26 +518,40 @@ function RecoverySummaryContent({ summary }) {
 // ─── Screen 1: Task Initialization ───────────────────────────────────────────
 
 function TaskInitScreen({ onStart }) {
+  const [participantId, setParticipantId] = useState(""); // stamped on the data export
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
-  const [nameError, setNameError] = useState(false); // shown on a Start attempt with an empty name
+  // All three fields are required — shown on a Start attempt with any empty.
+  const [participantIdError, setParticipantIdError] = useState(false);
+  const [nameError, setNameError] = useState(false);
+  const [objectiveError, setObjectiveError] = useState(false);
   const [isActive, setIsActive] = useState(false);
   const [isInterrupted, setIsInterrupted] = useState(false);
   // "baseline" = no recovery prompts (control condition); "intervention" =
   // recovery prompts enabled. This is the study's independent variable.
   const [condition, setCondition] = useState("intervention");
+  // Last finished session, kept so a download missed on the analytics screen
+  // can still be recovered here. Null once a newer session overwrites it.
+  const [lastSummary, setLastSummary] = useState(null);
 
+  // Self-contained senior high school writing prompts — opinion/reflection
+  // based, so participants can write from their own knowledge without needing
+  // to leave the doc to research (tab-switching would register as distraction).
   const templates = [
-    { name: "Research Essay", obj: "Write a 500-word essay on the impact of AI in education." },
-    { name: "Lab Report", obj: "Summarize findings from Experiment 3 with discussion." },
-    { name: "Reflection Paper", obj: "Reflect on this week's readings on cognitive load theory." },
+    { name: "Position Paper", obj: "Argue for or against allowing students to use AI tools for schoolwork. Take a clear stance and support it with at least three reasons." },
+    { name: "Reflective Essay", obj: "Reflect on a challenge you faced this school year and what it taught you about yourself as a student." },
+    { name: "Argumentative Essay", obj: "Should senior high school students be required to wear uniforms? Defend your position with clear arguments." },
   ];
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary"], (result) => {
+        // Read before the early return below — a recoverable previous session
+        // matters just as much when a session is already active.
+        setLastSummary(result.ff_lastSummary ?? null);
         const t = result.ff_task;
         if (t) {
+          setParticipantId(t.participantId ?? "");
           setTaskName(t.taskName ?? "");
           setObjective(t.objective ?? "");
           setCondition(t.condition ?? "intervention");
@@ -162,6 +564,7 @@ function TaskInitScreen({ onStart }) {
         // resurface in unrelated future sessions.
         const d = result.ff_draft;
         if (d) {
+          setParticipantId(d.participantId ?? "");
           setTaskName(d.taskName ?? "");
           setObjective(d.objective ?? "");
           setCondition(d.condition ?? "intervention");
@@ -180,8 +583,14 @@ function TaskInitScreen({ onStart }) {
   const showObjectiveNudge = !isActive && objectiveWordCount > 0 && objectiveWordCount < 3;
 
   function handleStartTask() {
-    if (!taskName.trim()) {
-      setNameError(true);
+    // All three fields are required before a session can start.
+    const missingPid = !participantId.trim();
+    const missingName = !taskName.trim();
+    const missingObjective = !objective.trim();
+    if (missingPid || missingName || missingObjective) {
+      setParticipantIdError(missingPid);
+      setNameError(missingName);
+      setObjectiveError(missingObjective);
       return;
     }
 
@@ -190,6 +599,7 @@ function TaskInitScreen({ onStart }) {
         const tabId = tabs[0]?.id ?? null;
 
         const taskMetadata = {
+          participantId: participantId.trim(),
           taskName,
           objective,
           condition,
@@ -203,6 +613,8 @@ function TaskInitScreen({ onStart }) {
         chrome.storage.local.remove("ff_interrupted");
         chrome.storage.local.remove("ff_recovery"); // stale summary must not leak into a new session
         chrome.storage.local.remove("ff_generating");
+        chrome.storage.local.remove("ff_suggestion_choices"); // and neither must last session's choices
+        chrome.storage.local.remove("ff_events"); // nor last session's intervention events
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -219,6 +631,20 @@ function TaskInitScreen({ onStart }) {
     }
   }
 
+  // Re-download a previous session's export. Same builder as the analytics
+  // screen, so the two can never produce different files.
+  function handleDownloadLast() {
+    if (!lastSummary) return;
+    const { json, csv, base } = buildSessionExport(lastSummary);
+    downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
+    setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    const updated = { ...lastSummary, downloadedAt: Date.now() };
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.set({ ff_lastSummary: updated });
+    }
+    setLastSummary(updated);
+  }
+
   function handleCancelTask() {
     if (typeof chrome !== "undefined" && chrome.storage) {
       // Send before clearing ff_task — sendToTaskTab needs its tabId.
@@ -230,11 +656,16 @@ function TaskInitScreen({ onStart }) {
       chrome.storage.local.remove("ff_interrupted");
       chrome.storage.local.remove("ff_recovery");
       chrome.storage.local.remove("ff_generating");
+      chrome.storage.local.remove("ff_suggestion_choices");
+      chrome.storage.local.remove("ff_events");
     }
 
+    setParticipantId("");
     setTaskName("");
     setObjective("");
+    setParticipantIdError(false);
     setNameError(false);
+    setObjectiveError(false);
     setIsActive(false);
   }
 
@@ -242,6 +673,31 @@ function TaskInitScreen({ onStart }) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <SidePanelHeader title="FrictionFlow" subtitle={isActive ? "Session in progress" : "Set up your writing session"} />
       <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 0" }}>
+        {/* Shown ONLY while a previous session's export is still outstanding —
+            it exists to catch data that would otherwise be lost. Once
+            downloaded it disappears entirely: a "download again" offer here is
+            noise on a screen whose job is starting the next session (re-download
+            still lives on the analytics screen, where it's the actual context). */}
+        {lastSummary && !lastSummary.downloadedAt && (
+          <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 11px", marginBottom: 14 }}>
+            <p style={{ margin: "0 0 7px", fontSize: 11, color: "#8A5A1B", lineHeight: 1.5 }}>
+              {`Previous session was not downloaded (${lastSummary.participantId || "no ID"} · ${lastSummary.condition === "baseline" ? "Baseline" : "Intervention"})`}
+            </p>
+            <Btn variant="outline" style={{ width: "100%" }} onClick={handleDownloadLast}>Download session data</Btn>
+          </div>
+        )}
+        <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Participant ID</p>
+        <input
+          value={participantId}
+          onChange={e => { if (!isActive) { setParticipantId(e.target.value); if (participantIdError) setParticipantIdError(false); } }}
+          placeholder="e.g. P01"
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${participantIdError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", marginBottom: participantIdError ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", cursor: isActive ? "default" : "text" }}
+        />
+        {participantIdError && (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter a participant ID.
+          </p>
+        )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
           value={taskName}
@@ -257,12 +713,16 @@ function TaskInitScreen({ onStart }) {
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Objective</p>
         <textarea
           value={objective}
-          onChange={e => !isActive && setObjective(e.target.value)}
+          onChange={e => { if (!isActive) { setObjective(e.target.value); if (objectiveError) setObjectiveError(false); } }}
           placeholder="Briefly describe what you aim to accomplish in this session…"
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: showObjectiveNudge ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
+          style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${objectiveError ? "#E5484D" : "rgba(0,0,0,0.12)"}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#030213", outline: "none", resize: "none", marginBottom: (objectiveError || showObjectiveNudge) ? 4 : 12, background: isActive ? TEAL[50] : "#FAFAFA", fontFamily: "inherit", cursor: isActive ? "default" : "text" }}
         />
-        {showObjectiveNudge && (
+        {objectiveError ? (
+          <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please enter an objective — it anchors the recovery prompts.
+          </p>
+        ) : showObjectiveNudge && (
           <p style={{ margin: "0 0 12px", fontSize: 11, color: "#B45309", lineHeight: 1.5 }}>
             A more specific objective helps FrictionFlow give better recovery tips — but you can start anyway.
           </p>
@@ -414,7 +874,7 @@ function ContextPrepScreen({ setScreen }) {
         const t = result.ff_task;
         if (t) {
           chrome.storage.local.set({
-            ff_draft: { taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
+            ff_draft: { participantId: t.participantId ?? "", taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
           });
         }
         chrome.storage.local.remove("ff_task");
@@ -474,11 +934,18 @@ function ContextPrepScreen({ setScreen }) {
 
 // ─── Screen 2: Active Monitoring ─────────────────────────────────────────────
 
-// showDistractionPrompt/setShowDistractionPrompt/promptDismissedRef are lifted
-// up to App and passed in as props — they must survive this component
-// unmounting when navigating to Recovery/Break and remounting on return,
-// otherwise a still-"Distracted" phase immediately re-triggers the modal.
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
+// After the user dismisses the Gentle Reminder, suppress re-showing it for this
+// long. Dismissing silences the CURRENT instance but must not disable detection:
+// if the writer is still distracted once the cooldown passes, the reminder
+// returns. A genuinely new distraction episode bypasses the cooldown entirely.
+const PROMPT_COOLDOWN_MS = 60000;
+
+// showDistractionPrompt/setShowDistractionPrompt and the two prompt refs
+// (promptSuppressUntilRef, lastDistractionOnsetRef) are lifted up to App and
+// passed in as props — they must survive this component unmounting when
+// navigating to Recovery/Break and remounting on return, otherwise the
+// dismiss cooldown and last-seen episode would reset and re-trigger the modal.
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -493,6 +960,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [currentPhase, setCurrentPhase] = useState("Planning");
   const [condition, setCondition] = useState("intervention");
   const [distractionCount, setDistractionCount] = useState(0);
+  const [participantId, setParticipantId] = useState(""); // carried into the export
+  // Docs API connection status, mirrored from ff_session.docsConnected. When
+  // false, the word count is keystroke-approximated (pasted text uncounted)
+  // and the panel offers a manual reconnect.
+  const [docsConnected, setDocsConnected] = useState(false);
+  const [docsConnecting, setDocsConnecting] = useState(false);
+  // The next-step the participant chose for the CURRENT recovery episode, shown
+  // between the phase and the active context. Null once a new episode generates
+  // (its generatedAt no longer matches any choice) until they pick again.
+  const [activeStep, setActiveStep] = useState(null);
 
   // Read sessionStartTime once from ff_task on mount so the timer can run locally.
   // This survives popup close/reopen since ff_task is in storage and never changes
@@ -521,15 +998,25 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.get(["ff_session", "ff_task"], (result) => {
+        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices"], (result) => {
           const s = result.ff_session;
           const t = result.ff_task;
 
           if (t) {
+            setParticipantId(t.participantId ?? "");
             setTaskName(t.taskName ?? "");
             setObjective(t.objective ?? "");
             setCondition(t.condition ?? "intervention");
           }
+
+          // Show the chosen step only for the current episode: match the choice
+          // record to the live ff_recovery.generatedAt. A newer generation has
+          // no matching record yet, so this clears until they re-pick.
+          const gen = result.ff_recovery?.generatedAt;
+          const rec = gen && Array.isArray(result.ff_suggestion_choices)
+            ? result.ff_suggestion_choices.find((c) => c.generatedAt === gen)
+            : null;
+          setActiveStep(rec ? rec.chosenText : null);
 
           if (!s) return;
           setWpm(s.wpm ?? 0);
@@ -539,22 +1026,45 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
-          setDistractionCount(s.distractionCount ?? 0);
+          // Show OCCURRENCES (onset), not closed episodes — so the tile ticks
+          // the moment a distraction begins (matching the reminder), instead of
+          // lagging until the resuming keystroke closes the episode.
+          setDistractionCount(s.distractionOnsetCount ?? 0);
           setTotalDocWords(s.totalDocWords ?? 0);
+          if (s.docsConnected) { setDocsConnected(true); setDocsConnecting(false); }
+          else setDocsConnected(false);
 
-          // Auto-trigger the distraction prompt when the phase reads
-          // "Distracted", once per episode. The prompt is STICKY by owner
-          // decision: it never dismisses itself — not on returning to the
-          // doc, not on typing — only the user's button click closes it
-          // (see the three handlers). Leaving Distracted merely re-arms the
-          // trigger for the next episode. Behavioral logging runs
-          // identically in both conditions — only baseline suppresses the
-          // prompt itself, since that's the study's independent variable.
+          // Auto-trigger the distraction prompt. Two independent triggers, so a
+          // dismiss silences the current instance without disabling detection:
+          //   1. A NEW distraction episode began (distractionOnsetCount rose) —
+          //      fires immediately, bypassing the cooldown. This also covers
+          //      tab-away, whose phase flips back to non-Distracted on return
+          //      before this poll ever sees "Distracted"; the onset still fires.
+          //   2. The writer is STILL "Distracted" and the post-dismiss cooldown
+          //      has elapsed — re-nudges a continuing distraction (e.g. repeated
+          //      tab-switching that never lets the phase leave "Distracted").
+          // The prompt is STICKY by owner decision: it never dismisses itself —
+          // only the user's button click closes it (see the three handlers).
+          // Behavioral logging runs identically in both conditions — only
+          // baseline suppresses the prompt, since that's the independent variable.
           const isBaseline = (t?.condition ?? "intervention") === "baseline";
-          if (s.currentPhase === "Distracted") {
-            if (!isBaseline && !promptDismissedRef.current) setShowDistractionPrompt(true);
-          } else {
-            promptDismissedRef.current = false;
+          if (!isBaseline) {
+            const onset = s.distractionOnsetCount ?? 0;
+            const isDistracted = s.currentPhase === "Distracted";
+            // Establish the baseline on first read so reopening the panel
+            // mid-episode doesn't retro-fire for an already-known distraction.
+            let newEpisode = false;
+            if (lastDistractionOnsetRef.current === null) {
+              lastDistractionOnsetRef.current = onset;
+            } else if (onset > lastDistractionOnsetRef.current) {
+              lastDistractionOnsetRef.current = onset;
+              newEpisode = true;
+            }
+            const cooldownElapsed = Date.now() >= promptSuppressUntilRef.current;
+            if (newEpisode || (isDistracted && cooldownElapsed)) {
+              promptSuppressUntilRef.current = 0; // clear any spent cooldown
+              setShowDistractionPrompt(true);
+            }
           }
         });
       }
@@ -562,7 +1072,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     readStorage();
     const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
-  }, [promptDismissedRef, setShowDistractionPrompt]);
+  }, [promptSuppressUntilRef, lastDistractionOnsetRef, setShowDistractionPrompt]);
 
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
@@ -578,26 +1088,58 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
 
-  // All three responses acknowledge the current distraction episode — none
-  // of them should cause the modal to reappear until the phase leaves
-  // "Distracted" and a new episode begins later.
+  // Log each time the Gentle Reminder actually appears. This effect only re-runs
+  // when showDistractionPrompt flips, and the poll's setShowDistractionPrompt(true)
+  // is a no-op when already true — so this fires once per appearance, not every
+  // 2s poll while the modal is open.
+  useEffect(() => {
+    if (showDistractionPrompt) logInterventionEvent("prompt_shown");
+  }, [showDistractionPrompt]);
+
+  // All three responses acknowledge the current distraction episode: start the
+  // dismiss cooldown so the modal doesn't immediately reappear, while still
+  // allowing a re-nudge if the writer stays distracted past the cooldown, or a
+  // genuinely new episode begins (both handled in the poll above). Each logs the
+  // chosen response for the intervention-event export.
   function handleGetBackToWork() {
-    promptDismissedRef.current = true;
+    logInterventionEvent("response", { response: "get_back_to_work" });
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     setHasRecoverySummary(true);
     setScreen("recovery");
   }
 
   function handleTakeBreakFromPrompt() {
-    promptDismissedRef.current = true;
+    logInterventionEvent("response", { response: "take_a_break" });
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
     breakOriginRef.current = "prompt";
     setScreen("break");
   }
 
   function handleDismissPrompt() {
-    promptDismissedRef.current = true;
+    logInterventionEvent("response", { response: "dismiss" });
+    promptSuppressUntilRef.current = Date.now() + PROMPT_COOLDOWN_MS;
     setShowDistractionPrompt(false);
+  }
+
+  // Manually (re)trigger the Google Docs consent. The session-start attempt is
+  // easy to miss (the popup is a separate window, or a stale grant fails
+  // non-interactively); this forces an interactive auth on demand. On success
+  // the next word-count sync flips docsConnected true and the banner clears.
+  function handleConnectDocs() {
+    if (typeof chrome === "undefined" || !chrome.runtime) return;
+    setDocsConnecting(true);
+    try {
+      chrome.runtime.sendMessage({ type: "FF_ENSURE_DOCS_AUTH" }, () => {
+        void chrome.runtime.lastError; // ignore; the poll reflects the real result
+        // Leave "connecting" until a sync confirms; time-box it so a
+        // dismissed popup doesn't spin forever.
+        setTimeout(() => setDocsConnecting(false), 8000);
+      });
+    } catch (e) {
+      setDocsConnecting(false);
+    }
   }
 
   function handleFinishSession() {
@@ -606,22 +1148,60 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       : elapsed;
 
     // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
-    function buildAndNavigate(sessionSnapshot = {}) {
+    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = []) {
+      // Finalize the suggestion tally. chosenIndex is the stance
+      // (0 = goal-anchored, 1 = doc-driven, 2 = bridge); every remaining record
+      // is a frozen per-episode choice, so summing by index gives the export
+      // counts. suggestionChoices keeps the full record (incl. the not-chosen
+      // options) for the study's data export.
+      const suggestionTally = suggestionChoices.reduce((acc, c) => {
+        if (typeof c.chosenIndex === "number") acc[c.chosenIndex] = (acc[c.chosenIndex] ?? 0) + 1;
+        return acc;
+      }, {});
       const finishedSummary = {
+        participantId,
         taskName,
+        objective,
         condition,
+        startedAt: sessionStartTime,
+        endedAt: Date.now(),
         elapsedSeconds: finalElapsedSeconds,
         totalBreakMs: sessionSnapshot.totalBreakMs ?? 0,
-        wordCount: words,
-        wpm,
-        totalPauses,
-        longestPauseMs: longestPause,
-        scrollFrequency,
-        scrollFrequencyLabel,
+        totalInterruptedMs: sessionSnapshot.totalInterruptedMs ?? 0,
+        // All behavioral fields read from the FRESH ff_session snapshot, not the
+        // panel's React state (which lags up to one 2s poll). Mixing the two
+        // made word count / WPM / pauses on the summary stale — and inconsistent
+        // with the snapshot-sourced fields beside them. State is only a
+        // dev-preview fallback (snapshot is {} when chrome.storage is absent).
+        wordCount: sessionSnapshot.wordCount ?? words, // session-added doc words (API-anchored, incl. paste)
+        totalDocWords: sessionSnapshot.totalDocWords ?? 0, // exact whole-doc count from the last Docs API sync
+        typedWordCount: sessionSnapshot.typedWordCount ?? 0, // keystroke-typed only (excludes paste)
+        wpm: sessionSnapshot.wpm ?? wpm,
+        totalPauses: sessionSnapshot.totalPauses ?? totalPauses,
+        longestPauseMs: sessionSnapshot.longestPauseMs ?? longestPause,
+        burstCount: sessionSnapshot.burstCount ?? 0,
+        avgBurstDurationSec: sessionSnapshot.avgBurstDurationSec ?? 0,
+        tabSwitchCount: sessionSnapshot.tabSwitchCount ?? 0,
+        totalTabAwayMs: sessionSnapshot.totalTabAwayMs ?? 0,
+        // Session-lifetime revision counts (NOT the rolling 60s values, which
+        // at finish would only describe the last minute). These are the raw
+        // signals behind the Reviewing classification.
+        totalDeletes: sessionSnapshot.totalDeletes ?? 0,
+        totalSelections: sessionSnapshot.totalSelections ?? 0,
+        scrollFrequency: sessionSnapshot.scrollFrequency ?? scrollFrequency,
+        scrollFrequencyLabel: sessionSnapshot.scrollFrequencyLabel ?? scrollFrequencyLabel,
         phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
-        distractionCount: sessionSnapshot.distractionCount ?? 0,
+        // distractionCount = occurrences (onset): matches the live tile and the
+        // reminders, and includes any distraction still open at finish.
+        // distractionsRecovered = episodes that closed on a resuming keystroke
+        // (the ones with a resumptionMs); avgResumptionMs is averaged over those.
+        distractionCount: sessionSnapshot.distractionOnsetCount ?? 0,
+        distractionsRecovered: sessionSnapshot.distractionCount ?? 0,
         distractionEpisodes: sessionSnapshot.distractionEpisodes ?? [],
         avgResumptionMs: sessionSnapshot.avgResumptionMs ?? 0,
+        suggestionChoices,
+        suggestionTally,
+        interventionEvents,
       };
       setSummary(finishedSummary);
 
@@ -629,22 +1209,33 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         // Send before clearing ff_task — sendToTaskTab needs its tabId.
         sendToTaskTab({ type: "FF_CANCEL_TASK" });
 
+        // SAFETY NET (study-critical): everything below is about to be cleared,
+        // and finishedSummary otherwise lives only in React state — so closing
+        // the panel on the analytics screen before downloading would lose the
+        // participant's whole session with no way back. This copy survives until
+        // the NEXT session finishes and overwrites it, so a missed download is
+        // recoverable from the task-setup screen. Deliberately NOT cleared by
+        // handleStartTask or handleCancelTask.
+        chrome.storage.local.set({ ff_lastSummary: finishedSummary });
+
         chrome.storage.local.remove("ff_task");
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_recovery");
         chrome.storage.local.remove("ff_generating");
+        chrome.storage.local.remove("ff_suggestion_choices");
+        chrome.storage.local.remove("ff_events");
       }
 
       setScreen("analytics");
     }
 
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get("ff_session", (result) => {
-        buildAndNavigate(result.ff_session ?? {});
+      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events"], (result) => {
+        buildAndNavigate(result.ff_session ?? {}, result.ff_suggestion_choices ?? [], result.ff_events ?? []);
       });
     } else {
-      buildAndNavigate({});
+      buildAndNavigate({}, [], []);
     }
   }
 
@@ -671,6 +1262,22 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             </div>
           ))}
         </div>
+        {/* Docs connection banner — only once past a short grace (so it
+            doesn't flash before the first word-count sync lands) and only
+            while genuinely not connected. */}
+        {elapsed >= 5 && !docsConnected && (
+          <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 12px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <p style={{ margin: "0 0 2px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Google Docs not connected</p>
+              <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+                Word count is approximate and won't include pasted text. Connect to enable the exact count.
+              </p>
+            </div>
+            <Btn variant="outline" style={{ fontSize: 12, padding: "7px 12px", flexShrink: 0 }} onClick={handleConnectDocs}>
+              {docsConnecting ? "Connecting…" : "Connect"}
+            </Btn>
+          </div>
+        )}
         {/* Writing phase */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Detected writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
@@ -683,6 +1290,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             <div style={{ flex: 1, background: activePhase.color, transition: "background 0.5s" }} />
           </div>
         </div>
+        {/* Chosen next step (current recovery episode) */}
+        {activeStep && (
+          <>
+            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Your next step</p>
+            <div style={{ background: "#fff", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[200]}`, display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[400], display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5l2.2 2.2L9.5 3.8" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </div>
+              <p style={{ margin: 0, fontSize: 12, color: "#444", lineHeight: 1.5 }}>{activeStep}</p>
+            </div>
+          </>
+        )}
         {/* Task context */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active context</p>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
@@ -693,7 +1312,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 8 }}>
-          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; setScreen("break"); }}>Take a break</Btn>
+          <Btn variant="ghost" style={{ flex: 1, fontSize: 12 }} onClick={() => { breakOriginRef.current = "voluntary"; logInterventionEvent("voluntary_break"); setScreen("break"); }}>Take a break</Btn>
           <Btn variant="primary" style={{ flex: 1 }} onClick={handleFinishSession}>Finish session</Btn>
         </div>
         {hasRecoverySummary && (
@@ -738,10 +1357,20 @@ function RecoveryScreen({ setScreen }) {
   const [summary, setSummary] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Whether a Gemini API key is configured. When absent, no summary can ever
+  // generate, so the empty state says so (a config fix) instead of implying
+  // one is coming. Defaults true so the "no key" notice doesn't flash before
+  // ff_settings is read.
+  const [hasApiKey, setHasApiKey] = useState(true);
+  // Which of the 3 suggestions this episode's choice currently sits on (null =
+  // no pick yet). Reloaded from the choice log so revisiting via "View last
+  // recovery summary" shows — and lets the participant change — their pick.
+  const [selectedIndex, setSelectedIndex] = useState(null);
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_recovery", "ff_generating", "ff_suggestion_choices", "ff_settings"], (result) => {
+        setHasApiKey(!!result.ff_settings?.geminiApiKey);
         const t = result.ff_task;
         const r = result.ff_recovery;
         if (t) {
@@ -753,7 +1382,12 @@ function RecoveryScreen({ setScreen }) {
             whatYouWereDoing: r.whatYouWereDoing,
             whereYouLeftOff: r.whereYouLeftOff,
             suggestions: r.suggestedNextSteps ?? [],
+            generatedAt: r.generatedAt,
           });
+          const prior = Array.isArray(result.ff_suggestion_choices)
+            ? result.ff_suggestion_choices.find((c) => c.generatedAt === r.generatedAt)
+            : null;
+          setSelectedIndex(prior ? prior.chosenIndex : null);
         }
         setGenerating(typeof result.ff_generating === "number" && Date.now() - result.ff_generating < GENERATING_STALE_MS);
         setLoading(false);
@@ -762,6 +1396,12 @@ function RecoveryScreen({ setScreen }) {
       setLoading(false);
     }
   }, []);
+
+  function handleSelectSuggestion(i) {
+    if (!summary) return;
+    setSelectedIndex(i);
+    recordSuggestionChoice({ generatedAt: summary.generatedAt, chosenIndex: i, options: summary.suggestions });
+  }
 
   // Generation is often still in flight when the user arrives here (it
   // starts when the Distracted episode starts) — show a generating state
@@ -776,7 +1416,11 @@ function RecoveryScreen({ setScreen }) {
           whatYouWereDoing: r.whatYouWereDoing,
           whereYouLeftOff: r.whereYouLeftOff,
           suggestions: r.suggestedNextSteps ?? [],
+          generatedAt: r.generatedAt,
         });
+        // A freshly generated episode has no pick yet; the previous episode's
+        // record is left frozen in the log for the tally.
+        setSelectedIndex(null);
       }
       if ("ff_generating" in changes) {
         const v = changes.ff_generating.newValue;
@@ -810,10 +1454,22 @@ function RecoveryScreen({ setScreen }) {
             <p style={{ margin: "6px 0 0", fontSize: 11, color: "#717182" }}>Reading your recent activity and progress</p>
           </div>
         ) : summary ? (
-          <RecoverySummaryContent summary={summary} />
+          <RecoverySummaryContent summary={summary} selectedIndex={selectedIndex} onSelect={handleSelectSuggestion} />
+        ) : !hasApiKey ? (
+          // No API key → summaries can never generate. Say so (a setup fix),
+          // rather than implying one is on the way.
+          <div style={{ textAlign: "center", padding: "36px 16px" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "#FFF8F0", border: "1px solid #FDDCB5", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+              <svg width="20" height="20" fill="none" viewBox="0 0 20 20"><path d="M10 6v5M10 14h.01" stroke="#F4A261" strokeWidth="2" strokeLinecap="round" /></svg>
+            </div>
+            <p style={{ margin: "0 0 4px", fontSize: 12, fontWeight: 600, color: "#030213" }}>AI recovery summaries are off</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6, maxWidth: 250, marginLeft: "auto", marginRight: "auto" }}>
+              No Gemini API key is configured. A researcher can add one on the extension's Options page to enable recovery summaries. You can head back and keep writing.
+            </p>
+          </div>
         ) : (
           // Honest empty state — no filler content pretending to be a real
-          // summary (no key configured, generation failed, or none yet).
+          // summary (generation failed, or no episode yet).
           <div style={{ textAlign: "center", padding: "36px 16px" }}>
             <div style={{ width: 40, height: 40, borderRadius: 12, background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
               <svg width="18" height="18" fill="none" viewBox="0 0 18 18"><path d="M3 9h12M9 3v12" stroke={TEAL[200]} strokeWidth="1.6" strokeLinecap="round" opacity="0.6" transform="rotate(45 9 9)"/></svg>
@@ -965,6 +1621,133 @@ function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
   );
 }
 
+// ─── Screen 7: Post-session questionnaires ───────────────────────────────────
+
+// One row of discrete choices. Used for FSS (1-7, numbered) and UEQ-S (-3..+3,
+// unlabelled circles, the semantic-differential convention).
+function ScaleRow({ points, value, onChange, showNumbers }) {
+  return (
+    <div style={{ display: "flex", gap: 4, justifyContent: "space-between", marginTop: 5 }}>
+      {points.map((p) => {
+        const on = value === p;
+        return (
+          <button
+            key={p}
+            type="button"
+            onClick={() => onChange(p)}
+            style={{ flex: 1, minWidth: 0, height: 26, borderRadius: 999, cursor: "pointer", fontSize: 10, fontWeight: 700, background: on ? TEAL[400] : "#fff", color: on ? "#fff" : "#717182", border: `1px solid ${on ? TEAL[400] : TEAL[100]}` }}
+          >
+            {showNumbers ? p : ""}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SurveyScreen({ initial, onDone, onBack }) {
+  const [step, setStep] = useState(0); // 0 = NASA-TLX, 1 = FSS, 2 = UEQ-S
+  // Prefilled from a previously completed survey so "review" actually reviews.
+  // Starting blank here meant re-submitting silently REPLACED good answers with
+  // whatever was re-entered — worse than not offering review at all.
+  const [tlx, setTlx] = useState(() => ({ ...(initial?.tlx?.items ?? {}) }));
+  const [fss, setFss] = useState(() => ({ ...(initial?.fss?.items ?? {}) }));
+  const [ueqs, setUeqs] = useState(() => ({ ...(initial?.ueqs?.items ?? {}) }));
+  const [error, setError] = useState(false);
+
+  // Every item must be answered before advancing. TLX sliders start UNSET
+  // rather than at 50 — a pre-filled midpoint would let a participant skip an
+  // item without noticing, and it would be indistinguishable from a real 50.
+  const complete = [
+    TLX_ITEMS.every((i) => typeof tlx[i.id] === "number"),
+    FSS_ITEMS.every((_, i) => typeof fss[i + 1] === "number"),
+    UEQS_ITEMS.every((_, i) => typeof ueqs[i + 1] === "number"),
+  ];
+
+  const titles = ["Workload (NASA-TLX)", "Flow (FSS)", "Experience (UEQ-S)"];
+  const intros = [
+    "Rate your experience of the writing session you just finished.",
+    "How well do these statements describe how you felt while writing?",
+    "Rate the FrictionFlow extension itself on each pair.",
+  ];
+
+  function handleNext() {
+    if (!complete[step]) { setError(true); return; }
+    setError(false);
+    if (step < 2) { setStep(step + 1); return; }
+    onDone(scoreSurvey({ tlx, fss, ueqs }));
+  }
+
+  function handleBack() {
+    setError(false);
+    if (step === 0) { onBack(); return; }
+    setStep(step - 1);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <SidePanelHeader title={initial ? "Review answers" : "Questionnaire"} subtitle={`Step ${step + 1} of 3 · ${titles[step]}`} />
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+        <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.6 }}>{intros[step]}</p>
+
+        {step === 0 && TLX_ITEMS.map((item) => (
+          <div key={item.id} style={{ marginBottom: 15 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+              <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: "#030213" }}>{item.label}</p>
+              <span style={{ fontSize: 11, fontWeight: 700, color: typeof tlx[item.id] === "number" ? TEAL[600] : "#B4B4BB" }}>
+                {typeof tlx[item.id] === "number" ? tlx[item.id] : "—"}
+              </span>
+            </div>
+            <p style={{ margin: "2px 0 6px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>{item.question}</p>
+            <input
+              type="range" min={0} max={100} step={5}
+              value={typeof tlx[item.id] === "number" ? tlx[item.id] : 50}
+              onChange={(e) => setTlx({ ...tlx, [item.id]: Number(e.target.value) })}
+              style={{ width: "100%", accentColor: TEAL[400], opacity: typeof tlx[item.id] === "number" ? 1 : 0.45 }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#717182" }}>
+              <span>{item.low}</span><span>{item.high}</span>
+            </div>
+          </div>
+        ))}
+
+        {step === 1 && (
+          <>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#717182", marginBottom: 8 }}>
+              <span>1 · Not at all</span><span>Very much · 7</span>
+            </div>
+            {FSS_ITEMS.map((text, i) => (
+              <div key={i} style={{ marginBottom: 13 }}>
+                <p style={{ margin: 0, fontSize: 11, color: "#030213", lineHeight: 1.5 }}>{i + 1}. {text}</p>
+                <ScaleRow points={[1, 2, 3, 4, 5, 6, 7]} value={fss[i + 1]} onChange={(v) => setFss({ ...fss, [i + 1]: v })} showNumbers />
+              </div>
+            ))}
+          </>
+        )}
+
+        {step === 2 && UEQS_ITEMS.map((pair, i) => (
+          <div key={i} style={{ marginBottom: 13 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#030213" }}>
+              <span>{pair.left}</span><span>{pair.right}</span>
+            </div>
+            <ScaleRow points={[-3, -2, -1, 0, 1, 2, 3]} value={ueqs[i + 1]} onChange={(v) => setUeqs({ ...ueqs, [i + 1]: v })} />
+          </div>
+        ))}
+
+        {error && (
+          <p style={{ margin: "4px 0 0", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
+            Please answer every item before continuing.
+          </p>
+        )}
+      </div>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", gap: 8 }}>
+        <Btn variant="outline" style={{ flex: 1 }} onClick={handleBack}>{step === 0 ? "Cancel" : "Back"}</Btn>
+        <Btn variant="primary" style={{ flex: 1 }} onClick={handleNext}>{step === 2 ? "Finish" : "Next"}</Btn>
+      </div>
+    </div>
+  );
+}
+
 // ─── Screen 6: Session Analytics ─────────────────────────────────────────────
 
 function AnalyticsScreen({ setScreen, summary }) {
@@ -972,7 +1755,17 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const totalSecs = s.elapsedSeconds ?? 0;
   const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
-  const writingSecs = Math.max(0, totalSecs - breakSecs);
+  // Time the Docs tab was closed/away (fully offline, untracked).
+  const interruptedSecs = Math.floor((s.totalInterruptedMs ?? 0) / 1000);
+  // Writing time = Translating + Reviewing — the phases where the participant is
+  // actually working on the text (producing it, or re-reading/revising it), per
+  // Flower & Hayes (1981). Planning and Distracted are deliberately excluded:
+  // the old "total − breaks − offline" counted both, so on a session with no
+  // breaks it came out identical to Total time. Neither is lost — both still
+  // appear as their own slice in the phase breakdown below.
+  const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
+  const reviewingSecs = Math.round((s.phaseDurationsMs?.Reviewing ?? 0) / 1000);
+  const writingSecs = translatingSecs + reviewingSecs;
 
   function fmt(seconds) {
     const m = Math.floor(seconds / 60);
@@ -982,20 +1775,146 @@ function AnalyticsScreen({ setScreen, summary }) {
 
   const avgResumptionSecs = Math.round((s.avgResumptionMs ?? 0) / 1000);
 
-  // True session average — words over active writing time. (s.wpm is only
-  // the last rolling-window value at the moment the session was finished.)
-  const avgWpm = writingSecs > 0 ? Math.round((s.wordCount ?? 0) / (writingSecs / 60)) : 0;
+  // Whole-document word count from the Docs API — matches the monitoring
+  // "Words" tile. Falls back to the session-added keystroke count if the API
+  // wasn't connected (totalDocWords stays 0 without OAuth).
+  const docWords = (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : (s.wordCount ?? 0);
+  const typedWords = s.typedWordCount ?? 0; // keystroke-typed words (excludes paste)
+
+  // The tile shows the FOCUSED rate: typed words (paste can't inflate them) over
+  // active drafting only (Translating), where new text is actually produced, so
+  // it reflects genuine typing pace. The OVERALL rate (over Translating +
+  // Reviewing) is shown in the tile's hover breakdown; both are exported.
+  const avgWpmFocused = translatingSecs > 0 ? Math.round(typedWords / (translatingSecs / 60)) : 0;
+  const avgWpmOverall = writingSecs > 0 ? Math.round(typedWords / (writingSecs / 60)) : 0;
+  // Whole-session rate: same typed words over total wall-clock time, so breaks,
+  // planning and distracted time all count against it. The lowest of the three.
+  const avgWpmSession = totalSecs > 0 ? Math.round(typedWords / (totalSecs / 60)) : 0;
+
+  // ── Values used only by the hover breakdowns ──
+  // The tiles show one headline number each; the adviser asked for the
+  // components behind them to be inspectable without opening the export.
+  const planningSecs = Math.round((s.phaseDurationsMs?.Planning ?? 0) / 1000);
+  const distractedSecs = Math.round((s.phaseDurationsMs?.Distracted ?? 0) / 1000);
+  const tabAwaySecs = Math.round((s.totalTabAwayMs ?? 0) / 1000);
+  // Only CLOSED episodes are in this array, so it's the recovered set.
+  const episodes = s.distractionEpisodes ?? [];
+  const recoveredCount = s.distractionsRecovered ?? episodes.length;
+  const triggerCount = (t) => episodes.filter((e) => e.trigger === t).length;
+  const resumptionSecsList = episodes.map((e) => Math.round((e.resumptionMs ?? 0) / 1000));
+  const events = Array.isArray(s.interventionEvents) ? s.interventionEvents : [];
+  const promptedBreaks = events.filter((e) => e.type === "response" && e.response === "take_a_break").length;
+  const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
 
   // Stats backed by real tracked data from content.js
   const stats = [
-    { label: "Total time",    value: fmt(totalSecs),   icon: "⏱" },
-    { label: "Writing time",  value: fmt(writingSecs),  icon: "✍️" },
-    { label: "Words written", value: s.wordCount ?? 0,  icon: "📝" },
-    { label: "Avg. WPM",      value: avgWpm,            icon: "⚡" },
-    { label: "Pauses",        value: s.totalPauses ?? 0, icon: "⏸" },
-    { label: "Break time",    value: fmt(breakSecs),    icon: "☕" },
-    { label: "Distractions",  value: s.distractionCount ?? 0, icon: "💥" },
-    { label: "Avg. recovery", value: (s.distractionCount ?? 0) > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯" },
+    { label: "Total time", value: fmt(totalSecs), icon: "⏱",
+      detail: {
+        rows: [
+          { label: "Writing", value: fmt(writingSecs) },
+          { label: "Planning", value: fmt(planningSecs) },
+          { label: "Distracted", value: fmt(distractedSecs) },
+          { label: "Breaks", value: fmt(breakSecs) },
+          ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs) }] : []),
+        ],
+        note: "Parts won't sum to the total — tracking pauses during breaks and offline time.",
+      } },
+    { label: "Writing time", value: fmt(writingSecs), icon: "✍️",
+      detail: {
+        rows: [
+          { label: "Translating (drafting)", value: fmt(translatingSecs) },
+          { label: "Reviewing (revising)", value: fmt(reviewingSecs) },
+        ],
+      } },
+    { label: "Doc words", value: docWords, icon: "📝",
+      detail: {
+        rows: [
+          // "—" not 0 when the Docs API never connected: totalDocWords stays 0
+          // in that case, and printing 0 asserts the document is EMPTY when the
+          // truth is that we never found out. The headline silently falls back
+          // to the keystroke estimate here, so the panel must show the gap.
+          { label: "Whole document", value: (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : "—" },
+          // Siblings, NOT a parent with a split: these two count different
+          // things (Docs API word boundaries vs keystrokes/5), so "typed" can
+          // legitimately exceed "added" — a word extended in place grows the
+          // keystroke estimate but not the document's word count. An "added
+          // minus typed = pasted" row was here and was wrong: it implied a
+          // decomposition that only holds when the API count runs ahead.
+          { label: "Added this session", value: s.wordCount ?? 0 },
+          { label: "Typed", value: typedWords },
+        ],
+      } },
+    { label: "Typed words", value: typedWords, icon: "⌨️",
+      detail: {
+        rows: [
+          // No row for typedWords itself — it's the headline directly above.
+          // Same wording as the Doc words tile: it's the same quantity.
+          { label: "Added this session", value: s.wordCount ?? 0 },
+          // Units spelled out: these are keypress/gesture counts sitting beside
+          // word counts, and "Deletions: 47" reads as 47 words otherwise.
+          { label: "Delete keypresses", value: s.totalDeletes ?? 0 },
+          { label: "Text selections", value: s.totalSelections ?? 0 },
+        ],
+        note: "Counted from keystrokes, so pasted text is excluded.",
+      } },
+    { label: "Avg. WPM", value: avgWpmFocused, icon: "⚡",
+      detail: {
+        rows: [
+          // Same typed words over three widening time bases, named after the
+          // phases in the chart below. The duplication with the headline is the
+          // point here — it's a comparison set, so the reader can see which
+          // base the tile uses. No rows for the inputs (typed words, phase
+          // durations): those are breakdowns of other tiles, not of this one.
+          { label: "Translating only", value: avgWpmFocused },
+          { label: "Translating + reviewing", value: avgWpmOverall },
+          { label: "Whole session", value: avgWpmSession },
+        ],
+      } },
+    { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸",
+      detail: {
+        rows: [
+          { label: "Longest pause", value: fmt(Math.round((s.longestPauseMs ?? 0) / 1000)) },
+          { label: "Typing bursts", value: s.burstCount ?? 0 },
+          { label: "Avg. burst length", value: fmt(s.avgBurstDurationSec ?? 0) },
+        ],
+      } },
+    { label: "Break time", value: fmt(breakSecs), icon: "☕",
+      detail: {
+        rows: [
+          { label: "Voluntary breaks", value: voluntaryBreaks },
+          { label: "Prompted breaks", value: promptedBreaks },
+        ],
+      } },
+    { label: "Distractions", value: s.distractionCount ?? 0, icon: "💥",
+      detail: {
+        rows: [
+          { label: "Recovered", value: recoveredCount },
+          // Indented under Recovered, NOT under the headline: trigger counts
+          // come from closed episodes only, so they sum to recovered. Listed
+          // flat they looked like a breakdown of occurrences that didn't add up.
+          { label: "Left the tab", value: triggerCount("tab-away"), indent: true },
+          { label: "Idle on the doc", value: triggerCount("idle"), indent: true },
+          { label: "Rapid switching", value: triggerCount("rapid-switch"), indent: true },
+          // Tab switch COUNT was dropped: most switches never become a
+          // distraction, so it isn't a breakdown of this tile. Time off-tab
+          // stays — it quantifies the dominant trigger above it.
+          { label: "Time off-tab", value: fmt(tabAwaySecs) },
+        ],
+      } },
+    // Guard on RECOVERED episodes (not occurrences): if the only distraction was
+    // still open at finish, there's no resumption time to average, so show "—".
+    { label: "Avg. recovery", value: episodes.length > 0 ? fmt(avgResumptionSecs) : "—", icon: "🎯",
+      detail: {
+        rows: [
+          { label: "Fastest", value: resumptionSecsList.length > 0 ? fmt(Math.min(...resumptionSecsList)) : "—" },
+          { label: "Slowest", value: resumptionSecsList.length > 0 ? fmt(Math.max(...resumptionSecsList)) : "—" },
+          { label: "Episodes measured", value: episodes.length },
+        ],
+      } },
+    // Only surfaced when the session was interrupted (Docs tab closed/left),
+    // so a clean session's grid stays uncluttered.
+    // No detail: the only thing to say is the number already on the tile.
+    ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs), icon: "🔌" }] : []),
   ];
   const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
   const PHASE_ORDER = ["Planning", "Translating", "Reviewing", "Distracted"];
@@ -1016,6 +1935,23 @@ function AnalyticsScreen({ setScreen, summary }) {
   const dominantPhase = phases.length > 0
     ? phases.reduce((max, p) => (p.pct > max.pct ? p : max))
     : null;
+
+  // Which tile's breakdown is showing (by label; null = none).
+  const [openStat, setOpenStat] = useState(null);
+  const [downloaded, setDownloaded] = useState(false);
+  function handleExport() {
+    const { json, csv, base } = buildSessionExport(s);
+    downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
+    // Small stagger so the browser reliably fires both downloads in a row.
+    setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    setDownloaded(true);
+    // Stamp the persisted copy as retrieved, so the setup screen stops flagging
+    // it as an un-downloaded session.
+    if (typeof chrome !== "undefined" && chrome.storage) {
+      chrome.storage.local.set({ ff_lastSummary: { ...s, downloadedAt: Date.now() } });
+    }
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid rgba(0,0,0,0.06)", textAlign: "center" }}>
@@ -1031,13 +1967,64 @@ function AnalyticsScreen({ setScreen, summary }) {
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 14 }}>
-          {stats.map(st => (
-            <div key={st.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${TEAL[50]}` }}>
-              <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
-              <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
-              <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
-            </div>
-          ))}
+          {stats.map((st, i) => {
+            // A tile with no detail never highlights or opens — it just sits there.
+            const open = openStat === st.label && !!st.detail;
+            // Tiles on the last row open UPWARD — a panel hanging below them
+            // would sit at the bottom edge of the scroll area, half off-screen.
+            // The last row holds 2 tiles on an even count, 1 on an odd one.
+            const openUp = i >= stats.length - (stats.length % 2 === 0 ? 2 : 1);
+            // Left column anchors left, right column anchors right, so a panel
+            // wider than its tile still can't overflow the narrow side panel.
+            const anchorRight = i % 2 === 1;
+            return (
+              <div
+                key={st.label}
+                onMouseEnter={() => setOpenStat(st.label)}
+                onMouseLeave={() => setOpenStat(null)}
+                onFocus={() => setOpenStat(st.label)}
+                onBlur={() => setOpenStat(null)}
+                // Click toggles too: hover alone is unreachable by keyboard and
+                // unreliable on a trackpad-less setup during a study session.
+                onClick={() => setOpenStat(open ? null : st.label)}
+                tabIndex={st.detail ? 0 : undefined}
+                style={{ position: "relative", background: "#F7FAF9", borderRadius: 10, padding: "9px 10px", border: `1px solid ${open ? TEAL[200] : TEAL[50]}`, cursor: st.detail ? "help" : "default", outline: "none" }}
+              >
+                <p style={{ margin: 0, fontSize: 16 }}>{st.icon}</p>
+                <p style={{ margin: "3px 0 0", fontSize: 15, fontWeight: 700, color: TEAL[800] }}>{st.value}</p>
+                <p style={{ margin: "1px 0 0", fontSize: 10, color: "#717182" }}>{st.label}</p>
+                {open && st.detail && (
+                  // The wrapper carries the gap as PADDING, not margin, so the
+                  // pointer never crosses dead space (which would fire
+                  // mouseleave and close the panel on the way to reading it).
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ position: "absolute", zIndex: 20, width: 216, [anchorRight ? "right" : "left"]: 0, [openUp ? "bottom" : "top"]: "100%", [openUp ? "paddingBottom" : "paddingTop"]: 6, textAlign: "left", cursor: "default" }}
+                  >
+                    <div style={{ background: "#fff", border: `1px solid ${TEAL[200]}`, borderRadius: 10, padding: "9px 11px", boxShadow: "0 6px 18px rgba(0,0,0,0.10)" }}>
+                      <p style={{ margin: "0 0 6px", fontSize: 10, fontWeight: 700, color: "#030213", textTransform: "uppercase", letterSpacing: "0.05em" }}>{st.label}</p>
+                      {st.detail.rows.map(r => (
+                        // Sub-rows are indented with real padding + a rule, not
+                        // a leading "—": that character already means "no value"
+                        // in these panels (Fastest/Slowest with no episodes).
+                        <div key={r.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 3, paddingLeft: r.indent ? 9 : 0, borderLeft: r.indent ? `2px solid ${TEAL[100]}` : "none" }}>
+                          <span style={{ fontSize: 10, color: "#717182", lineHeight: 1.5 }}>{r.label}</span>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: TEAL[800], flexShrink: 0, lineHeight: 1.5 }}>{r.value}</span>
+                        </div>
+                      ))}
+                      {/* A note only earns its place when a number would
+                          otherwise read as a bug (parts that don't sum, a
+                          count that looks too low). Most rows explain
+                          themselves from their label, so most have none. */}
+                      {st.detail.note && (
+                        <p style={{ margin: "7px 0 0", paddingTop: 6, borderTop: "1px solid rgba(0,0,0,0.06)", fontSize: 10, color: "#717182", lineHeight: 1.55 }}>{st.detail.note}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Time in writing phase</p>
         <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
@@ -1072,8 +2059,26 @@ function AnalyticsScreen({ setScreen, summary }) {
           </p>
         </div>
       </div>
-      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        {/* The export embeds questionnaire responses, so downloading first
+            yields an incomplete file. Only ONE action is primary at a time,
+            walking the researcher through questionnaire → download → next task.
+            The gate is deliberately soft: a hard block would strand the
+            behavioral data whenever a participant can't finish the scales, so
+            the skip stays available as a plain link rather than a button. */}
+        <Btn variant={s.survey ? "outline" : "primary"} style={{ width: "100%" }} onClick={() => setScreen("survey")}>
+          {s.survey ? "Review answers ✓" : "Complete questionnaire (3 short scales)"}
+        </Btn>
+        {s.survey ? (
+          <Btn variant={downloaded ? "outline" : "primary"} style={{ width: "100%" }} onClick={handleExport}>
+            {downloaded ? "Downloaded ✓ — download again" : "Download session data (JSON + CSV)"}
+          </Btn>
+        ) : (
+          <button onClick={handleExport} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: "#717182", textDecoration: "underline", padding: "2px 0", alignSelf: "center" }}>
+            Download without questionnaire
+          </button>
+        )}
+        <Btn variant={downloaded ? "primary" : "outline"} style={{ width: "100%" }} onClick={() => setScreen("init")}>Start new task</Btn>
       </div>
     </div>
   );
@@ -1081,19 +2086,21 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptDismissedRef, breakOriginRef }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
   const screenMap = {
     init: <TaskInitScreen onStart={(mode) => {
       setHasRecoverySummary(false);
       setShowDistractionPrompt(false);
-      promptDismissedRef.current = false;
-      if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.remove("ff_interrupted");
-      }
+      promptSuppressUntilRef.current = 0;
+      lastDistractionOnsetRef.current = null;
       if (mode === "resume") {
+        // resumeTaskTracking reads ff_interrupted to measure the offline gap,
+        // then clears it once resume is confirmed — so it must NOT be removed
+        // here first (that race previously discarded the timestamp).
         resumeTaskTracking(); // content script may have been re-injected — restart tracking
         setScreen("monitoring");
       } else {
+        // Fresh start: handleStartTask already clears ff_interrupted.
         setScreen("contextPrep");
       }
     }}/>,
@@ -1105,10 +2112,26 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       setHasRecoverySummary={setHasRecoverySummary}
       showDistractionPrompt={showDistractionPrompt}
       setShowDistractionPrompt={setShowDistractionPrompt}
-      promptDismissedRef={promptDismissedRef}
+      promptSuppressUntilRef={promptSuppressUntilRef}
+      lastDistractionOnsetRef={lastDistractionOnsetRef}
       breakOriginRef={breakOriginRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
+    survey: <SurveyScreen
+      initial={summary?.survey}
+      onBack={() => setScreen("analytics")}
+      onDone={(survey) => {
+        // Fold the responses into the summary so the existing export picks them
+        // up, and mirror to ff_lastSummary so a questionnaire completed but not
+        // downloaded is still recoverable from the setup screen.
+        const next = { ...(summary ?? {}), survey };
+        setSummary(next);
+        if (typeof chrome !== "undefined" && chrome.storage) {
+          chrome.storage.local.set({ ff_lastSummary: next });
+        }
+        setScreen("analytics");
+      }}
+    />,
     break: <BreakScreen setScreen={setScreen} setHasRecoverySummary={setHasRecoverySummary} breakOriginRef={breakOriginRef} />,
     analytics: <AnalyticsScreen setScreen={setScreen} summary={summary} />,
   };
@@ -1129,7 +2152,14 @@ export default function App() {
   // distraction-prompt acknowledgment survives navigating to Recovery/Break
   // and back to Monitoring, which otherwise unmounts and remounts that screen.
   const [showDistractionPrompt, setShowDistractionPrompt] = useState(false);
-  const promptDismissedRef = useRef(false);
+  // Timestamp until which the reminder stays suppressed after a dismiss (0 = not
+  // suppressed). A timestamp, not a boolean, so dismissing silences the current
+  // instance for PROMPT_COOLDOWN_MS without permanently disabling detection.
+  const promptSuppressUntilRef = useRef(0);
+  // Highest distractionOnsetCount the panel has already reacted to, so each NEW
+  // episode re-arms the reminder exactly once. Null until the first storage read
+  // establishes the baseline.
+  const lastDistractionOnsetRef = useRef(null);
   // How the current break was entered: "voluntary" (Take a break button) or
   // "prompt" (the distraction prompt's Take a Break option). Lifted here
   // because it's set in ActiveMonitoringScreen and read in BreakScreen —
@@ -1174,7 +2204,8 @@ export default function App() {
           setHasRecoverySummary={setHasRecoverySummary}
           showDistractionPrompt={showDistractionPrompt}
           setShowDistractionPrompt={setShowDistractionPrompt}
-          promptDismissedRef={promptDismissedRef}
+          promptSuppressUntilRef={promptSuppressUntilRef}
+          lastDistractionOnsetRef={lastDistractionOnsetRef}
           breakOriginRef={breakOriginRef}
         />
       </div>
