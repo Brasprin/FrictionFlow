@@ -1101,7 +1101,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
 
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
-  const longestPauseSec = (longestPause / 1000).toFixed(1);
+  // Minutes+seconds, matching the finish screen's fmt(): a long pause reads
+  // "2m 5s" instead of "125.4s". Whole seconds — a live decimal just flickers.
+  const lpSecTotal = Math.round(longestPause / 1000);
+  const longestPauseLabel = lpSecTotal >= 60 ? `${Math.floor(lpSecTotal / 60)}m ${lpSecTotal % 60}s` : `${lpSecTotal}s`;
   const scrollFrequencyValue = scrollFrequency;
 
   const phaseConfig = {
@@ -1282,7 +1285,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             { label: "Words", value: totalDocWords > 0 ? totalDocWords : words },
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
-            { label: "Longest Pause", value: `${longestPauseSec}s` },
+            { label: "Longest Pause", value: longestPauseLabel },
             { label: "Scroll Frequency", value: `${scrollFrequencyLabel} (${scrollFrequency}/min)` },
             { label: "Distractions", value: distractionCount },
           ].map(s => (
