@@ -270,18 +270,22 @@ function buildSessionExport(s) {
   const breakSec = sec(s.totalBreakMs);
   const offlineSec = sec(s.totalInterruptedMs);
   const phases = s.phaseDurationsMs ?? {};
+  const planningSec = sec(phases.Planning);
   const translatingSec = sec(phases.Translating);
   const reviewingSec = sec(phases.Reviewing);
-  // Writing time = Translating + Reviewing — time actually working on the text
-  // (producing it, or re-reading/revising it), per Flower & Hayes (1981).
-  // Planning and Distracted are excluded but still reported in phasesMs, and
-  // total/break/offline are all exported, so any other time base is derivable.
-  const writingSec = translatingSec + reviewingSec;
+  // Writing time = Planning + Translating + Reviewing — all three cognitive
+  // writing processes in Flower & Hayes (1981); i.e. total on-task time, the
+  // only phase excluded being Distracted. (Breaks and offline aren't phases and
+  // are reported separately.) Every phase is in phasesMs, so any narrower base
+  // is still derivable.
+  const writingSec = planningSec + translatingSec + reviewingSec;
   const typedWords = s.typedWordCount ?? 0;
-  // Overall pace = words over all writing work (Translating + Reviewing).
-  // Focused pace = words over active drafting only (Translating), where new text
-  // is actually produced. Both exported; UI shows focused.
-  const avgWpmOverall = writingSec > 0 ? Math.round(typedWords / (writingSec / 60)) : 0;
+  // WPM denominators are intentionally NOT tied to writingSec: a rate over time
+  // where little text is produced (Planning) understates pace, so the "overall"
+  // rate stays over drafting+revising only. Focused = drafting alone. The
+  // fully-diluted whole-session rate is computed below.
+  const draftReviewSec = translatingSec + reviewingSec;
+  const avgWpmOverall = draftReviewSec > 0 ? Math.round(typedWords / (draftReviewSec / 60)) : 0;
   const avgWpmFocused = translatingSec > 0 ? Math.round(typedWords / (translatingSec / 60)) : 0;
   // Session pace = words over total wall-clock time (breaks and distraction
   // included) — the most conservative of the three rates.
@@ -329,6 +333,11 @@ function buildSessionExport(s) {
   const promptedBreaks = respCount("take_a_break");
   const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
   const tally = s.suggestionTally ?? {};
+  // Chosen suggestions in episode order (generatedAt) for the CSV topic column.
+  // One record per episode: recordSuggestionChoice overwrites by generatedAt, so
+  // a participant who changes their mind leaves only the FINAL pick here. The
+  // full records (stance index, rejected options, timestamps) stay in the JSON.
+  const choicesOrdered = [...(s.suggestionChoices ?? [])].sort((a, b) => (a.generatedAt ?? 0) - (b.generatedAt ?? 0));
   const sv = s.survey ?? null;
 
   const json = {
@@ -344,10 +353,14 @@ function buildSessionExport(s) {
       offlineTimeSec: offlineSec,
       interrupted: offlineSec > 0,
     },
+    // Names match the UI labels so the CSV can't be misread: wordsAddedToDoc =
+    // the Docs-API change this session (the "Added to doc" row, incl. paste);
+    // wholeDocWords = the whole-document count (the "Doc words" tile / "Whole
+    // document" row, incl. the pre-loaded prompt); typedWords = keystrokes only.
     words: {
-      docWords: s.wordCount ?? 0,        // words ADDED this session (API-anchored, incl. paste)
-      typedWords,                        // keystroke-typed only (excludes paste)
-      docTotalWords: s.totalDocWords ?? 0, // exact whole-document count (Docs API), incl. pre-loaded prompt
+      wordsAddedToDoc: s.wordCount ?? 0,
+      typedWords,
+      wholeDocWords: s.totalDocWords ?? 0,
     },
     typing: {
       avgWpmOverall,
@@ -416,14 +429,16 @@ function buildSessionExport(s) {
     ["breakTimeSec", breakSec],
     ["offlineTimeSec", offlineSec],
     ["interrupted", json.session.interrupted ? 1 : 0],
-    ["docWords", json.words.docWords],
+    ["wordsAddedToDoc", json.words.wordsAddedToDoc],
     ["typedWords", typedWords],
-    ["docTotalWords", json.words.docTotalWords],
+    ["wholeDocWords", json.words.wholeDocWords],
     ["avgWpmOverall", avgWpmOverall],
     ["avgWpmFocused", avgWpmFocused],
     ["avgWpmSession", avgWpmSession],
     ["totalPauses", json.typing.totalPauses],
     ["longestPauseSec", json.typing.longestPauseSec],
+    ["burstCount", json.typing.burstCount],
+    ["avgBurstSec", json.typing.avgBurstSec],
     ["totalDeletes", json.revision.totalDeletes],
     ["totalSelections", json.revision.totalSelections],
     ["planningSec", sec(phases.Planning)],
@@ -447,6 +462,11 @@ function buildSessionExport(s) {
     ["suggestStance0", tally[0] ?? 0],
     ["suggestStance1", tally[1] ?? 0],
     ["suggestStance2", tally[2] ?? 0],
+    // Just the chosen topic text in the CSV — one entry per episode, in episode
+    // order, joined with " | " (a single cell holds all of a session's picks).
+    // The stance index, rejected options and timestamps live only in the JSON's
+    // recoverySuggestions.choices; no need to flatten those into columns.
+    ["chosenSuggestions", choicesOrdered.map((c) => c.chosenText ?? "").join(" | ")],
     // Questionnaires. Subscale scores AND every raw item — item-level data is
     // what reliability analysis (Cronbach's alpha) needs, and it lets the
     // scores be recomputed if a scoring decision changes. Blank cells when the
@@ -853,6 +873,11 @@ function ContextPrepScreen({ setScreen }) {
         }
         chrome.tabs.sendMessage(targetId, { type: "FF_START_TASK" })
           .then(() => {
+            // sessionStartTime stays at the "Start Task" click, so Total time
+            // includes the Context Prep setup ("Connecting…", "Building
+            // context-aware focus model…"). That setup belongs to no phase, so
+            // the Total tile's rows add up to a little less than the headline —
+            // an accepted, minor discrepancy (owner's call).
             // Kick the one-time Google consent for the Docs API here, at
             // session start, so it never pops up mid-writing. Failure is
             // fine — word count / doc text fall back to keystroke data.
@@ -1165,6 +1190,11 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         condition,
         startedAt: sessionStartTime,
         endedAt: Date.now(),
+        // Total = wall clock from the "Start Task" click, so it includes the
+        // Context Prep setup. Phases are tracked only from FF_START_TASK, so the
+        // hover rows add up to a little less than Total by that setup time — an
+        // accepted, minor discrepancy (owner's call). finalElapsedSeconds is a
+        // fresh wall-clock read; the React `elapsed` state is the dev fallback.
         elapsedSeconds: finalElapsedSeconds,
         totalBreakMs: sessionSnapshot.totalBreakMs ?? 0,
         totalInterruptedMs: sessionSnapshot.totalInterruptedMs ?? 0,
@@ -1757,15 +1787,14 @@ function AnalyticsScreen({ setScreen, summary }) {
   const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
   // Time the Docs tab was closed/away (fully offline, untracked).
   const interruptedSecs = Math.floor((s.totalInterruptedMs ?? 0) / 1000);
-  // Writing time = Translating + Reviewing — the phases where the participant is
-  // actually working on the text (producing it, or re-reading/revising it), per
-  // Flower & Hayes (1981). Planning and Distracted are deliberately excluded:
-  // the old "total − breaks − offline" counted both, so on a session with no
-  // breaks it came out identical to Total time. Neither is lost — both still
-  // appear as their own slice in the phase breakdown below.
+  // Writing time = Planning + Translating + Reviewing — all three cognitive
+  // writing processes in Flower & Hayes (1981), i.e. total on-task time; only
+  // Distracted is excluded (breaks and offline aren't phases). Each phase also
+  // shows as its own slice in the breakdown below, so nothing is hidden.
+  const planningSecs = Math.round((s.phaseDurationsMs?.Planning ?? 0) / 1000);
   const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
   const reviewingSecs = Math.round((s.phaseDurationsMs?.Reviewing ?? 0) / 1000);
-  const writingSecs = translatingSecs + reviewingSecs;
+  const writingSecs = planningSecs + translatingSecs + reviewingSecs;
 
   function fmt(seconds) {
     const m = Math.floor(seconds / 60);
@@ -1781,12 +1810,11 @@ function AnalyticsScreen({ setScreen, summary }) {
   const docWords = (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : (s.wordCount ?? 0);
   const typedWords = s.typedWordCount ?? 0; // keystroke-typed words (excludes paste)
 
-  // The tile shows the FOCUSED rate: typed words (paste can't inflate them) over
-  // active drafting only (Translating), where new text is actually produced, so
-  // it reflects genuine typing pace. The OVERALL rate (over Translating +
-  // Reviewing) is shown in the tile's hover breakdown; both are exported.
+  // WPM denominators are deliberately independent of writingSecs (which now
+  // includes Planning): dividing typed words by low-output planning time would
+  // understate pace. Focused = drafting only; Overall = drafting + revising.
   const avgWpmFocused = translatingSecs > 0 ? Math.round(typedWords / (translatingSecs / 60)) : 0;
-  const avgWpmOverall = writingSecs > 0 ? Math.round(typedWords / (writingSecs / 60)) : 0;
+  const avgWpmOverall = (translatingSecs + reviewingSecs) > 0 ? Math.round(typedWords / ((translatingSecs + reviewingSecs) / 60)) : 0;
   // Whole-session rate: same typed words over total wall-clock time, so breaks,
   // planning and distracted time all count against it. The lowest of the three.
   const avgWpmSession = totalSecs > 0 ? Math.round(typedWords / (totalSecs / 60)) : 0;
@@ -1794,7 +1822,7 @@ function AnalyticsScreen({ setScreen, summary }) {
   // ── Values used only by the hover breakdowns ──
   // The tiles show one headline number each; the adviser asked for the
   // components behind them to be inspectable without opening the export.
-  const planningSecs = Math.round((s.phaseDurationsMs?.Planning ?? 0) / 1000);
+  // (planningSecs is declared above, since writingSecs now needs it.)
   const distractedSecs = Math.round((s.phaseDurationsMs?.Distracted ?? 0) / 1000);
   const tabAwaySecs = Math.round((s.totalTabAwayMs ?? 0) / 1000);
   // Only CLOSED episodes are in this array, so it's the recovered set.
@@ -1811,51 +1839,35 @@ function AnalyticsScreen({ setScreen, summary }) {
     { label: "Total time", value: fmt(totalSecs), icon: "⏱",
       detail: {
         rows: [
+          // Planning is a component of Writing now, not a sibling — listing it
+          // here too would double-count against the total.
           { label: "Writing", value: fmt(writingSecs) },
-          { label: "Planning", value: fmt(planningSecs) },
           { label: "Distracted", value: fmt(distractedSecs) },
           { label: "Breaks", value: fmt(breakSecs) },
           ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs) }] : []),
         ],
-        note: "Parts won't sum to the total — tracking pauses during breaks and offline time.",
       } },
     { label: "Writing time", value: fmt(writingSecs), icon: "✍️",
       detail: {
         rows: [
+          { label: "Planning", value: fmt(planningSecs) },
           { label: "Translating (drafting)", value: fmt(translatingSecs) },
           { label: "Reviewing (revising)", value: fmt(reviewingSecs) },
         ],
       } },
-    { label: "Doc words", value: docWords, icon: "📝",
-      detail: {
-        rows: [
-          // "—" not 0 when the Docs API never connected: totalDocWords stays 0
-          // in that case, and printing 0 asserts the document is EMPTY when the
-          // truth is that we never found out. The headline silently falls back
-          // to the keystroke estimate here, so the panel must show the gap.
-          { label: "Whole document", value: (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : "—" },
-          // Siblings, NOT a parent with a split: these two count different
-          // things (Docs API word boundaries vs keystrokes/5), so "typed" can
-          // legitimately exceed "added" — a word extended in place grows the
-          // keystroke estimate but not the document's word count. An "added
-          // minus typed = pasted" row was here and was wrong: it implied a
-          // decomposition that only holds when the API count runs ahead.
-          { label: "Added this session", value: s.wordCount ?? 0 },
-          { label: "Typed", value: typedWords },
-        ],
-      } },
+    // No hover: the whole-document count speaks for itself, and its parts
+    // (prompt vs added) overlapped the Typed words tile. Renders as a plain,
+    // non-interactive tile.
+    { label: "Doc words", value: docWords, icon: "📝" },
     { label: "Typed words", value: typedWords, icon: "⌨️",
       detail: {
         rows: [
-          // No row for typedWords itself — it's the headline directly above.
-          // Same wording as the Doc words tile: it's the same quantity.
-          { label: "Added this session", value: s.wordCount ?? 0 },
-          // Units spelled out: these are keypress/gesture counts sitting beside
-          // word counts, and "Deletions: 47" reads as 47 words otherwise.
+          // Keystroke behavior only — no word-count rows, which live on the Doc
+          // words tile. Units spelled out: these are keypress/gesture counts,
+          // and "Deletions: 47" would read as 47 words next to the headline.
           { label: "Delete keypresses", value: s.totalDeletes ?? 0 },
           { label: "Text selections", value: s.totalSelections ?? 0 },
         ],
-        note: "Counted from keystrokes, so pasted text is excluded.",
       } },
     { label: "Avg. WPM", value: avgWpmFocused, icon: "⚡",
       detail: {
@@ -1873,9 +1885,10 @@ function AnalyticsScreen({ setScreen, summary }) {
     { label: "Pauses", value: s.totalPauses ?? 0, icon: "⏸",
       detail: {
         rows: [
+          // Pauses only — bursts are the OPPOSITE (continuous typing), so they
+          // don't belong under a "Pauses" headline. Burst counts stay in the
+          // export (burstCount, avgBurstSec) for fluency analysis.
           { label: "Longest pause", value: fmt(Math.round((s.longestPauseMs ?? 0) / 1000)) },
-          { label: "Typing bursts", value: s.burstCount ?? 0 },
-          { label: "Avg. burst length", value: fmt(s.avgBurstDurationSec ?? 0) },
         ],
       } },
     { label: "Break time", value: fmt(breakSecs), icon: "☕",

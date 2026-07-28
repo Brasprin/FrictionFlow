@@ -770,6 +770,11 @@ function startTracking() {
   isTracking = true;
   attachListenersOnce();
   startIntervals();
+  // Open the first phase segment NOW rather than waiting for the phase
+  // interval's first tick (up to 2s later): otherwise those seconds fall into
+  // no phase, and the analytics phase durations sum to just under the session
+  // length. classifyPhase with no keystrokes yet returns Planning (its default).
+  updatePhaseTracking();
   console.log("FrictionFlow: tracking started.");
 }
 
