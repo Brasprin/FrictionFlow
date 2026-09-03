@@ -150,6 +150,28 @@ function logInterventionEvent(type, detail = {}) {
   });
 }
 
+// Calibration profiles are stored per participant under one key (see
+// CALIBRATION_STORE_KEY in content.js). These two helpers are the only readers,
+// so the legacy single-profile key is tolerated in exactly one place.
+const CALIBRATION_STORE_KEY = "ff_calibrations";
+
+function readCalibrationStore(result) {
+  const store = { ...(result?.[CALIBRATION_STORE_KEY] ?? {}) };
+  const legacy = result?.ff_calibration;
+  // A profile captured before profiles were keyed by participant. Folded in
+  // only when the map has nothing for that participant, so it can never shadow
+  // a newer one.
+  if (legacy?.participantId && !store[legacy.participantId]) {
+    store[legacy.participantId] = legacy;
+  }
+  return store;
+}
+
+// The most recently captured profile, used to prefill the participant id field.
+function mostRecentProfile(store) {
+  return Object.values(store).sort((a, b) => (b?.capturedAt ?? 0) - (a?.capturedAt ?? 0))[0] ?? null;
+}
+
 // ─── Session data export ──────────────────────────────────────────────────────
 
 // Triggers a file download from the side panel via an in-memory blob — no
@@ -270,15 +292,23 @@ function buildSessionExport(s) {
   const breakSec = sec(s.totalBreakMs);
   const offlineSec = sec(s.totalInterruptedMs);
   const phases = s.phaseDurationsMs ?? {};
+  const distracted = s.distractedDurationsMs ?? {};
   const planningSec = sec(phases.Planning);
   const translatingSec = sec(phases.Translating);
   const reviewingSec = sec(phases.Reviewing);
-  // Writing time = Planning + Translating + Reviewing — all three cognitive
-  // writing processes in Flower & Hayes (1981); i.e. total on-task time, the
-  // only phase excluded being Distracted. (Breaks and offline aren't phases and
-  // are reported separately.) Every phase is in phasesMs, so any narrower base
-  // is still derivable.
-  const writingSec = planningSec + translatingSec + reviewingSec;
+  // Distraction OVERLAPS the phases rather than partitioning alongside them:
+  // under the two-label model the writer is always in one of the three
+  // processes, and being distracted is a state within that phase. So distracted
+  // time is a SUBSET of the phase totals and has to be subtracted explicitly —
+  // where the previous four-way model got the same result for free, because
+  // Distracted was a disjoint fourth bucket.
+  const distractedSec = sec(distracted.Planning) + sec(distracted.Translating) + sec(distracted.Reviewing);
+  const phaseTotalSec = planningSec + translatingSec + reviewingSec;
+  // Writing time = on-task time: all three Flower & Hayes processes, minus the
+  // stretches within them where attention had gone. (Breaks and offline aren't
+  // phases and are reported separately.) Both phasesMs and distractedMs ship in
+  // full, so any narrower base stays derivable.
+  const writingSec = Math.max(0, phaseTotalSec - distractedSec);
   const typedWords = s.typedWordCount ?? 0;
   // WPM denominators are intentionally NOT tied to writingSec: a rate over time
   // where little text is produced (Planning) understates pace, so the "overall"
@@ -383,11 +413,44 @@ function buildSessionExport(s) {
       totalDeletes: s.totalDeletes ?? 0,       // Backspace/Delete presses
       totalSelections: s.totalSelections ?? 0, // debounced selection gestures
     },
+    // Total time in each writing process. These partition the tracked session
+    // (breaks and offline excluded) — there is no Distracted key, because
+    // distraction is not a phase.
     phasesMs: {
       Planning: phases.Planning ?? 0,
       Translating: phases.Translating ?? 0,
       Reviewing: phases.Reviewing ?? 0,
-      Distracted: phases.Distracted ?? 0,
+    },
+    // Distracted time WITHIN each phase — a subset of phasesMs above. This is
+    // the 3x2 matrix the four-way model could not produce: it labelled the
+    // participant Distracted and thereby discarded which process was
+    // interrupted, so "time distracted while planning" had nowhere to live.
+    distractedMs: {
+      Planning: distracted.Planning ?? 0,
+      Translating: distracted.Translating ?? 0,
+      Reviewing: distracted.Reviewing ?? 0,
+    },
+    // Which thresholds produced every classification above, and whether they
+    // came from a valid calibration profile or the documented fallbacks.
+    calibration: {
+      valid: s.calibrationValid ?? false,
+      profileId: s.calibrationProfileId ?? null,
+      thresholds: s.thresholds ?? null,
+      // Provenance of the profile itself: when it was captured, whether it was
+      // accepted, why not if it was not, and the per-segment statistics behind
+      // every derived threshold. This is what makes the numbers auditable
+      // rather than asserted — a reviewer can recompute them from here.
+      profile: s.calibrationProfile
+        ? {
+            capturedAt: s.calibrationProfile.capturedAt
+              ? new Date(s.calibrationProfile.capturedAt).toISOString()
+              : null,
+            valid: s.calibrationProfile.valid ?? false,
+            testMode: s.calibrationProfile.testMode ?? false,
+            failures: s.calibrationProfile.failures ?? [],
+            segments: s.calibrationProfile.segments ?? null,
+          }
+        : null,
     },
     distractions: {
       count: s.distractionCount ?? 0,              // occurrences (onset)
@@ -410,6 +473,12 @@ function buildSessionExport(s) {
       prompted: promptedBreaks,
       total: voluntaryBreaks + promptedBreaks,
     },
+    // Also in the JSON so a single file is self-contained, with the column
+    // names alongside the rows — the rows are positional arrays to avoid
+    // repeating twelve field names ~1,500 times.
+    decisionTrace: s.trace
+      ? { columns: s.trace.columns ?? [], truncated: !!s.trace.truncated, rows: s.trace.rows ?? [] }
+      : null,
     recoverySuggestions: { tally, choices: s.suggestionChoices ?? [] },
     interventionEvents: events,
     // null when the participant hasn't completed the questionnaire yet — an
@@ -429,6 +498,28 @@ function buildSessionExport(s) {
     ["breakTimeSec", breakSec],
     ["offlineTimeSec", offlineSec],
     ["interrupted", json.session.interrupted ? 1 : 0],
+    // Calibration provenance. calibrationValid=0 means this session ran on the
+    // fallback constants, so its thresholds are NOT comparable to a calibrated
+    // participant's — it must be visible in the flat file, not buried in JSON.
+    ["calibrationValid", json.calibration.valid ? 1 : 0],
+    ["calibrationProfileId", json.calibration.profileId],
+    ["calibrationCapturedAt", json.calibration.profile?.capturedAt],
+    // Empty when the profile was accepted. Non-empty rows must be read as
+    // running on defaults, whatever the other columns say.
+    ["calibrationFailures", (json.calibration.profile?.failures ?? []).join(" | ")],
+    ["thrWpmGate", json.calibration.thresholds?.wpmGate],
+    ["thrBurstMinSec", json.calibration.thresholds?.burstMinSec],
+    ["thrDeleteGate", json.calibration.thresholds?.deleteGate],
+    ["thrScrollGate", json.calibration.thresholds?.scrollGate],
+    ["thrIdlePlanningSec", json.calibration.thresholds?.idleSec?.Planning],
+    ["thrIdleTranslatingSec", json.calibration.thresholds?.idleSec?.Translating],
+    ["thrIdleReviewingSec", json.calibration.thresholds?.idleSec?.Reviewing],
+    // The Rate family's baselines. Without these the flat file cannot explain
+    // why a distraction did or did not fire, since a deviation is judged
+    // against them — blank means the family was disabled for that phase.
+    ["thrActivityPlanning", json.calibration.thresholds?.activityRate?.Planning],
+    ["thrActivityTranslating", json.calibration.thresholds?.activityRate?.Translating],
+    ["thrActivityReviewing", json.calibration.thresholds?.activityRate?.Reviewing],
     ["wordsAddedToDoc", json.words.wordsAddedToDoc],
     ["typedWords", typedWords],
     ["wholeDocWords", json.words.wholeDocWords],
@@ -441,10 +532,17 @@ function buildSessionExport(s) {
     ["avgBurstSec", json.typing.avgBurstSec],
     ["totalDeletes", json.revision.totalDeletes],
     ["totalSelections", json.revision.totalSelections],
-    ["planningSec", sec(phases.Planning)],
-    ["translatingSec", sec(phases.Translating)],
-    ["reviewingSec", sec(phases.Reviewing)],
-    ["distractedSec", sec(phases.Distracted)],
+    ["planningSec", planningSec],
+    ["translatingSec", translatingSec],
+    ["reviewingSec", reviewingSec],
+    // Distracted time is a SUBSET of the three columns above, not a fourth
+    // sibling — planningSec + translatingSec + reviewingSec is the whole
+    // tracked session, and distractedSec is carved out of it. The per-phase
+    // split follows so the overlap is auditable rather than asserted.
+    ["distractedSec", distractedSec],
+    ["distractedPlanningSec", sec(distracted.Planning)],
+    ["distractedTranslatingSec", sec(distracted.Translating)],
+    ["distractedReviewingSec", sec(distracted.Reviewing)],
     // tabSwitchCount rides along because tabAwaySec is hard to read without it
     // (10 min away over 2 switches means something different than over 40).
     ["tabSwitchCount", json.typing.tabSwitchCount],
@@ -488,7 +586,28 @@ function buildSessionExport(s) {
   const datePart = (s.startedAt ? new Date(s.startedAt) : new Date()).toISOString().slice(0, 10);
   const base = `${fileSlug(s.participantId, "session")}_${fileSlug(s.condition, "cond")}_${datePart}`;
 
-  return { json, csv, base };
+  // The decision trace ships as its own long-format CSV rather than inside the
+  // single-row session CSV: it is one row per 2s tick (~1,500 for a 50-minute
+  // session), which is the shape analysis actually wants — one line per
+  // decision, alignable against the screen-recording coder's timestamps.
+  //
+  // This is the file that makes the counterfactual possible. Every column left
+  // of `phase` is a raw measurement, so the same session can be re-classified
+  // under the fixed pre-calibration thresholds and both scored against the same
+  // human-coded ground truth. Stored decisions alone cannot support that: a
+  // recorded "Translating" is a conclusion, not evidence.
+  const traceColumns = s.trace?.columns ?? [];
+  const traceRows = s.trace?.rows ?? [];
+  const traceCsv = traceColumns.length
+    ? [
+        ["participantId", "condition", ...traceColumns].map(csvCell).join(","),
+        ...traceRows.map((row) =>
+          [s.participantId ?? "", s.condition ?? "", ...row].map(csvCell).join(",")
+        ),
+      ].join("\r\n") + "\r\n"
+    : null;
+
+  return { json, csv, traceCsv, base };
 }
 
 function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
@@ -537,7 +656,7 @@ function RecoverySummaryContent({ summary, selectedIndex, onSelect }) {
 
 // ─── Screen 1: Task Initialization ───────────────────────────────────────────
 
-function TaskInitScreen({ onStart }) {
+function TaskInitScreen({ onStart, onCalibrate }) {
   const [participantId, setParticipantId] = useState(""); // stamped on the data export
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
@@ -553,6 +672,10 @@ function TaskInitScreen({ onStart }) {
   // Last finished session, kept so a download missed on the analytics screen
   // can still be recovered here. Null once a newer session overwrites it.
   const [lastSummary, setLastSummary] = useState(null);
+  // Every stored calibration profile, keyed by participant id. The card below
+  // looks up the one matching the typed id — a profile is only ever usable for
+  // the participant it was captured from.
+  const [calibrationStore, setCalibrationStore] = useState({});
 
   // Self-contained senior high school writing prompts — opinion/reflection
   // based, so participants can write from their own knowledge without needing
@@ -565,10 +688,12 @@ function TaskInitScreen({ onStart }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary", CALIBRATION_STORE_KEY, "ff_calibration"], (result) => {
         // Read before the early return below — a recoverable previous session
         // matters just as much when a session is already active.
         setLastSummary(result.ff_lastSummary ?? null);
+        const store = readCalibrationStore(result);
+        setCalibrationStore(store);
         const t = result.ff_task;
         if (t) {
           setParticipantId(t.participantId ?? "");
@@ -589,7 +714,16 @@ function TaskInitScreen({ onStart }) {
           setObjective(d.objective ?? "");
           setCondition(d.condition ?? "intervention");
           chrome.storage.local.remove("ff_draft");
+          return;
         }
+        // Otherwise fall back to the most recently calibrated participant.
+        // Without this, returning here straight from calibration lands on an
+        // empty field, which the status card compares against the profile's id
+        // and reports as "Not calibrated" — for a participant who just
+        // calibrated successfully. Only a prefill: typing a different id
+        // immediately re-evaluates the card against that participant.
+        const recent = mostRecentProfile(store);
+        if (recent?.participantId) setParticipantId(recent.participantId);
       });
     }
   }, []);
@@ -601,6 +735,25 @@ function TaskInitScreen({ onStart }) {
   // worse for the study than weak input reaching the (hardened) prompt.
   const objectiveWordCount = objective.trim().split(/\s+/).filter(Boolean).length;
   const showObjectiveNudge = !isActive && objectiveWordCount > 0 && objectiveWordCount < 3;
+
+  // A profile is usable only for the participant it was captured from — content
+  // .js applies the same test, and refuses a mismatch rather than silently
+  // running one participant on another's baseline.
+  const trimmedPid = participantId.trim();
+  const calibration = trimmedPid ? calibrationStore[trimmedPid] ?? null : null;
+  const calibratedForThisParticipant = !!calibration?.valid;
+  const otherIds = Object.keys(calibrationStore).filter((id) => id !== trimmedPid);
+  // Three distinct not-calibrated cases, kept apart because they call for
+  // different actions: run calibration, correct the id, or type an id at all.
+  // Collapsing them into one "Not calibrated" sent a researcher hunting for a
+  // problem that did not exist.
+  const uncalibratedReason = !trimmedPid
+    ? "Enter a participant ID to check calibration"
+    : calibration && !calibration.valid
+      ? `Calibration for ${trimmedPid} was rejected`
+      : otherIds.length > 0
+        ? `No profile for ${trimmedPid} — calibrated: ${otherIds.join(", ")}`
+        : "Not calibrated";
 
   function handleStartTask() {
     // All three fields are required before a session can start.
@@ -655,9 +808,10 @@ function TaskInitScreen({ onStart }) {
   // screen, so the two can never produce different files.
   function handleDownloadLast() {
     if (!lastSummary) return;
-    const { json, csv, base } = buildSessionExport(lastSummary);
+    const { json, csv, traceCsv, base } = buildSessionExport(lastSummary);
     downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
     setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    if (traceCsv) setTimeout(() => downloadFile(`${base}_trace.csv`, traceCsv, "text/csv"), 800);
     const updated = { ...lastSummary, downloadedAt: Date.now() };
     if (typeof chrome !== "undefined" && chrome.storage) {
       chrome.storage.local.set({ ff_lastSummary: updated });
@@ -717,6 +871,48 @@ function TaskInitScreen({ onStart }) {
           <p style={{ margin: "0 0 12px", fontSize: 11, color: "#E5484D", lineHeight: 1.5 }}>
             Please enter a participant ID.
           </p>
+        )}
+        {/* Calibration status, tied to the participant id above. Deliberately
+            informative rather than blocking: a session must always be able to
+            run, and an uncalibrated one is honest about the thresholds it used
+            (calibrationValid: false rides in the export). Blocking here would
+            strand a participant whose calibration failed. */}
+        {!isActive && (
+          calibratedForThisParticipant ? (
+            <div style={{ background: TEAL[50], border: `1px solid ${TEAL[100]}`, borderRadius: 10, padding: "10px 11px", marginBottom: 14 }}>
+              <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>Calibrated ✓</p>
+              <p style={{ margin: "0 0 7px", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
+                {calibration.display
+                  ? `Writing ${calibration.display.writingWpm} WPM · reviewing ${calibration.display.reviewingWpm} WPM · pause ~${calibration.display.typicalPauseSec}s`
+                  : "This participant's own thresholds are in use."}
+              </p>
+              <button
+                onClick={() => onCalibrate(trimmedPid)}
+                style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: TEAL[600], textDecoration: "underline", padding: 0 }}
+              >
+                Re-run calibration
+              </button>
+            </div>
+          ) : (
+            <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 11px", marginBottom: 14 }}>
+              <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>
+                {uncalibratedReason}
+              </p>
+              <p style={{ margin: "0 0 7px", fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+                This session will run on default thresholds, recorded as such in the exported data.
+              </p>
+              <Btn
+                variant="outline"
+                style={{ width: "100%" }}
+                onClick={() => {
+                  if (!trimmedPid) { setParticipantIdError(true); return; }
+                  onCalibrate(trimmedPid);
+                }}
+              >
+                {`Run calibration (${CALIBRATION_TOTAL_MIN} min)`}
+              </Btn>
+            </div>
+          )
         )}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6, marginTop: 0 }}>Task name</p>
         <input
@@ -983,6 +1179,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [scrollFrequency, setScrollFrequency] = useState(0);
   const [scrollFrequencyLabel, setScrollFrequencyLabel] = useState("None");
   const [currentPhase, setCurrentPhase] = useState("Planning");
+  // Second label. Tracked separately from the phase so the panel can show
+  // "Translating · drifting" — what the writer was doing AND whether they are
+  // still with it — instead of replacing the one with the other.
+  const [currentAttention, setCurrentAttention] = useState("Focused");
   const [condition, setCondition] = useState("intervention");
   const [distractionCount, setDistractionCount] = useState(0);
   const [participantId, setParticipantId] = useState(""); // carried into the export
@@ -1051,6 +1251,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           setScrollFrequency(s.scrollFrequency ?? 0);
           setScrollFrequencyLabel(s.scrollFrequencyLabel ?? "None");
           setCurrentPhase(s.currentPhase ?? "Planning");
+          setCurrentAttention(s.currentAttention ?? "Focused");
           // Show OCCURRENCES (onset), not closed episodes — so the tile ticks
           // the moment a distraction begins (matching the reminder), instead of
           // lagging until the resuming keystroke closes the episode.
@@ -1063,11 +1264,11 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           // dismiss silences the current instance without disabling detection:
           //   1. A NEW distraction episode began (distractionOnsetCount rose) —
           //      fires immediately, bypassing the cooldown. This also covers
-          //      tab-away, whose phase flips back to non-Distracted on return
-          //      before this poll ever sees "Distracted"; the onset still fires.
-          //   2. The writer is STILL "Distracted" and the post-dismiss cooldown
+          //      tab-away, whose attention flips back to Focused on return
+          //      before this poll ever observes it; the onset still fires.
+          //   2. The writer is STILL Distracted and the post-dismiss cooldown
           //      has elapsed — re-nudges a continuing distraction (e.g. repeated
-          //      tab-switching that never lets the phase leave "Distracted").
+          //      tab-switching that never lets the attention channel clear).
           // The prompt is STICKY by owner decision: it never dismisses itself —
           // only the user's button click closes it (see the three handlers).
           // Behavioral logging runs identically in both conditions — only
@@ -1075,7 +1276,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           const isBaseline = (t?.condition ?? "intervention") === "baseline";
           if (!isBaseline) {
             const onset = s.distractionOnsetCount ?? 0;
-            const isDistracted = s.currentPhase === "Distracted";
+            // Reads the ATTENTION channel, not the phase — the phase is now
+            // always one of the three writing processes and never reports
+            // distraction at all.
+            const isDistracted = s.currentAttention === "Distracted";
             // Establish the baseline on first read so reopening the panel
             // mid-episode doesn't retro-fire for an already-known distraction.
             let newEpisode = false;
@@ -1107,14 +1311,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const longestPauseLabel = lpSecTotal >= 60 ? `${Math.floor(lpSecTotal / 60)}m ${lpSecTotal % 60}s` : `${lpSecTotal}s`;
   const scrollFrequencyValue = scrollFrequency;
 
+  // Three phases only — "Distracted" is no longer one of them. Distraction is
+  // rendered as a state OF a phase (the amber overlay below), not instead of it.
   const phaseConfig = {
   Planning:    { color: TEAL[100], desc: "thinking..." },
   Translating: { color: TEAL[400], desc: "drafting..." },
   Reviewing:   { color: TEAL[200], desc: "re-reading...." },
-  Distracted:  { color: "#F4A261", desc: "away..." },
   };
 
   const activePhase = phaseConfig[currentPhase] ?? phaseConfig.Planning;
+  const isDistracted = currentAttention === "Distracted";
 
   // Log each time the Gentle Reminder actually appears. This effect only re-runs
   // when showDistractionPrompt flips, and the poll's setShowDistractionPrompt(true)
@@ -1176,7 +1382,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       : elapsed;
 
     // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
-    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = []) {
+    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = [], calibrationProfile = null, trace = null) {
       // Finalize the suggestion tally. chosenIndex is the stance
       // (0 = goal-anchored, 1 = doc-driven, 2 = bridge); every remaining record
       // is a frozen per-episode choice, so summing by index gives the export
@@ -1224,6 +1430,25 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         scrollFrequency: sessionSnapshot.scrollFrequency ?? scrollFrequency,
         scrollFrequencyLabel: sessionSnapshot.scrollFrequencyLabel ?? scrollFrequencyLabel,
         phaseDurationsMs: sessionSnapshot.phaseDurationsMs ?? {},
+        // Distracted time WITHIN each phase — a subset of the above, not a peer.
+        distractedDurationsMs: sessionSnapshot.distractedDurationsMs ?? {},
+        // The thresholds this session actually ran under, and whether they came
+        // from a valid calibration profile. Without these the behavioural data
+        // is uninterpretable: the same numbers mean different things depending
+        // on which thresholds produced them.
+        calibrationValid: sessionSnapshot.calibrationValid ?? false,
+        calibrationProfileId: sessionSnapshot.calibrationProfileId ?? null,
+        thresholds: sessionSnapshot.thresholds ?? null,
+        // The whole profile, including the per-segment statistics every
+        // threshold was derived from. Carried in BOTH of a participant's
+        // session exports (spec §3): the profile is captured once and reused,
+        // so without this copy the second session's file would not record how
+        // its thresholds were produced.
+        calibrationProfile,
+        // Per-tick raw measurements plus the decision they produced. This is
+        // what lets the session be re-classified under a different threshold
+        // set during analysis — the classifier's inputs, not just its output.
+        trace,
         // distractionCount = occurrences (onset): matches the live tile and the
         // reminders, and includes any distraction still open at finish.
         // distractionsRecovered = episodes that closed on a resuming keystroke
@@ -1263,12 +1488,36 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       setScreen("analytics");
     }
 
+    // Ask the content script to persist the tail of the decision trace before
+    // reading storage: it writes on a ~10s cadence to keep the periodic writes
+    // cheap, so the final ticks — often the ones around the last distraction —
+    // would otherwise be missing from the export. Failure is non-fatal; the
+    // read proceeds either way rather than stranding the session.
+    function readAndBuild() {
+      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events", "ff_trace", CALIBRATION_STORE_KEY, "ff_calibration"], (result) => {
+        buildAndNavigate(
+          result.ff_session ?? {},
+          result.ff_suggestion_choices ?? [],
+          result.ff_events ?? [],
+          // This participant's own profile, not merely the most recent one —
+          // another participant may have calibrated between this participant's
+          // two sessions.
+          readCalibrationStore(result)[participantId] ?? null,
+          result.ff_trace ?? null
+        );
+      });
+    }
+
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events"], (result) => {
-        buildAndNavigate(result.ff_session ?? {}, result.ff_suggestion_choices ?? [], result.ff_events ?? []);
+      chrome.storage.local.get("ff_task", (r) => {
+        const tabId = r.ff_task?.tabId;
+        if (!tabId) { readAndBuild(); return; }
+        chrome.tabs.sendMessage(tabId, { type: "FF_FLUSH_TRACE" })
+          .then(readAndBuild)
+          .catch(readAndBuild);
       });
     } else {
-      buildAndNavigate({}, [], []);
+      buildAndNavigate({}, [], [], null, null);
     }
   }
 
@@ -1313,14 +1562,22 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         )}
         {/* Writing phase */}
         <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Detected writing phase</p>
-        <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
+        <div style={{ background: "#F7FAF9", borderRadius: 10, padding: "10px 12px", marginBottom: 14, border: `1px solid ${isDistracted ? "#FDDCB5" : TEAL[50]}` }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
             <div style={{ width: 8, height: 8, borderRadius: 999, background: activePhase.color }} />
             <span style={{ fontSize: 13, fontWeight: 700, color: TEAL[800] }}>{currentPhase}</span>
             <span style={{ fontSize: 11, color: "#717182" }}>— {activePhase.desc}</span>
+            {/* The second label, shown ALONGSIDE the phase rather than
+                replacing it: the writer stays "Translating" while distracted,
+                which is exactly the fact the recovery summary depends on. */}
+            {isDistracted && (
+              <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, color: "#B45309", background: "#FFF3E0", padding: "2px 7px", borderRadius: 99 }}>
+                distracted
+              </span>
+            )}
           </div>
           <div style={{ display: "flex", height: 6, borderRadius: 99, overflow: "hidden" }}>
-            <div style={{ flex: 1, background: activePhase.color, transition: "background 0.5s" }} />
+            <div style={{ flex: 1, background: isDistracted ? "#F4A261" : activePhase.color, transition: "background 0.5s" }} />
           </div>
         </div>
         {/* Chosen next step (current recovery episode) */}
@@ -1654,6 +1911,369 @@ function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
   );
 }
 
+// ─── Calibration ─────────────────────────────────────────────────────────────
+// Runs ONCE PER PARTICIPANT, before their first session, and the resulting
+// profile is reused for both study arms. Re-calibrating between arms would give
+// the two conditions different baselines and weaken the paired comparison — the
+// only thing that should differ between them is the recovery prompt.
+//
+// The participant works in the real Google Doc throughout: Reviewing needs
+// genuine scroll behaviour off the Docs editor, and a baseline gathered through
+// a different input path than the session measurements would not be comparable
+// to them. The panel only drives the clock and the instructions.
+
+const CALIBRATION_SEGMENTS = [
+  {
+    phase: "Planning",
+    seconds: 180,
+    heading: "Plan",
+    instruction: "Decide your position and plan what you will write. Do not start writing the answer yet — jot notes if that is how you normally plan.",
+  },
+  {
+    phase: "Translating",
+    seconds: 300,
+    heading: "Write",
+    instruction: "Now write your answer. Focus on getting your ideas down rather than on getting them right — you will revise next.",
+  },
+  {
+    phase: "Reviewing",
+    seconds: 240,
+    heading: "Review",
+    instruction: "Now reread what you wrote and revise it. Fix wording, cut what does not work, move things around.",
+  },
+];
+
+// The order is fixed and not arbitrary: reviewing requires text to review,
+// which requires writing first.
+const CALIBRATION_TOTAL_MIN = Math.round(
+  CALIBRATION_SEGMENTS.reduce((sum, s) => sum + s.seconds, 0) / 60
+);
+
+// Testing shortcut from the options page. Kept honest rather than hidden: the
+// profile is stamped testMode and rejected by content.js, so a forgotten toggle
+// costs a re-run, never a corrupted participant.
+const CALIBRATION_TEST_SECONDS = 30;
+
+const CALIBRATION_TASK =
+  "Should university students be allowed to use generative AI tools for academic work? Explain your position and give at least two reasons.";
+
+// Matches CALIB_WARMUP_MS in content.js. Surfaced to the participant because a
+// step that visibly ignores its own first half-minute is otherwise confusing.
+const CALIBRATION_WARMUP_SEC = 30;
+
+function CalibrationScreen({ setScreen, participantId }) {
+  const [stage, setStage] = useState("intro"); // intro | running | results | error
+  const [index, setIndex] = useState(0);
+  const [remaining, setRemaining] = useState(CALIBRATION_SEGMENTS[0].seconds);
+  const [profile, setProfile] = useState(null);
+  // Initialised from the environment rather than set in an effect: the plain-
+  // browser dev preview has no document to calibrate against, so it is always a
+  // flow test, and that is knowable before the first render.
+  const [testMode, setTestMode] = useState(() => typeof chrome === "undefined" || !chrome.storage);
+  const [errorMessage, setErrorMessage] = useState("");
+  // The Docs tab is resolved ONCE at start and every later message goes to that
+  // id. Re-querying the active tab per segment would misfire if the participant
+  // happened to be looking elsewhere at a boundary.
+  const tabIdRef = useRef(null);
+  const finishedRef = useRef(false);
+  // The segment clock runs off a wall-clock deadline rather than by decrementing
+  // a counter each tick. Two reasons: a throttled or backgrounded panel would
+  // otherwise stretch the segments, and segment length is what determines how
+  // much usable data each phase yields; and transitions can then happen outside
+  // a setState updater, which React may invoke more than once.
+  const deadlineRef = useRef(0);
+  const indexRef = useRef(0);
+
+  const segments = CALIBRATION_SEGMENTS.map((s) => ({
+    ...s,
+    seconds: testMode ? CALIBRATION_TEST_SECONDS : s.seconds,
+  }));
+  const current = segments[index] ?? segments[segments.length - 1];
+
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome.storage) return;
+    chrome.storage.local.get("ff_settings", (result) => {
+      setTestMode(!!result.ff_settings?.shortCalibration);
+    });
+  }, []);
+
+  function fail(message) {
+    setErrorMessage(message);
+    setStage("error");
+  }
+
+  function begin() {
+    if (typeof chrome === "undefined" || !chrome.tabs) {
+      // Plain-browser dev preview. Still has to arm the clock: an unarmed
+      // deadline reads as already expired and skips the first segment.
+      finishedRef.current = false;
+      indexRef.current = 0;
+      deadlineRef.current = Date.now() + segments[0].seconds * 1000;
+      setIndex(0);
+      setRemaining(segments[0].seconds);
+      setStage("running");
+      return;
+    }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const active = tabs[0];
+      if (!active?.url?.startsWith("https://docs.google.com/")) {
+        fail("Open the Google Doc and make it the active tab, then try again.");
+        return;
+      }
+      tabIdRef.current = active.id;
+      chrome.tabs
+        .sendMessage(active.id, { type: "FF_CALIB_START" })
+        .then(() => chrome.tabs.sendMessage(active.id, { type: "FF_CALIB_SEGMENT", phase: segments[0].phase }))
+        .then(() => {
+          finishedRef.current = false;
+          indexRef.current = 0;
+          deadlineRef.current = Date.now() + segments[0].seconds * 1000;
+          setIndex(0);
+          setRemaining(segments[0].seconds);
+          setStage("running");
+        })
+        .catch(() => fail("Could not reach the document. If the extension was reloaded recently, refresh the Google Docs tab and try again."));
+    });
+  }
+
+  function finish() {
+    if (finishedRef.current) return; // the timer and an early finish can race
+    finishedRef.current = true;
+    if (typeof chrome === "undefined" || !chrome.tabs || tabIdRef.current === null) {
+      setStage("results");
+      return;
+    }
+    chrome.tabs
+      .sendMessage(tabIdRef.current, { type: "FF_CALIB_FINISH", participantId, testMode })
+      .then((response) => {
+        // No callback to the parent: the setup screen re-reads the profile store
+        // when it remounts, so the stored profile is the single source of truth
+        // for calibration status rather than a copy passed through React state.
+        setProfile(response?.profile ?? null);
+        setStage("results");
+      })
+      .catch(() => fail("Lost contact with the document before the profile could be saved. The calibration will need to be run again."));
+  }
+
+  function cancel() {
+    if (typeof chrome !== "undefined" && chrome.tabs && tabIdRef.current !== null) {
+      chrome.tabs.sendMessage(tabIdRef.current, { type: "FF_CALIB_CANCEL" }).catch(() => {});
+    }
+    setScreen("init");
+  }
+
+  // Advancing a segment tells the content script to close the previous one and
+  // open the next — that message is what gives the behavioural data its labels,
+  // so it must be sent exactly once per boundary. Bumping the deadline before
+  // sending makes a repeat tick a no-op.
+  function advanceSegment() {
+    const next = indexRef.current + 1;
+    if (next >= segments.length) {
+      finish();
+      return;
+    }
+    indexRef.current = next;
+    deadlineRef.current = Date.now() + segments[next].seconds * 1000;
+    setIndex(next);
+    setRemaining(segments[next].seconds);
+    if (typeof chrome !== "undefined" && chrome.tabs && tabIdRef.current !== null) {
+      chrome.tabs
+        .sendMessage(tabIdRef.current, { type: "FF_CALIB_SEGMENT", phase: segments[next].phase })
+        .catch(() => {});
+    }
+  }
+
+  // Segment clock. Polls faster than once a second so the displayed countdown
+  // stays honest if a tick is delayed, since the deadline is authoritative.
+  useEffect(() => {
+    if (stage !== "running") return;
+    // Defensive: an unarmed deadline reads as expired, which would silently skip
+    // a whole segment and shorten the calibration without any visible error.
+    if (!deadlineRef.current) {
+      deadlineRef.current = Date.now() + segments[indexRef.current].seconds * 1000;
+    }
+    const t = setInterval(() => {
+      const left = Math.max(0, Math.ceil((deadlineRef.current - Date.now()) / 1000));
+      setRemaining(left);
+      if (left === 0) advanceSegment();
+    }, 250);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage]);
+
+  const mm = String(Math.floor(remaining / 60)).padStart(2, "0");
+  const ss = String(remaining % 60).padStart(2, "0");
+  const elapsedInSegment = current.seconds - remaining;
+  const inWarmup = elapsedInSegment < CALIBRATION_WARMUP_SEC;
+
+  // ── intro ──
+  if (stage === "intro" || stage === "error") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <SidePanelHeader title="FrictionFlow" subtitle={`Calibration · ${participantId || "no ID"}`} />
+        <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+          {stage === "error" && (
+            <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
+              <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Could not start</p>
+              <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>{errorMessage}</p>
+            </div>
+          )}
+          {testMode && (
+            <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
+              <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Short calibration is on</p>
+              <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+                Steps run for {CALIBRATION_TEST_SECONDS}s each and the profile will be rejected. Turn this
+                off in the extension options before running a participant.
+              </p>
+            </div>
+          )}
+          <p style={{ margin: "0 0 12px", fontSize: 12, color: "#444", lineHeight: 1.6 }}>
+            This measures how <strong>you</strong> write, so the system compares you against your own
+            baseline instead of an average. It runs once — both of your sessions will use it.
+          </p>
+          <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Write about</p>
+          <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
+            <p style={{ margin: 0, fontSize: 12, color: TEAL[800], lineHeight: 1.5 }}>{CALIBRATION_TASK}</p>
+          </div>
+          <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
+            Three steps · {testMode ? "test lengths" : `${CALIBRATION_TOTAL_MIN} minutes total`}
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 14 }}>
+            {segments.map((s, i) => (
+              <div key={s.phase} style={{ background: "#F7FAF9", borderRadius: 9, padding: "9px 11px", border: `1px solid ${TEAL[50]}`, display: "flex", gap: 9, alignItems: "flex-start", textAlign: "left" }}>
+                <div style={{ width: 18, height: 18, borderRadius: 999, background: TEAL[50], border: `1px solid ${TEAL[200]}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                  <span style={{ fontSize: 9, fontWeight: 700, color: TEAL[600] }}>{i + 1}</span>
+                </div>
+                <div>
+                  <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: TEAL[800] }}>
+                    {s.heading} · {Math.round(s.seconds / 60) || 1} min
+                  </p>
+                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>{s.instruction}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6 }}>
+            The Google Doc must be open and in front. Write in the document as you normally would —
+            the panel will tell you when to move to the next step.
+          </p>
+        </div>
+        <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+          <Btn variant="primary" style={{ width: "100%" }} onClick={begin}>
+            {stage === "error" ? "Try again" : "Start calibration"}
+          </Btn>
+          <Btn variant="ghost" style={{ width: "100%" }} onClick={() => setScreen("init")}>Back</Btn>
+        </div>
+      </div>
+    );
+  }
+
+  // ── running ──
+  if (stage === "running") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <SidePanelHeader title="FrictionFlow" subtitle={`Step ${index + 1} of ${segments.length} · ${current.heading}`} status="Calibrating" />
+        <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+          <div style={{ background: "#F7FAF9", borderRadius: 12, padding: "14px 20px", textAlign: "center", marginBottom: 14, border: `1px solid ${TEAL[50]}` }}>
+            <p style={{ margin: 0, fontSize: 11, color: "#717182", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{current.heading}</p>
+            <p style={{ margin: 0, fontSize: 34, fontWeight: 700, color: TEAL[800], fontVariantNumeric: "tabular-nums" }}>{mm}:{ss}</p>
+          </div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 14 }}>
+            {segments.map((s, i) => (
+              <div key={s.phase} style={{ flex: s.seconds, height: 6, borderRadius: 99, background: i < index ? TEAL[400] : i === index ? TEAL[200] : TEAL[50] }} />
+            ))}
+          </div>
+          <div style={{ background: TEAL[50], borderRadius: 10, padding: "12px 13px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
+            <p style={{ margin: 0, fontSize: 12, color: TEAL[800], lineHeight: 1.6 }}>{current.instruction}</p>
+          </div>
+          {/* Told plainly rather than hidden: a participant who notices the
+              system ignoring its own opening seconds should know it is
+              deliberate, not a fault. */}
+          {inWarmup && (
+            <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.6 }}>
+              Settling in — the first {CALIBRATION_WARMUP_SEC} seconds of each step are not measured, so just
+              begin naturally.
+            </p>
+          )}
+          <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Writing about</p>
+          <p style={{ margin: 0, fontSize: 11, color: "#717182", lineHeight: 1.6 }}>{CALIBRATION_TASK}</p>
+        </div>
+        <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+          {/* No skip-ahead control by design — a shortened segment would produce
+              a profile that looks valid but is not. Cancelling is clean: no
+              profile is written at all. */}
+          <Btn variant="danger" style={{ width: "100%" }} onClick={cancel}>Cancel calibration</Btn>
+        </div>
+      </div>
+    );
+  }
+
+  // ── results ──
+  const valid = profile?.valid;
+  const d = profile?.display;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <SidePanelHeader title="FrictionFlow" subtitle={`Calibration complete · ${participantId || "no ID"}`} />
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
+        {valid && d ? (
+          <>
+            <p style={{ margin: "0 0 12px", fontSize: 12, color: "#444", lineHeight: 1.6 }}>
+              These are your own numbers, measured just now. FrictionFlow will compare you against
+              these rather than against an average writer.
+            </p>
+            {[
+              { label: "Your writing speed", value: `${d.writingWpm} WPM`, note: "while drafting" },
+              { label: "Your reviewing speed", value: `${d.reviewingWpm} WPM`, note: "while revising" },
+              { label: "Your natural pause", value: `~${d.typicalPauseSec}s`, note: "before a gap counts as unusual" },
+            ].map((row) => (
+              <div key={row.label} style={{ background: "#F7FAF9", borderRadius: 10, padding: "11px 12px", border: `1px solid ${TEAL[50]}`, marginBottom: 8 }}>
+                <p style={{ margin: 0, fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.06em" }}>{row.label}</p>
+                <p style={{ margin: "3px 0 0", fontSize: 20, fontWeight: 700, color: TEAL[800] }}>{row.value}</p>
+                <p style={{ margin: "1px 0 0", fontSize: 11, color: "#717182" }}>{row.note}</p>
+              </div>
+            ))}
+            <p style={{ margin: "12px 0 0", fontSize: 11, color: "#717182", lineHeight: 1.6 }}>
+              Saved for {participantId}. Both sessions will use this profile — you will not need to
+              do this again.
+            </p>
+          </>
+        ) : (
+          <>
+            <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "11px 12px", marginBottom: 14 }}>
+              <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Calibration could not be used</p>
+              <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+                Sessions will run on the default thresholds instead. This is recorded in the
+                exported data, so the difference stays visible in the analysis.
+              </p>
+            </div>
+            {/* Named reasons, not a generic failure: the researcher needs to know
+                whether to re-run or whether the participant misread a step. */}
+            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Why</p>
+            <ul style={{ margin: "0 0 4px", paddingLeft: 18, textAlign: "left" }}>
+              {(profile?.failures ?? ["The profile was not returned."]).map((f) => (
+                <li key={f} style={{ fontSize: 11, color: "#444", lineHeight: 1.7 }}>
+                  {{
+                    "test-mode-calibration": "Short calibration was enabled — this run was a flow test, not a real profile.",
+                    "translating-not-faster-than-reviewing": "No more typing happened in the writing step than in the reviewing step, so the steps cannot be told apart.",
+                    "insufficient-text": "Too little text was written during the writing step to measure anything from.",
+                    "missing-segment": "One of the three steps was not recorded.",
+                  }[f] ?? f}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+      <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 8 }}>
+        <Btn variant="primary" style={{ width: "100%" }} onClick={() => setScreen("init")}>Continue to task setup →</Btn>
+        <Btn variant="ghost" style={{ width: "100%" }} onClick={() => { setProfile(null); finishedRef.current = false; indexRef.current = 0; setIndex(0); setStage("intro"); }}>
+          Run calibration again
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 // ─── Screen 7: Post-session questionnaires ───────────────────────────────────
 
 // One row of discrete choices. Used for FSS (1-7, numbered) and UEQ-S (-3..+3,
@@ -1790,14 +2410,21 @@ function AnalyticsScreen({ setScreen, summary }) {
   const breakSecs = Math.floor((s.totalBreakMs ?? 0) / 1000);
   // Time the Docs tab was closed/away (fully offline, untracked).
   const interruptedSecs = Math.floor((s.totalInterruptedMs ?? 0) / 1000);
-  // Writing time = Planning + Translating + Reviewing — all three cognitive
-  // writing processes in Flower & Hayes (1981), i.e. total on-task time; only
-  // Distracted is excluded (breaks and offline aren't phases). Each phase also
-  // shows as its own slice in the breakdown below, so nothing is hidden.
+  // The three Flower & Hayes processes partition the tracked session; distracted
+  // time sits INSIDE them and is subtracted to get on-task time. (Breaks and
+  // offline aren't phases and are counted separately.) Each phase still shows
+  // as its own slice below, with its distracted portion marked, so nothing is
+  // hidden by the subtraction.
   const planningSecs = Math.round((s.phaseDurationsMs?.Planning ?? 0) / 1000);
   const translatingSecs = Math.round((s.phaseDurationsMs?.Translating ?? 0) / 1000);
   const reviewingSecs = Math.round((s.phaseDurationsMs?.Reviewing ?? 0) / 1000);
-  const writingSecs = planningSecs + translatingSecs + reviewingSecs;
+  const distractedInPhase = {
+    Planning: Math.round((s.distractedDurationsMs?.Planning ?? 0) / 1000),
+    Translating: Math.round((s.distractedDurationsMs?.Translating ?? 0) / 1000),
+    Reviewing: Math.round((s.distractedDurationsMs?.Reviewing ?? 0) / 1000),
+  };
+  const distractedSecs = distractedInPhase.Planning + distractedInPhase.Translating + distractedInPhase.Reviewing;
+  const writingSecs = Math.max(0, planningSecs + translatingSecs + reviewingSecs - distractedSecs);
 
   function fmt(seconds) {
     const m = Math.floor(seconds / 60);
@@ -1825,8 +2452,8 @@ function AnalyticsScreen({ setScreen, summary }) {
   // ── Values used only by the hover breakdowns ──
   // The tiles show one headline number each; the adviser asked for the
   // components behind them to be inspectable without opening the export.
-  // (planningSecs is declared above, since writingSecs now needs it.)
-  const distractedSecs = Math.round((s.phaseDurationsMs?.Distracted ?? 0) / 1000);
+  // (planningSecs and distractedSecs are declared above, since writingSecs
+  // now needs both.)
   const tabAwaySecs = Math.round((s.totalTabAwayMs ?? 0) / 1000);
   // Only CLOSED episodes are in this array, so it's the recovered set.
   const episodes = s.distractionEpisodes ?? [];
@@ -1852,11 +2479,15 @@ function AnalyticsScreen({ setScreen, summary }) {
       } },
     { label: "Writing time", value: fmt(writingSecs), icon: "✍️",
       detail: {
+        // On-task time per phase: the phase total minus the distracted stretch
+        // inside it. Showing the raw phase totals here would no longer sum to
+        // the headline, since the headline now nets out distraction.
         rows: [
-          { label: "Planning", value: fmt(planningSecs) },
-          { label: "Translating (drafting)", value: fmt(translatingSecs) },
-          { label: "Reviewing (revising)", value: fmt(reviewingSecs) },
+          { label: "Planning", value: fmt(Math.max(0, planningSecs - distractedInPhase.Planning)) },
+          { label: "Translating (drafting)", value: fmt(Math.max(0, translatingSecs - distractedInPhase.Translating)) },
+          { label: "Reviewing (revising)", value: fmt(Math.max(0, reviewingSecs - distractedInPhase.Reviewing)) },
         ],
+        note: "On-task only — distracted time inside each phase is excluded here and counted under Distractions.",
       } },
     // No hover: the whole-document count speaks for itself, and its parts
     // (prompt vs added) overlapped the Typed words tile. Renders as a plain,
@@ -1909,12 +2540,18 @@ function AnalyticsScreen({ setScreen, summary }) {
           // come from closed episodes only, so they sum to recovered. Listed
           // flat they looked like a breakdown of occurrences that didn't add up.
           { label: "Left the tab", value: triggerCount("tab-away"), indent: true },
-          { label: "Idle on the doc", value: triggerCount("idle"), indent: true },
-          { label: "Rapid switching", value: triggerCount("rapid-switch"), indent: true },
+          { label: "Stalled completely", value: triggerCount("severe-stall"), indent: true },
+          { label: "Drifted (2+ signals)", value: triggerCount("deviation"), indent: true },
           // Tab switch COUNT was dropped: most switches never become a
           // distraction, so it isn't a breakdown of this tile. Time off-tab
           // stays — it quantifies the dominant trigger above it.
           { label: "Time off-tab", value: fmt(tabAwaySecs) },
+          // Which phase the distraction interrupted — only expressible now that
+          // the phase survives the distraction instead of being replaced by it.
+          { label: "Distracted while…", value: fmt(distractedSecs) },
+          { label: "Planning", value: fmt(distractedInPhase.Planning), indent: true },
+          { label: "Translating", value: fmt(distractedInPhase.Translating), indent: true },
+          { label: "Reviewing", value: fmt(distractedInPhase.Reviewing), indent: true },
         ],
       } },
     // Guard on RECOVERED episodes (not occurrences): if the only distraction was
@@ -1932,34 +2569,51 @@ function AnalyticsScreen({ setScreen, summary }) {
     // No detail: the only thing to say is the number already on the tile.
     ...(interruptedSecs > 0 ? [{ label: "Offline", value: fmt(interruptedSecs), icon: "🔌" }] : []),
   ];
-  const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200], Distracted: "#F4A261" };
-  const PHASE_ORDER = ["Planning", "Translating", "Reviewing", "Distracted"];
+  const PHASE_COLORS = { Planning: TEAL[100], Translating: TEAL[400], Reviewing: TEAL[200] };
+  const PHASE_ORDER = ["Planning", "Translating", "Reviewing"];
+  const DISTRACTED_COLOR = "#F4A261";
 
   const phaseDurationsMs = s.phaseDurationsMs ?? {};
   const totalPhaseMs = PHASE_ORDER.reduce((sum, label) => sum + (phaseDurationsMs[label] ?? 0), 0);
 
+  // Each phase is one slice, sized by its TOTAL time, carrying the distracted
+  // portion as an amber sub-slice inside it. Distraction is no longer a fourth
+  // peer slice — it is a state that happened during one of these three, and the
+  // chart says which.
   const phases = totalPhaseMs > 0
     ? PHASE_ORDER
         .filter(label => (phaseDurationsMs[label] ?? 0) > 0)
-        .map(label => ({
-          label,
-          pct: Math.round((phaseDurationsMs[label] / totalPhaseMs) * 100),
-          color: PHASE_COLORS[label],
-        }))
+        .map(label => {
+          const totalMs = phaseDurationsMs[label];
+          const distMs = Math.min(s.distractedDurationsMs?.[label] ?? 0, totalMs);
+          return {
+            label,
+            pct: Math.round((totalMs / totalPhaseMs) * 100),
+            distractedPct: Math.round((distMs / totalMs) * 100),
+            color: PHASE_COLORS[label],
+          };
+        })
     : [];
 
   const dominantPhase = phases.length > 0
     ? phases.reduce((max, p) => (p.pct > max.pct ? p : max))
     : null;
+  // Replaces the old "dominant phase === Distracted" check, which cannot happen
+  // now that Distracted is not a phase. Half the tracked time spent distracted
+  // is the equivalent signal.
+  const mostlyDistracted = totalPhaseMs > 0 && distractedSecs * 1000 > totalPhaseMs / 2;
 
   // Which tile's breakdown is showing (by label; null = none).
   const [openStat, setOpenStat] = useState(null);
   const [downloaded, setDownloaded] = useState(false);
   function handleExport() {
-    const { json, csv, base } = buildSessionExport(s);
+    const { json, csv, traceCsv, base } = buildSessionExport(s);
     downloadFile(`${base}.json`, JSON.stringify(json, null, 2), "application/json");
-    // Small stagger so the browser reliably fires both downloads in a row.
+    // Small stagger so the browser reliably fires the downloads in a row.
     setTimeout(() => downloadFile(`${base}.csv`, csv, "text/csv"), 400);
+    // Long-format, one row per classifier tick. Absent only if no trace was
+    // recorded (a session from before this existed, or one that never ticked).
+    if (traceCsv) setTimeout(() => downloadFile(`${base}_trace.csv`, traceCsv, "text/csv"), 800);
     setDownloaded(true);
     // Stamp the persisted copy as retrieved, so the setup screen stops flagging
     // it as an un-downloaded session.
@@ -2047,7 +2701,15 @@ function AnalyticsScreen({ setScreen, summary }) {
           {phases.length > 0 ? (
             <>
               <div style={{ display: "flex", height: 10, borderRadius: 99, overflow: "hidden", gap: 2, marginBottom: 8 }}>
-                {phases.map(p => <div key={p.label} style={{ flex: p.pct, background: p.color }} />)}
+                {phases.map(p => (
+                  // Each phase slice is itself split: the distracted portion is
+                  // drawn amber at the tail of its own phase, so the reader sees
+                  // both how long the phase ran and how much of it was lost.
+                  <div key={p.label} style={{ flex: p.pct, display: "flex" }}>
+                    <div style={{ flex: 100 - p.distractedPct, background: p.color }} />
+                    {p.distractedPct > 0 && <div style={{ flex: p.distractedPct, background: DISTRACTED_COLOR }} />}
+                  </div>
+                ))}
               </div>
               <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
                 {phases.map(p => (
@@ -2056,6 +2718,12 @@ function AnalyticsScreen({ setScreen, summary }) {
                     <span style={{ fontSize: 10, color: "#717182" }}>{p.label} {p.pct}%</span>
                   </div>
                 ))}
+                {distractedSecs > 0 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: DISTRACTED_COLOR }} />
+                    <span style={{ fontSize: 10, color: "#717182" }}>Distracted (within phases)</span>
+                  </div>
+                )}
               </div>
             </>
           ) : (
@@ -2064,12 +2732,12 @@ function AnalyticsScreen({ setScreen, summary }) {
         </div>
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}` }}>
           <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, color: TEAL[800] }}>
-            {dominantPhase && dominantPhase.label !== "Distracted" ? "Great session!" : "Session complete"}
+            {dominantPhase && !mostlyDistracted ? "Great session!" : "Session complete"}
           </p>
           <p style={{ margin: 0, fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
             {!dominantPhase
               ? "Start a new session to build up your phase breakdown."
-              : dominantPhase.label === "Distracted"
+              : mostlyDistracted
                 ? "Most of this session was spent away from the task — shorter sessions or fewer open tabs might help next time."
                 : `You spent most of your time in the ${dominantPhase.label.toLowerCase()} phase${dominantPhase.label === "Translating" ? " — a sign of productive flow." : "."}`}
           </p>
@@ -2102,9 +2770,11 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef, calibrationParticipantId, setCalibrationParticipantId }) {
   const screenMap = {
-    init: <TaskInitScreen onStart={(mode) => {
+    init: <TaskInitScreen
+      onCalibrate={(pid) => { setCalibrationParticipantId(pid); setScreen("calibration"); }}
+      onStart={(mode) => {
       setHasRecoverySummary(false);
       setShowDistractionPrompt(false);
       promptSuppressUntilRef.current = 0;
@@ -2119,8 +2789,10 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
         // Fresh start: handleStartTask already clears ff_interrupted.
         setScreen("contextPrep");
       }
-    }}/>,
+    }}
+    />,
     contextPrep: <ContextPrepScreen setScreen={setScreen} />,
+    calibration: <CalibrationScreen setScreen={setScreen} participantId={calibrationParticipantId} />,
     monitoring: <ActiveMonitoringScreen
       setScreen={setScreen}
       setSummary={setSummary}
@@ -2181,6 +2853,10 @@ export default function App() {
   // because it's set in ActiveMonitoringScreen and read in BreakScreen —
   // it decides pause-vs-break accounting and summary-generation timing.
   const breakOriginRef = useRef("voluntary");
+  // Carried from the setup screen into calibration so the profile is filed
+  // under the right participant. Calibration runs before ff_task exists, so
+  // there is no stored task to read the id from.
+  const [calibrationParticipantId, setCalibrationParticipantId] = useState("");
 
   // On popup open, check storage to decide the correct starting screen:
   // - ff_interrupted = true means the Docs tab was closed mid-session → init with interrupted notice
@@ -2223,6 +2899,8 @@ export default function App() {
           promptSuppressUntilRef={promptSuppressUntilRef}
           lastDistractionOnsetRef={lastDistractionOnsetRef}
           breakOriginRef={breakOriginRef}
+          calibrationParticipantId={calibrationParticipantId}
+          setCalibrationParticipantId={setCalibrationParticipantId}
         />
       </div>
     </div>

@@ -19,11 +19,63 @@ const TAB_AWAY_THRESHOLD_MS = 60000;      // single tab-away tolerated up to thi
                                           // it the away-stretch is Distracted. Short reference
                                           // hops are free — frequency (above) catches repeats.
 const REVIEW_SIGNAL_WINDOW_MS = 60000;    // rolling window for revision signals (Reviewing rule)
-const DELETE_REVIEW_THRESHOLD = 5;        // >=5 deletions in the window (with low WPM) = revising,
-                                          // not typo-fixing — flow typos co-occur with high WPM,
-                                          // which the WPM gate already excludes
-const SELECT_REVIEW_THRESHOLD = 2;        // >=2 distinct selection gestures in the window =
-                                          // deliberate text manipulation, not a stray click
+const ACTIVITY_WINDOW_MS = 60000;         // rolling window for the interaction-rate deviation signal
+
+// ─── Two-label state model (see CALIBRATION_SPEC.md §8) ────────────────────
+// PHASE is always one of Planning | Translating | Reviewing — never erased.
+// ATTENTION is Focused | Distracted, evaluated against the CURRENT PHASE's
+// calibrated baseline. Distraction is not a fourth phase: it is a condition
+// that can occur during any of the three (Flower & Hayes describe three
+// processes, not four), and keeping the two separate is what lets a 60s pause
+// be normal while Planning and a stall while Translating.
+const DEVIATION_FAMILIES_REQUIRED = 2;    // families that must fire together to enter Distracted
+const SEVERE_STALL_MULTIPLIER = 3;        // inactivity beyond this x IDLE_<phase> stands alone
+const RATE_DEVIATION_FRACTION = 0.25;     // interaction rate below this x the phase baseline = deviation
+
+// ─── Calibration capture (see CALIBRATION_SPEC.md §5-§6) ───────────────────
+// The participant works through three instructed segments in the real
+// document, so the baseline is produced by the SAME listeners, debounces and
+// rolling windows that produce the session measurements.
+const CALIB_WARMUP_MS = 30000;            // discarded from the head of each segment
+const CALIB_PAUSE_FLOOR_MS = 2000;        // a gap below this is typing rhythm, not a pause
+const CALIB_MAD_MULTIPLIER = 3;           // idle threshold = median + 3 x MAD
+const CALIB_SAMPLE_MS = 2000;             // WPM sampling cadence — matches the classifier's
+const CALIB_IDLE_MIN_SEC = 15;            // clamp: below this a pause isn't disengagement
+const CALIB_IDLE_MAX_SEC = 180;           // clamp: above this the threshold is unusable
+const CALIB_BURST_MIN_SEC = 3;            // clamp on the derived burst minimum
+const CALIB_BURST_MAX_SEC = 30;
+const CALIB_MIN_PAUSES = 5;               // fewer than this: fall back for that phase only
+const CALIB_MIN_TRANSLATING_KEYS = 100;   // less text than this: the whole profile is rejected
+
+// Profiles are stored as a MAP keyed by participant id, not as a single
+// profile. A single-profile key loses P01's baseline the moment P02
+// calibrates — and because the study is within-subjects, each participant runs
+// TWO sessions that may be days apart with other participants in between. The
+// second session would then quietly fall back to default thresholds while the
+// panel still showed the participant as calibrated.
+const CALIBRATION_STORE_KEY = "ff_calibrations";
+
+// Per-participant thresholds, populated from the calibration profile at
+// session start. These defaults are the FALLBACK used when no profile exists
+// (dev testing, a pre-calibration session, or a profile that failed the
+// validity guards) — every value is the constant this system used before
+// calibration, except idleSec.
+//
+// idleSec defaults to 40 (not the old 120) because the severe-stall tier sits
+// at SEVERE_STALL_MULTIPLIER x idleSec: 3 x 40 = 120s reproduces the previous
+// behaviour exactly, while still giving the two-family rule a mild tier to
+// work with. The default is derived from the old system, not chosen freely.
+const DEFAULT_THRESHOLDS = {
+  wpmGate: 10,          // separates Translating from Reviewing/Planning
+  burstMinSec: 10,      // minimum burst length to count as Translating
+  deleteGate: 5,        // deletions/min indicating revision
+  scrollGate: 5,        // scroll events/min indicating rereading
+  idleSec:  { Planning: 40, Translating: 40, Reviewing: 40 },
+  // Per-phase interaction rate (events/min) from calibration. null disables
+  // the Rate deviation family for that phase — with no baseline there is
+  // nothing to deviate from, so the fallback runs on Time + Environment only.
+  activityRate: { Planning: null, Translating: null, Reviewing: null },
+};
 
 
 //------------------- State --------------------------//
@@ -102,17 +154,84 @@ let wordSyncInFlight = false; // true while a Docs API word-count request is pen
 // can reconnect instead of silently getting keystroke-only word counts.
 let docsConnected = false;
 
-// Phase Duration Variables — accumulated ms spent in each classified phase
-let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+// Active thresholds for this session. Replaced wholesale by the participant's
+// calibration profile at startTracking; stays at DEFAULT_THRESHOLDS otherwise.
+let thresholds = structuredClone(DEFAULT_THRESHOLDS);
+let calibrationValid = false;     // true only when a valid profile was loaded
+let calibrationProfileId = null;  // participant id the profile belongs to, for the export
+
+// Interaction timestamps for the Rate deviation family. Distinct from
+// keyStrokeTimeStamps: this counts EVERY interaction (keystroke, scroll,
+// selection gesture), because "still present but barely doing anything" is a
+// different question from "typing slowly" — and during Planning, where typing
+// is near zero by definition, it is the only rate question worth asking.
+let activityTimeStamps = [];
+
+// ── Phase channel ──
+// Accumulated ms in each of the three writing processes. There is no
+// Distracted bucket: distraction is tracked on its own axis below and OVERLAPS
+// these, so time in phase stays a complete partition of the tracked session.
+let phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0 };
 let currentTrackedPhase = null;
-let phaseSegmentStartTime = null;
-// The most recent NON-Distracted phase — i.e. what the writer was doing right
-// before a distraction began. Passed to the LLM so recovery guidance can be
-// tailored to the interrupted cognitive state (Flower & Hayes): planning →
-// re-orient to the goal, translating → the unfinished sentence, reviewing →
-// the revision in progress. currentPhase can't answer this: at generation time
-// it is "Distracted", which says nothing about what was interrupted.
-let lastActivePhase = null;
+
+// ── Attention channel ──
+// Distracted ms WITHIN each phase — a subset of phaseDurationsMs, not a peer.
+// This is what yields "time distracted, by phase", which the previous
+// four-way model could not express: once it labelled you Distracted, the
+// phase you were distracted *from* had already been overwritten.
+let distractedDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0 };
+let currentAttention = "Focused";
+let attentionFamilies = [];       // families that fired on the last evaluation
+let attentionTrigger = null;      // what caused the current Distracted state
+
+// ── Calibration state ──
+// Active only between FF_CALIB_START and FF_CALIB_FINISH, and never at the same
+// time as a tracked session: calibration runs before the writing task, so
+// isTracking stays false throughout and no ff_session data is produced.
+let calibrationMode = false;
+let calibSegments = [];        // completed segments, each fully recorded
+let calibCurrent = null;       // the segment being recorded right now
+let calibSampleIntervalId = null;
+
+// ── Decision trace ──
+// One row per classifier tick holding the RAW MEASUREMENTS alongside the
+// decision they produced. Without the inputs, a saved decision cannot be
+// re-derived: "Translating" is a conclusion, and no threshold set can be
+// replayed against it. Keeping them is what makes the study able to ask, after
+// the fact, what the SAME session would have been classified as under the fixed
+// pre-calibration thresholds — scored against the same screen-recording ground
+// truth, which is the paired comparison that shows whether calibration helped.
+//
+// Rows are arrays, not objects, so the field names are not repeated 1,500 times
+// (a 50-minute session is ~1,500 ticks). TRACE_COLUMNS travels with the export
+// so the file stays self-describing.
+const TRACE_COLUMNS = [
+  "tMs",                // ms since session start
+  "phase",              // Planning | Translating | Reviewing
+  "attention",          // Focused | Distracted
+  "wpm",                // rolling WPM, 30s window
+  "inactiveSec",        // since ANY interaction — what the Time family tests
+  "scrollPerMin",
+  "deletePerMin",
+  "activityPerMin",     // interactions/min — what the Rate family tests
+  "burstSec",           // current typing burst length
+  "tabSwitchesPerMin",
+  "hidden",             // 1 while the tab is not visible
+  "families",           // deviation families firing, "+"-joined
+];
+const TRACE_FLUSH_EVERY_TICKS = 5;   // persist every ~10s rather than every tick
+const TRACE_MAX_ROWS = 6000;         // ~3.3h; guards memory if a session is left running
+
+let decisionTrace = [];
+let traceTruncated = false;
+let traceTickCounter = 0;
+
+// Timestamp of the last time-accumulation tick. Elapsed time is banked into
+// the phase bucket (and the distracted bucket when distracted) on every tick,
+// rather than only on transitions — with two overlapping channels a
+// transition-based scheme would need to track two independent segment starts
+// and reconcile them.
+let lastAccumTime = null;
 
 // Distraction Episode Variables — one entry per completed "Distracted" phase
 // episode: { startedAt, endedAt, durationMs, trigger, resumptionMs }.
@@ -138,6 +257,28 @@ let wordSyncIntervalId = null;
 //------------------- Helper -----------------------------//
 function isPrintable(key) {
   return key.length === 1;
+}
+
+// ── Robust statistics for calibration ──
+function median(values) {
+  if (!values || values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+// Median absolute deviation. Used instead of the standard deviation because,
+// unlike SD, it is not inflated by the very outliers it exists to detect —
+// which matters at these sample sizes (a Planning segment may yield fewer than
+// ten pauses). Leys, Ley, Klein, Bernard & Licata (2013).
+function mad(values) {
+  const med = median(values);
+  if (med === null) return null;
+  return median(values.map((v) => Math.abs(v - med)));
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function rollingWPM() {
@@ -166,6 +307,28 @@ function rollingSelectionFrequency() {
   return selectionTimeStamps.length;
 }
 
+// Interaction events per minute over the rolling window — the Rate deviation
+// family's live measure, compared against the phase's calibrated baseline.
+function rollingActivityFrequency() {
+  const cutOff = Date.now() - ACTIVITY_WINDOW_MS;
+  while (activityTimeStamps.length > 0 && activityTimeStamps[0] < cutOff) {
+    activityTimeStamps.shift();
+  }
+  return activityTimeStamps.length * (60000 / ACTIVITY_WINDOW_MS);
+}
+
+// Single entry point for "the participant did something". Every interaction
+// route (keystroke, scroll, selection gesture, tab return) goes through here so
+// the idle clock and the interaction-rate window can never disagree about what
+// counts as activity — the Time family reads lastActivityTime and the Rate
+// family reads activityTimeStamps, and a signal recorded in one but not the
+// other would make the two families silently inconsistent.
+function markActivity(now) {
+  lastActivityTime = now;
+  activityTimeStamps.push(now);
+  isTyping = true;
+}
+
 // Debounced: a held shift+arrow fires keydown repeats many times per second,
 // but one continuous extend-the-selection motion is ONE gesture. Signals
 // less than 1s apart merge into the previous gesture.
@@ -177,8 +340,15 @@ function pushSelectionSignal(now) {
     totalSelections++;
   }
   // Selecting text is engagement — keep it from reading as idle.
-  lastActivityTime = now;
-  isTyping = true;
+  markActivity(now);
+  calibRecord("selections", now);
+}
+
+// Appends an event to the segment currently being recorded. A no-op outside
+// calibration, so the live listeners can call it unconditionally.
+function calibRecord(kind, at) {
+  if (!calibrationMode || !calibCurrent) return;
+  calibCurrent[kind].push(at);
 }
 
 function rollingTabSwitchFrequency() {
@@ -272,6 +442,9 @@ function isExtensionContextValid() {
 // in-flight event listeners (keydown/scroll/visibilitychange) become no-ops.
 // Called once, the first time we detect the extension context has died.
 function stopAllTracking() {
+  // Calibration runs on its own interval and is stopped unconditionally: a dead
+  // extension context must not leave a sampler running in the page.
+  stopCalibration();
   if (!isTracking) return; // already stopped, avoid double logging
   isTracking = false;
 
@@ -292,16 +465,18 @@ function stopAllTracking() {
 // Wraps a chrome.storage.local call so that if the extension context has
 // been invalidated, we stop tracking cleanly instead of throwing on every
 // interval tick.
-function safeStorageSet(payload) {
+function safeStorageSet(payload, callback) {
   if (!isExtensionContextValid()) {
     stopAllTracking();
+    if (typeof callback === "function") callback();
     return;
   }
   try {
-    chrome.storage.local.set(payload);
+    chrome.storage.local.set(payload, callback);
   } catch (e) {
     // Context died between the check above and this call — stop here too.
     stopAllTracking();
+    if (typeof callback === "function") callback();
   }
 }
 
@@ -318,103 +493,208 @@ function safeStorageGet(keys, callback) {
 }
 
 
-//------------------ Phase Detection -------------------//
+//------------------ Phase & Attention Detection -------------------//
+// Two independent channels, both recomputed on the 2s interval. The phase
+// channel runs first; the attention channel then evaluates against THAT
+// phase's calibrated baseline.
+
+// PHASE — three-way. Every "Distracted" branch that used to live here has
+// moved into assessAttention, because being distracted should not erase what
+// the participant was doing.
+//
+// Planning is the residual state, which is what it always was in substance:
+// the old `pause > 15s && WPM < 10` rule and the `default → Planning`
+// fallthrough collapsed to the same answer, so that threshold is gone rather
+// than calibrated. It is also the theoretically correct default — pausing
+// mid-draft to work out the next sentence IS a shift into planning under
+// Flower & Hayes' recursive model.
+//
+// Selection gestures no longer feed this rule (see CALIBRATION_SPEC.md §6.3):
+// the weakest of the three revision signals, redundant with the delete rate,
+// and itself only a proxy for something Docs' canvas rendering hides. Gestures
+// are still logged — they count as activity, and the session total is exported.
 function classifyPhase(scrollFreq) {
   const now = Date.now();
-  const currentPauseSec = lastKeyTime ? Math.round((now - lastKeyTime) / 1000) : 0;
   const currentBurstSec = burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0;
+  const wpm = rollingWPM();
 
-  // Distracted — away from tab or long idle. Note: the phase (and with it
-  // the Gentle Reminder) flips back as soon as the user returns to the doc,
-  // but the distraction EPISODE stays open until the first keystroke — see
-  // finalizeDistractionEpisode, called from the keydown handler. Phase
-  // drives the UI; the episode drives the H1 resumption measurement.
-  // A single tab-away is tolerated up to TAB_AWAY_THRESHOLD_MS (quick
-  // reference checks shouldn't flag) — beyond that the away-stretch is
-  // Distracted. While hidden, Chrome throttles our intervals to ~1/min,
-  // which still evaluates this rule in time for any meaningful away-stretch;
-  // repeated short hops are caught by the rapid-switch rule below instead.
-  if (document.hidden && tabHiddenAt !== null && now - tabHiddenAt > TAB_AWAY_THRESHOLD_MS) return "Distracted";
-  if (currentPauseSec > 120) return "Distracted";
+  // Reviewing — rereading or revising while production typing is low: heavy
+  // scrolling (evaluating a long doc), or a run of deletions (pruning text —
+  // flow typo-fixes co-occur with high WPM, which the gate excludes).
+  if ((scrollFreq >= thresholds.scrollGate || rollingDeleteFrequency() >= thresholds.deleteGate)
+      && wpm < thresholds.wpmGate) return "Reviewing";
 
-  // Distracted — rapid tab switching: >= RAPID_SWITCH_THRESHOLD switches in
-  // the rolling window means attention is fragmented even while on the doc
-  // (a switch every ~20s never lets focus rebuild). WPM guard: a writer
-  // typing at speed is Translating regardless of recent switches — without
-  // it the panel would show "Distracted" through genuine writing.
-  if (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD && rollingWPM() < 10) return "Distracted";
+  // Translating — actively typing at pace, within a sustained burst.
+  if (wpm >= thresholds.wpmGate && currentBurstSec >= thresholds.burstMinSec) return "Translating";
 
-  // Reviewing — rereading OR revising while production typing is low:
-  // heavy scrolling (evaluating a long doc), a run of deletions (pruning
-  // text — flow typo-fixes co-occur with high WPM, which the gate excludes),
-  // or repeated selection gestures (deliberate text manipulation). Any one
-  // signal suffices; each threshold is individually meaningful.
-  if (
-    (scrollFreq >= 5 ||
-      rollingDeleteFrequency() >= DELETE_REVIEW_THRESHOLD ||
-      rollingSelectionFrequency() >= SELECT_REVIEW_THRESHOLD) &&
-    rollingWPM() < 10
-  ) return "Reviewing";
-
-  // Planning — pausing but still on the doc, low WPM, short bursts
-  if (currentPauseSec > 15 && rollingWPM() < 10) return "Planning";
-
-  // Translating — actively typing, decent WPM, sustained burst
-  if (rollingWPM() >= 10 && currentBurstSec >= 10) return "Translating";
-
-  // Default fallback
   return "Planning";
 }
 
-// Re-classifies the phase and rolls the elapsed time since the last check
-// into the previous phase's running total. Must be called on a fixed
-// interval regardless of typing activity — otherwise a silent pause never
-// gets re-classified (e.g. into "Distracted") because classifyPhase would
-// only ever run inside the activity-gated flush.
-function updatePhaseTracking() {
-  const phase = classifyPhase(rollingScrollFrequency());
+// ATTENTION — Focused | Distracted, judged against the CURRENT phase's
+// baseline. Signals are grouped into FAMILIES and two different families must
+// fire together, so no single deviation flags a participant (a long pause is
+// ordinary during Planning; a burst of tab switches is ordinary mid-research).
+//
+// Grouping by family rather than counting signals flatly prevents
+// double-counting near-identical evidence: "no keystroke for 40s" and "no
+// interaction for 40s" are effectively one observation and must not satisfy a
+// two-signal rule between them.
+//
+//   Time        — no interaction of ANY kind for longer than IDLE_<phase>
+//   Rate        — interaction rate collapsed vs the phase's calibrated baseline
+//   Environment — rapid tab switching
+//
+// The Rate family deliberately measures INTERACTIONS, not words: a "no text
+// produced" signal would be true almost continuously during Planning, whose
+// definition is producing no text, and a signal that is definitionally true in
+// a phase carries no information in that phase. It is also why the Time family
+// reads lastActivityTime rather than lastKeyTime — a writer who is genuinely
+// planning is still present (rereading, scrolling, moving the cursor), while
+// one who has disengaged produces no interaction at all. That distinction is
+// the only thing that separates the two during Planning.
+function assessAttention(phase) {
   const now = Date.now();
+  const idleMs = (thresholds.idleSec[phase] ?? DEFAULT_THRESHOLDS.idleSec[phase]) * 1000;
+  const inactiveMs = now - lastActivityTime;
 
-  // Remember what they were doing while they're still doing it. Once the phase
-  // flips to Distracted this stops updating, so it holds the interrupted phase
-  // for the episode that starts below.
-  if (phase !== "Distracted") lastActivePhase = phase;
-
-  if (currentTrackedPhase === null) {
-    currentTrackedPhase = phase;
-    phaseSegmentStartTime = now;
-    if (phase === "Distracted") startDistractionEpisode(now);
-    return;
+  // ── Categorical triggers — sufficient on their own ──
+  // Not deviations from a baseline: direct evidence the participant is not
+  // working. A single tab-away is still tolerated up to TAB_AWAY_THRESHOLD_MS
+  // so quick reference checks don't flag.
+  if (document.hidden && tabHiddenAt !== null && now - tabHiddenAt > TAB_AWAY_THRESHOLD_MS) {
+    return { distracted: true, trigger: "tab-away", families: ["tab-away"] };
+  }
+  // Severe stall. Without this tier a participant who disengages during
+  // Planning without touching another tab fires only the Time family — one
+  // family, never enough — and would never be flagged at all. At the default
+  // idleSec of 40s this lands at 120s, exactly the old global idle rule.
+  if (inactiveMs > idleMs * SEVERE_STALL_MULTIPLIER) {
+    return { distracted: true, trigger: "severe-stall", families: ["severe-stall"] };
   }
 
-  if (phase !== currentTrackedPhase) {
-    phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
+  // ── Deviation families ──
+  const families = [];
+  if (inactiveMs > idleMs) families.push("time");
+  const rateBaseline = thresholds.activityRate[phase];
+  if (rateBaseline !== null && rollingActivityFrequency() < rateBaseline * RATE_DEVIATION_FRACTION) {
+    families.push("rate");
+  }
+  // No WPM guard here any more: a writer typing productively through a few tab
+  // switches fires Environment and nothing else, which is one family, which is
+  // not enough. The two-family rule makes the old guard redundant.
+  if (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD) families.push("environment");
 
-    // Entering Distracted opens an episode. Leaving Distracted does NOT
-    // close it — the episode ends only at the first keystroke (see the
-    // keydown handler), so resumptionMs measures actual writing resumption
-    // even though the phase/UI flips back the moment the user returns.
-    if (phase === "Distracted") {
-      startDistractionEpisode(now);
-    }
+  // Hysteresis — enter at >= 2 families, leave only at 0, never at 1. This
+  // interval runs every 2s; a symmetric threshold would let the state
+  // oscillate across the boundary, and every oscillation opens a new
+  // distraction episode, fires a new Gentle Reminder and triggers a new
+  // Gemini call.
+  const distracted = currentAttention === "Distracted"
+    ? families.length > 0
+    : families.length >= DEVIATION_FAMILIES_REQUIRED;
 
-    currentTrackedPhase = phase;
-    phaseSegmentStartTime = now;
+  return { distracted, trigger: distracted ? "deviation" : null, families };
+}
+
+// Banks elapsed time into the current phase bucket, and additionally into the
+// distracted bucket when distracted — the two channels OVERLAP, so distracted
+// time is a subset of phase time, not a peer of it. Tick-based rather than
+// transition-based: with two channels changing independently, a
+// transition-based scheme would need two segment starts kept in sync.
+// Break time is banked nowhere, but the clock still advances so the break gap
+// isn't retroactively charged to a phase when tracking resumes.
+function bankElapsed() {
+  const now = Date.now();
+  if (lastAccumTime !== null && currentTrackedPhase !== null && !isOnBreak) {
+    const dt = now - lastAccumTime;
+    phaseDurationsMs[currentTrackedPhase] += dt;
+    if (currentAttention === "Distracted") distractedDurationsMs[currentTrackedPhase] += dt;
+  }
+  lastAccumTime = now;
+}
+
+// Recomputes both channels. Must run on a fixed interval regardless of typing
+// activity — otherwise a silent stall is never re-evaluated, because the
+// classifier would only ever run inside the activity-gated flush.
+function updateState() {
+  const now = Date.now();
+
+  // Freeze the phase while distracted. The phase at ONSET is what the recovery
+  // prompt needs ("you were mid-sentence"); re-evaluating through a long
+  // tab-away would drift it to Planning and reintroduce exactly the erasure
+  // this model exists to prevent. This is what replaces lastActivePhase.
+  const phase = currentAttention === "Distracted" && currentTrackedPhase !== null
+    ? currentTrackedPhase
+    : classifyPhase(rollingScrollFrequency());
+
+  const assessment = assessAttention(phase);
+
+  // Bank against the OLD state before applying the new one, so elapsed time
+  // lands in the buckets that were actually current for that interval.
+  bankElapsed();
+
+  currentTrackedPhase = phase;
+  attentionFamilies = assessment.families;
+
+  recordTraceRow(now, phase, assessment);
+
+  if (assessment.distracted && currentAttention === "Focused") {
+    currentAttention = "Distracted";
+    attentionTrigger = assessment.trigger;
+    startDistractionEpisode(now, assessment.trigger, phase, assessment.families);
+  } else if (!assessment.distracted && currentAttention === "Distracted") {
+    // The attention state clears as soon as the signals do, but the distraction
+    // EPISODE stays open until the first writing keystroke (see the keydown
+    // handler) — that is what makes resumptionMs the H1 measure.
+    currentAttention = "Focused";
+    attentionTrigger = null;
   }
 }
 
-// triggerOverride is used by the retroactive tab-away catch in the
-// visibilitychange handler, where document.hidden is already false again.
-function startDistractionEpisode(now, triggerOverride) {
+// Appends one row of raw measurements plus the decision they produced. The
+// attention value recorded is the one this tick ENDS on, so a row can be read
+// as "these measurements, therefore this state".
+function recordTraceRow(now, phase, assessment) {
+  if (isOnBreak) return; // tracking is suspended; there is no decision to record
+  if (decisionTrace.length >= TRACE_MAX_ROWS) { traceTruncated = true; return; }
+
+  decisionTrace.push([
+    now - sessionStartTime,
+    phase,
+    assessment.distracted ? "Distracted" : "Focused",
+    rollingWPM(),
+    Math.round((now - lastActivityTime) / 1000),
+    rollingScrollFrequency(),
+    rollingDeleteFrequency(),
+    rollingActivityFrequency(),
+    burstStartTime ? Math.round((now - burstStartTime) / 1000) : 0,
+    rollingTabSwitchFrequency(),
+    document.hidden ? 1 : 0,
+    assessment.families.join("+"),
+  ]);
+
+  // Persisted on its own key and on a slower cadence: ff_session is
+  // read-modify-written every 2s, and a growing array there would make every
+  // one of those writes progressively heavier.
+  traceTickCounter++;
+  if (traceTickCounter % TRACE_FLUSH_EVERY_TICKS === 0) flushTraceToStorage();
+}
+
+function flushTraceToStorage(callback) {
+  safeStorageSet(
+    { ff_trace: { columns: TRACE_COLUMNS, rows: decisionTrace, truncated: traceTruncated } },
+    callback
+  );
+}
+
+function startDistractionEpisode(now, trigger, phase, families) {
   if (activeDistraction) return;
   distractionOnsetCount++; // onset signal for the panel's per-episode re-arm
   activeDistraction = {
     startedAt: now,
-    // Three causes, distinguished for the export: hidden tab, rapid
-    // switching while visible, or a long idle pause on the doc.
-    trigger: triggerOverride ?? (document.hidden
-      ? "tab-away"
-      : (rollingTabSwitchFrequency() >= RAPID_SWITCH_THRESHOLD ? "rapid-switch" : "idle")),
+    trigger,   // "tab-away" | "severe-stall" | "deviation"
+    phase,     // the phase this distraction interrupted — no longer inferred
+    families,  // which signals fired, kept for analysis of the detection rule
     returnedAt: null,
   };
 
@@ -423,14 +703,15 @@ function startDistractionEpisode(now, triggerOverride) {
   // (intervention condition, cooldown, key configured) live in background —
   // this is fire-and-forget and must never affect tracking.
   //
-  // trigger + lastActivePhase ride ON THE MESSAGE rather than being read from
+  // The episode facts ride ON THE MESSAGE rather than being read from
   // ff_session: the flush that would carry them happens AFTER this call, so a
   // storage read in background would race it and could see stale values.
   try {
     chrome.runtime.sendMessage({
       type: "FF_CHECK_STUCK",
-      trigger: activeDistraction.trigger,
-      lastActivePhase,
+      trigger,
+      phase,
+      families,
     }, () => void chrome.runtime.lastError);
   } catch (e) {
     // Extension context died mid-call — the interval guards will handle it.
@@ -448,22 +729,14 @@ function finalizeDistractionEpisode(now) {
     endedAt: now,
     durationMs: now - ep.startedAt,
     trigger: ep.trigger,
+    phase: ep.phase ?? null,        // what was interrupted
+    families: ep.families ?? [],    // which signals fired, for auditing the rule
     // For tab-away episodes measure from the moment they came back to the
-    // doc; for idle and rapid-switch episodes the user never left (or is
+    // doc; for stall and deviation episodes the user never left (or is
     // currently on the doc), so use the full episode.
     resumptionMs: ep.trigger === "tab-away" && ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
   });
   activeDistraction = null;
-}
-
-// Returns accumulated phase durations including the in-progress segment,
-// so reads reflect time up to "now" rather than the last phase transition.
-function getPhaseDurationsMsSnapshot() {
-  const snapshot = { ...phaseDurationsMs };
-  if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
-    snapshot[currentTrackedPhase] += Date.now() - phaseSegmentStartTime;
-  }
-  return snapshot;
 }
 
 function getAvgResumptionMs() {
@@ -484,14 +757,20 @@ function flushPhaseToStorage() {
       ff_session: {
         ...existing,
         currentPhase: currentTrackedPhase,
-        lastActivePhase,
-        phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+        currentAttention,        // "Focused" | "Distracted" — the second label
+        attentionFamilies,       // which deviation families are firing right now
+        attentionTrigger,
+        phaseDurationsMs,        // total time per phase (distracted time included)
+        distractedDurationsMs,   // distracted time WITHIN each phase (a subset)
         distractionCount: distractionEpisodes.length,
         distractionOnsetCount,
         distractionEpisodes,
         activeDistraction, // persist the open episode so a resume can continue it
         avgResumptionMs: getAvgResumptionMs(),
         docsConnected, // Docs API auth status, for the panel's connect indicator
+        calibrationValid,
+        calibrationProfileId,
+        thresholds, // the exact values this session ran under — must reach the export
       }
     });
   });
@@ -509,9 +788,16 @@ function attachTypingListener() {
   }
 
   docsInput.contentDocument.addEventListener("keydown", (e) => {
-    if (!isTracking) return; // ignore activity once tracking has stopped
+    // Calibration uses the same listener deliberately (spec §4): a baseline
+    // gathered by a different mechanism than the measurement would not be
+    // comparable to it.
+    if (!isTracking && !calibrationMode) return;
 
     const now = Date.now();
+    if (calibrationMode) {
+      if (isPrintable(e.key)) calibRecord("keys", now);
+      else if (e.key === "Backspace" || e.key === "Delete") calibRecord("deletes", now);
+    }
 
     // First WRITING keystroke while a distraction episode is open = task
     // resumed — close the episode here (not on phase transitions) so
@@ -557,6 +843,12 @@ function attachTypingListener() {
           burstCount++;
           totalBurstDurationMs += burstDuration;
           lastCompletedBurstMs = burstDuration;
+          // Bursts are attributed to the segment they ENDED in, and carry their
+          // own start time so the warm-up filter can exclude any that began
+          // before the segment's usable window opened.
+          if (calibrationMode && calibCurrent) {
+            calibCurrent.bursts.push({ startedAt: burstStartTime, durationMs: burstDuration });
+          }
         }
         burstStartTime = null; // reset burst start
       }
@@ -567,8 +859,7 @@ function attachTypingListener() {
     }
 
     lastKeyTime = now;
-    lastActivityTime = now;
-    isTyping = true;
+    markActivity(now);
   });
 }
 
@@ -583,7 +874,7 @@ function attachScrollListener() {
   let scrollDebounceTimer = null;
 
   editor.addEventListener("scroll", () => {
-    if (!isTracking) return; // ignore activity once tracking has stopped
+    if (!isTracking && !calibrationMode) return;
 
     const currentScrollTop = editor.scrollTop;
     const delta = currentScrollTop - lastScrollTop;
@@ -596,13 +887,20 @@ function attachScrollListener() {
     }
 
     lastScrollTop = currentScrollTop;
-    lastActivityTime = Date.now();
-    isTyping = true; // treat scrolling as activity for idle detection
+    // Scrolling is interaction: it keeps the Time family's idle clock from
+    // running, and counts toward the Rate family's interaction window. This is
+    // what distinguishes a writer rereading their draft while planning from
+    // one who has left the desk.
+    markActivity(Date.now());
 
     // Only push timestamp once per scroll burst, not on every raw event
     clearTimeout(scrollDebounceTimer);
     scrollDebounceTimer = setTimeout(() => {
-      scrollTimeStamps.push(Date.now());
+      const at = Date.now();
+      scrollTimeStamps.push(at);
+      // Same debounced unit the scroll threshold is expressed in, so the
+      // calibrated gate and the live measure count the same thing.
+      calibRecord("scrolls", at);
     }, 150); // waits 150ms after last scroll before counting
   });
 }
@@ -627,14 +925,14 @@ function attachSelectionListener() {
   });
 
   editor.addEventListener("mouseup", (e) => {
-    if (!isTracking || !dragStart) return;
+    if ((!isTracking && !calibrationMode) || !dragStart) return;
     const moved = Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y);
     dragStart = null;
     if (moved > 8) pushSelectionSignal(Date.now()); // drag, not a plain caret click
   });
 
   editor.addEventListener("dblclick", () => {
-    if (!isTracking) return;
+    if (!isTracking && !calibrationMode) return;
     pushSelectionSignal(Date.now());
   });
 }
@@ -655,25 +953,32 @@ function attachTabSwitchListener() {
       // immediately on the switch that crosses the threshold. (A single
       // tab-away no longer flags here — see TAB_AWAY_THRESHOLD_MS.)
       if (!isOnBreak) {
-        updatePhaseTracking();
+        updateState();
         flushPhaseToStorage();
       }
     } else {
       // Retroactive catch: if Chrome throttled/froze our intervals while the
       // tab was hidden, an over-threshold away-stretch may never have been
-      // classified. Flip the segment to Distracted here, backdated to when
-      // the tolerance ran out, so the away time is attributed correctly.
+      // evaluated. Flip ATTENTION here, backdated to when the tolerance ran
+      // out, so the away time is attributed correctly. The PHASE is left
+      // untouched — under the two-label model an absence says nothing about
+      // which writing process was interrupted, and preserving it is the point.
       // Must run before tabHiddenAt is cleared.
       if (tabHiddenAt !== null && !isOnBreak) {
         const awayMs = Date.now() - tabHiddenAt;
-        if (awayMs > TAB_AWAY_THRESHOLD_MS && currentTrackedPhase !== "Distracted") {
+        if (awayMs > TAB_AWAY_THRESHOLD_MS && currentAttention === "Focused") {
           const flipAt = tabHiddenAt + TAB_AWAY_THRESHOLD_MS;
-          if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
-            phaseDurationsMs[currentTrackedPhase] += flipAt - phaseSegmentStartTime;
+          // Bank the still-focused stretch up to the flip; the updateState()
+          // call below then banks flipAt→now as distracted time, since
+          // bankElapsed runs before the state is re-evaluated.
+          if (lastAccumTime !== null && currentTrackedPhase !== null && flipAt > lastAccumTime) {
+            phaseDurationsMs[currentTrackedPhase] += flipAt - lastAccumTime;
+            lastAccumTime = flipAt;
           }
-          currentTrackedPhase = "Distracted";
-          phaseSegmentStartTime = flipAt;
-          startDistractionEpisode(flipAt, "tab-away");
+          currentAttention = "Distracted";
+          attentionTrigger = "tab-away";
+          attentionFamilies = ["tab-away"];
+          startDistractionEpisode(flipAt, "tab-away", currentTrackedPhase, ["tab-away"]);
         }
       }
       if (tabHiddenAt !== null) {
@@ -687,12 +992,16 @@ function attachTabSwitchListener() {
       if (activeDistraction && activeDistraction.trigger === "tab-away") {
         activeDistraction.returnedAt = Date.now();
       }
-      isTyping = true; // treat returning to tab as activity for idle detection
+      // Force the next flush to write, but deliberately do NOT call
+      // markActivity: coming back to the tab is not doing work. Leaving the
+      // idle clock running means a participant who returns and then sits there
+      // stays flagged, which is the honest reading.
+      isTyping = true;
 
       // Re-sync on return too — if the tab was frozen while hidden, this is
       // the first chance to bank the away time into the phase durations.
       if (!isOnBreak) {
-        updatePhaseTracking();
+        updateState();
         flushPhaseToStorage();
       }
     }
@@ -755,27 +1064,85 @@ function resetSessionState() {
   wordSyncInFlight = false;
   docsConnected = false;
 
-  phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0, Distracted: 0 };
+  activityTimeStamps = [];
+
+  phaseDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0 };
+  distractedDurationsMs = { Planning: 0, Translating: 0, Reviewing: 0 };
   currentTrackedPhase = null;
-  phaseSegmentStartTime = null;
-  lastActivePhase = null;
+  currentAttention = "Focused";
+  attentionFamilies = [];
+  attentionTrigger = null;
+  lastAccumTime = null;
 
   distractionEpisodes = [];
   activeDistraction = null;
   distractionOnsetCount = 0;
+
+  decisionTrace = [];
+  traceTruncated = false;
+  traceTickCounter = 0;
+
+  // Thresholds are NOT reset here — loadThresholds() owns them, and it runs
+  // before tracking starts so a reset would just discard the profile it loaded.
+}
+
+// Loads the participant's calibration profile into `thresholds`. Falls back to
+// DEFAULT_THRESHOLDS on anything unexpected — a missing profile, a profile for
+// a different participant, or one that failed the validity guards at capture
+// time. A session must always be able to run: a participant blocked at the
+// start screen because calibration is missing is a worse study outcome than one
+// running on documented defaults, which the export flags as calibrationValid:
+// false so the condition is visible in the data rather than silent.
+function loadThresholds(callback) {
+  thresholds = structuredClone(DEFAULT_THRESHOLDS);
+  calibrationValid = false;
+  calibrationProfileId = null;
+
+  safeStorageGet([CALIBRATION_STORE_KEY, "ff_calibration", "ff_task"], (result) => {
+    const participantId = result?.ff_task?.participantId ?? null;
+    const store = result?.[CALIBRATION_STORE_KEY] ?? {};
+    // Falls back to the pre-map single-profile key so a profile captured before
+    // this change is still honoured rather than silently ignored.
+    const legacy = result?.ff_calibration;
+    const profile =
+      (participantId && store[participantId]) ??
+      (legacy && legacy.participantId === participantId ? legacy : null);
+
+    if (profile?.valid && profile.thresholds && profile.participantId === participantId) {
+      thresholds = { ...structuredClone(DEFAULT_THRESHOLDS), ...structuredClone(profile.thresholds) };
+      calibrationValid = true;
+      calibrationProfileId = profile.participantId;
+      console.log("FrictionFlow: calibration profile loaded for", profile.participantId);
+    } else if (profile && profile.participantId !== participantId) {
+      // Loud, because silently running P02 on P01's baseline would corrupt a
+      // participant's data in a way nothing downstream could detect.
+      console.warn(
+        `FrictionFlow: calibration profile belongs to ${profile.participantId}, session is ${participantId} — using defaults.`
+      );
+    } else {
+      console.log("FrictionFlow: no valid calibration profile — using default thresholds.");
+    }
+
+    if (typeof callback === "function") callback();
+  });
 }
 
 function startTracking() {
   resetSessionState();
-  isTracking = true;
-  attachListenersOnce();
-  startIntervals();
-  // Open the first phase segment NOW rather than waiting for the phase
-  // interval's first tick (up to 2s later): otherwise those seconds fall into
-  // no phase, and the analytics phase durations sum to just under the session
-  // length. classifyPhase with no keystrokes yet returns Planning (its default).
-  updatePhaseTracking();
-  console.log("FrictionFlow: tracking started.");
+  // Thresholds must be in place BEFORE the first classification, or the opening
+  // seconds of the session would be judged against defaults and then silently
+  // switch to the participant's profile mid-stream.
+  loadThresholds(() => {
+    isTracking = true;
+    attachListenersOnce();
+    startIntervals();
+    // Open the first phase segment NOW rather than waiting for the phase
+    // interval's first tick (up to 2s later): otherwise those seconds fall into
+    // no phase, and the analytics phase durations sum to just under the session
+    // length. classifyPhase with no keystrokes yet returns Planning (its default).
+    updateState();
+    console.log("FrictionFlow: tracking started.");
+  });
 }
 
 // Resumes tracking in a freshly injected content script (tab refresh,
@@ -783,11 +1150,19 @@ function startTracking() {
 // accumulated counters from the last ff_session snapshot, so the session
 // continues instead of restarting from zero. Callers must check isTracking
 // first — if tracking is already alive, resuming would be a data-losing reset.
-function resumeTracking(snapshot, task, interruptedMs = 0) {
+function resumeTracking(snapshot, task, interruptedMs = 0, trace = null) {
   resetSessionState();
 
   // Keep the original session anchor so elapsed time stays continuous.
   if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
+
+  // Carry the trace across reinjection. Row timestamps are relative to
+  // sessionStartTime, restored just above, so the resumed rows line up with the
+  // earlier ones on one continuous timeline.
+  if (Array.isArray(trace?.rows)) {
+    decisionTrace = trace.rows;
+    traceTruncated = !!trace.truncated;
+  }
 
   if (snapshot) {
     // Restore the typed-keystroke count (not the doc word count) so the typed-
@@ -806,9 +1181,25 @@ function resumeTracking(snapshot, task, interruptedMs = 0) {
     totalBreakMs = snapshot.totalBreakMs ?? 0;
     totalInterruptedMs = snapshot.totalInterruptedMs ?? 0;
     if (snapshot.phaseDurationsMs) {
-      phaseDurationsMs = { ...phaseDurationsMs, ...snapshot.phaseDurationsMs };
+      // Spread over the fresh object, so a snapshot written by the previous
+      // four-phase build (which carried a Distracted key) can't reintroduce it.
+      const { Planning = 0, Translating = 0, Reviewing = 0 } = snapshot.phaseDurationsMs;
+      phaseDurationsMs = { Planning, Translating, Reviewing };
     }
-    lastActivePhase = snapshot.lastActivePhase ?? null;
+    if (snapshot.distractedDurationsMs) {
+      const { Planning = 0, Translating = 0, Reviewing = 0 } = snapshot.distractedDurationsMs;
+      distractedDurationsMs = { Planning, Translating, Reviewing };
+    }
+    // Attention deliberately restarts at Focused: the signals it is derived
+    // from (idle clock, interaction window, tab-switch window) are all rolling
+    // and cannot be reconstructed across a reinjection gap. The open EPISODE is
+    // restored below, so nothing is lost from the H1 measure — only the live
+    // state, which the next tick recomputes anyway.
+    // Guarded against a snapshot from the previous four-phase build, whose
+    // currentPhase could be "Distracted" — not a phase any more.
+    currentTrackedPhase = ["Planning", "Translating", "Reviewing"].includes(snapshot.currentPhase)
+      ? snapshot.currentPhase
+      : null;
     // Cumulative revision totals must survive reinjection — the rolling arrays
     // deliberately restart (a 60s window has no meaning across a gap).
     totalDeletes = snapshot.totalDeletes ?? 0;
@@ -830,19 +1221,25 @@ function resumeTracking(snapshot, task, interruptedMs = 0) {
   // the running total so analytics can subtract it from writing time.
   totalInterruptedMs += interruptedMs ?? 0;
 
-  isTracking = true;
-  attachListenersOnce();
-  startIntervals();
+  // Same ordering requirement as startTracking: the profile has to be loaded
+  // before any classification runs, so a resumed session is judged against the
+  // same thresholds as the stretch before the interruption.
+  loadThresholds(() => {
+    isTracking = true;
+    attachListenersOnce();
+    startIntervals();
+    updateState();
 
-  // Persist the interruption total immediately — the participant may finish the
-  // session before the first flush, and handleFinishSession reads it from the
-  // ff_session snapshot.
-  safeStorageGet("ff_session", (result) => {
-    const existing = (result && result.ff_session) ?? {};
-    safeStorageSet({ ff_session: { ...existing, totalInterruptedMs } });
+    // Persist the interruption total immediately — the participant may finish the
+    // session before the first flush, and handleFinishSession reads it from the
+    // ff_session snapshot.
+    safeStorageGet("ff_session", (result) => {
+      const existing = (result && result.ff_session) ?? {};
+      safeStorageSet({ ff_session: { ...existing, totalInterruptedMs } });
+    });
+
+    console.log("FrictionFlow: tracking resumed from stored session snapshot.");
   });
-
-  console.log("FrictionFlow: tracking resumed from stored session snapshot.");
 }
 
 function stopTracking() {
@@ -855,15 +1252,22 @@ function stopTracking() {
 // paper, the system is "in a paused state" during break mode.
 function startBreak() {
   if (!isTracking || isOnBreak) return;
-  isOnBreak = true;
 
   const now = Date.now();
-  // Close out the current phase segment so break time isn't attributed to it.
-  if (currentTrackedPhase !== null && phaseSegmentStartTime !== null) {
-    phaseDurationsMs[currentTrackedPhase] += now - phaseSegmentStartTime;
-  }
+  // Bank everything up to this moment BEFORE flipping isOnBreak, so the
+  // pre-break stretch is still attributed. Nulling lastAccumTime then makes the
+  // first tick after the break bank nothing, which is what keeps the break gap
+  // out of the phase totals entirely.
+  bankElapsed();
   currentTrackedPhase = null;
-  phaseSegmentStartTime = null;
+  lastAccumTime = null;
+  // A sanctioned break is not distraction — clear the attention channel so the
+  // break can't accumulate distracted time or leave the state stuck on return.
+  currentAttention = "Focused";
+  attentionFamilies = [];
+  attentionTrigger = null;
+
+  isOnBreak = true;
 
   // If a distraction episode led into this break, it ends here — the user
   // responded to it by taking a sanctioned break, not by disengaging further.
@@ -896,6 +1300,10 @@ function endBreak(breakMs, countAsBreak = true, countAsPause = false) {
   lastKeyTime = null;
   burstStartTime = null;
   lastActivityTime = Date.now();
+  // Clear the interaction window too: activity from before a ten-minute break
+  // would otherwise sit in the 60s rolling window and make the Rate family
+  // read a burst of pre-break activity as if it had just happened.
+  activityTimeStamps = [];
 
   // Persist immediately — the user may finish the session before typing again.
   safeStorageGet("ff_session", (result) => {
@@ -911,6 +1319,11 @@ function startIntervals() {
     if (!isExtensionContextValid()) { stopAllTracking(); return; }
     if (!isTyping) return; // Only log if there was activity since last flush
     isTyping = false;
+
+    // Bring the time buckets up to now before reading them: this interval and
+    // the phase interval are separate timers, so without this the durations
+    // written here could lag by a full tick.
+    bankElapsed();
 
     const scrollFreq = rollingScrollFrequency(); // to avoid recalculating multiple times during flush
 
@@ -958,10 +1371,21 @@ function startIntervals() {
       avgBurstDurationSec: burstCount > 0 ? Math.round(totalBurstDurationMs / burstCount / 1000) : 0,
       lastCompletedBurstSec: Math.round(lastCompletedBurstMs / 1000),
 
-      // Phase
+      // Phase channel — one of Planning | Translating | Reviewing, always.
       currentPhase: currentTrackedPhase ?? classifyPhase(scrollFreq),
-      lastActivePhase, // last non-Distracted phase — what a distraction interrupted
-      phaseDurationsMs: getPhaseDurationsMsSnapshot(),
+      phaseDurationsMs,
+
+      // Attention channel — evaluated against the current phase's baseline.
+      currentAttention,
+      attentionFamilies,
+      attentionTrigger,
+      distractedDurationsMs, // distracted time WITHIN each phase (a subset of the above)
+
+      // Thresholds actually in force this session, so the export records what
+      // the classification ran on rather than what it was assumed to run on.
+      calibrationValid,
+      calibrationProfileId,
+      thresholds,
 
       // Distraction episodes
       distractionCount: distractionEpisodes.length,
@@ -1009,7 +1433,7 @@ function startIntervals() {
     if (isOnBreak) return; // suspended during sanctioned breaks
     if (!isExtensionContextValid()) { stopAllTracking(); return; }
 
-    updatePhaseTracking();
+    updateState();
     flushPhaseToStorage();
   }, 2000);
 
@@ -1036,10 +1460,273 @@ function startIntervals() {
 }
 
 
+//------------------ Calibration ------------------------//
+// Runs BEFORE any writing session, once per participant. isTracking stays false
+// throughout, so calibration produces no ff_session data and cannot be confused
+// with a study session — but it uses the same listeners, so the baseline and
+// the measurements are produced by one code path.
+
+function startCalibration() {
+  calibrationMode = true;
+  calibSegments = [];
+  calibCurrent = null;
+
+  // Clear the sensing state the segment statistics derive from. Without this,
+  // keystrokes from before calibration would sit in the rolling WPM window and
+  // inflate the first segment's opening samples.
+  keyStrokeTimeStamps = [];
+  lastKeyTime = null;
+  burstStartTime = null;
+  scrollTimeStamps = [];
+  selectionTimeStamps = [];
+
+  attachListenersOnce();
+
+  // Sample rolling WPM on the SAME cadence and through the same function the
+  // classifier uses. A baseline computed as total-words/total-time would not be
+  // comparable to a threshold that will be tested against a 30s rolling window.
+  calibSampleIntervalId = setInterval(() => {
+    if (!calibrationMode) return;
+    if (!isExtensionContextValid()) { stopCalibration(); return; }
+    if (calibCurrent) calibCurrent.wpmSamples.push({ at: Date.now(), wpm: rollingWPM() });
+  }, CALIB_SAMPLE_MS);
+
+  console.log("FrictionFlow: calibration started.");
+}
+
+function beginCalibrationSegment(phase) {
+  if (!calibrationMode) return;
+  closeCalibrationSegment();
+  calibCurrent = {
+    phase,
+    startedAt: Date.now(),
+    endedAt: null,
+    keys: [], deletes: [], scrolls: [], selections: [], bursts: [], wpmSamples: [],
+  };
+  console.log(`FrictionFlow: calibration segment "${phase}" started.`);
+}
+
+function closeCalibrationSegment() {
+  if (!calibCurrent) return;
+  calibCurrent.endedAt = Date.now();
+  calibSegments.push(calibCurrent);
+  calibCurrent = null;
+}
+
+function stopCalibration() {
+  calibrationMode = false;
+  calibCurrent = null;
+  if (calibSampleIntervalId !== null) {
+    clearInterval(calibSampleIntervalId);
+    calibSampleIntervalId = null;
+  }
+}
+
+// Reduces one recorded segment to the statistics the thresholds are built from.
+// The first CALIB_WARMUP_MS of every segment is discarded: rolling WPM uses a
+// 30s window, so at a segment boundary that window is either empty or still
+// full of the PREVIOUS segment's keystrokes.
+function summarizeSegment(seg) {
+  const windowStart = seg.startedAt + CALIB_WARMUP_MS;
+  const windowEnd = seg.endedAt ?? Date.now();
+  const usableMs = Math.max(0, windowEnd - windowStart);
+  const usableMin = usableMs / 60000;
+  const inWindow = (arr) => arr.filter((t) => t >= windowStart && t <= windowEnd);
+
+  const keys = inWindow(seg.keys);
+  const deletes = inWindow(seg.deletes);
+  const scrolls = inWindow(seg.scrolls);
+  const selections = inWindow(seg.selections);
+
+  // Pauses are gaps in the merged INTERACTION timeline — keystrokes, deletions,
+  // scrolls and selection gestures together — not gaps between printable
+  // keystrokes alone. This has to match what the threshold is tested against:
+  // the Time family measures `now - lastActivityTime`, which every one of those
+  // events resets. Deriving the threshold from keystroke gaps only would make
+  // it systematically too high, because a stretch of deleting or scrolling
+  // reads as one long "pause" during capture but as continuous activity at
+  // runtime — worst exactly in Reviewing, where non-typing interaction is the
+  // dominant behaviour.
+  //
+  // The 2s floor is not optional: raw gaps are dominated by within-word
+  // intervals of 150-300ms, so a median over all gaps would measure typing
+  // rhythm, and every statistic built on it would be meaningless. 2s is the
+  // conventional keystroke-logging pause threshold (Leijten & Van Waes 2013).
+  const interactions = [...keys, ...deletes, ...scrolls, ...selections].sort((a, b) => a - b);
+  const pauses = [];
+  for (let i = 1; i < interactions.length; i++) {
+    const gap = interactions[i] - interactions[i - 1];
+    if (gap >= CALIB_PAUSE_FLOOR_MS) pauses.push(gap / 1000);
+  }
+
+  const wpmSamples = seg.wpmSamples
+    .filter((s) => s.at >= windowStart && s.at <= windowEnd)
+    .map((s) => s.wpm);
+  // Only bursts that BEGAN inside the usable window: one spanning the warm-up
+  // boundary was partly produced under the previous segment's instruction.
+  const bursts = seg.bursts
+    .filter((b) => b.startedAt >= windowStart)
+    .map((b) => b.durationMs / 1000);
+
+  return {
+    phase: seg.phase,
+    durationSec: Math.round((windowEnd - seg.startedAt) / 1000),
+    usableSec: Math.round(usableMs / 1000),
+    keyCount: keys.length,
+    medianWpm: median(wpmSamples) ?? 0,
+    pauseCount: pauses.length,
+    pauseMedianSec: median(pauses),
+    pauseMadSec: mad(pauses),
+    // Same merged timeline the pauses come from, so the Rate and Time families
+    // are calibrated against one consistent definition of "interaction".
+    activityRate: usableMin > 0 ? Math.round(interactions.length / usableMin) : 0,
+    deleteRate: usableMin > 0 ? deletes.length / usableMin : 0,
+    scrollRate: usableMin > 0 ? scrolls.length / usableMin : 0,
+    medianBurstSec: median(bursts),
+  };
+}
+
+// Turns the three segment summaries into the threshold set, applying the
+// validity guards. Two grades of failure, deliberately: a phase with too few
+// pauses falls back for THAT PHASE ONLY, while a participant who did not follow
+// the instructions at all invalidates the whole profile.
+function computeCalibrationProfile(participantId, testMode = false) {
+  const byPhase = {};
+  for (const seg of calibSegments) byPhase[seg.phase] = summarizeSegment(seg);
+
+  const failures = [];
+  const T = byPhase.Translating;
+  const R = byPhase.Reviewing;
+  if (!byPhase.Planning || !T || !R) failures.push("missing-segment");
+  // Short-calibration runs exist to exercise the UI flow; their segments are far
+  // too brief to characterise anyone. Rejected unconditionally so a researcher
+  // who forgets to switch the setting off cannot silently run a participant on
+  // a 90-second "profile" — the session falls back to documented defaults, and
+  // the export says why.
+  if (testMode) failures.push("test-mode-calibration");
+
+  const idleSec = {};
+  const activityRate = {};
+  for (const phase of ["Planning", "Translating", "Reviewing"]) {
+    const s = byPhase[phase];
+    if (!s) {
+      idleSec[phase] = DEFAULT_THRESHOLDS.idleSec[phase];
+      activityRate[phase] = null;
+      continue;
+    }
+    // null disables the Rate family for this phase rather than comparing
+    // against a baseline of zero, which nothing could ever fall below.
+    activityRate[phase] = s.activityRate > 0 ? s.activityRate : null;
+
+    if (s.pauseCount < CALIB_MIN_PAUSES || !s.pauseMadSec) {
+      idleSec[phase] = DEFAULT_THRESHOLDS.idleSec[phase];
+      failures.push(`idle-fallback:${phase}`);
+    } else {
+      idleSec[phase] = Math.round(clamp(
+        s.pauseMedianSec + CALIB_MAD_MULTIPLIER * s.pauseMadSec,
+        CALIB_IDLE_MIN_SEC,
+        CALIB_IDLE_MAX_SEC
+      ));
+    }
+  }
+
+  // Did not type faster while writing than while reviewing — the segments were
+  // not followed, and every discriminating threshold below would be nonsense.
+  if (T && R && T.medianWpm <= R.medianWpm) failures.push("translating-not-faster-than-reviewing");
+  if (T && T.keyCount < CALIB_MIN_TRANSLATING_KEYS) failures.push("insufficient-text");
+
+  // Per-phase idle fallbacks do not invalidate the profile: the rest of it is
+  // still the participant's own data, and rejecting everything over one thin
+  // segment would throw away good calibration.
+  const valid = failures.every((f) => f.startsWith("idle-fallback"));
+
+  const thresholds = valid
+    ? {
+        // Reviewing is Translating's nearest neighbour (both involve typing),
+        // so it is the boundary that matters. For two classes of similar
+        // spread, the midpoint of the means is the split that minimises
+        // misclassification.
+        wpmGate: Math.max(1, Math.round((T.medianWpm + R.medianWpm) / 2)),
+        // Half a typical burst is enough evidence of being inside one. This is
+        // what fixes the choppy-typist case: a writer whose bursts average 8s
+        // would never reach Translating under a fixed 10s rule.
+        burstMinSec: Math.round(clamp(
+          0.5 * (T.medianBurstSec ?? DEFAULT_THRESHOLDS.burstMinSec * 2),
+          CALIB_BURST_MIN_SEC,
+          CALIB_BURST_MAX_SEC
+        )),
+        deleteGate: Math.max(1, Math.round((T.deleteRate + R.deleteRate) / 2)),
+        scrollGate: Math.max(1, Math.round((T.scrollRate + R.scrollRate) / 2)),
+        idleSec,
+        activityRate,
+      }
+    : structuredClone(DEFAULT_THRESHOLDS);
+
+  return {
+    participantId: participantId ?? null,
+    capturedAt: Date.now(),
+    valid,
+    testMode,
+    failures,
+    thresholds,
+    // Every input to every threshold, kept so the derivation is auditable from
+    // the exported data rather than taken on trust.
+    segments: byPhase,
+    // The three figures shown back to the participant (spec §10). Transparency
+    // is a stated design commitment: the baseline must not be a hidden
+    // internal parameter.
+    display: valid
+      ? {
+          writingWpm: Math.round(T.medianWpm),
+          reviewingWpm: Math.round(R.medianWpm),
+          typicalPauseSec: idleSec.Translating,
+        }
+      : null,
+  };
+}
+
+function finishCalibration(participantId, sendResponse, testMode = false) {
+  closeCalibrationSegment();
+  const profile = computeCalibrationProfile(participantId, testMode);
+  stopCalibration();
+
+  // Merge into the per-participant map rather than replacing it, so calibrating
+  // a new participant cannot destroy an earlier one's baseline.
+  safeStorageGet(CALIBRATION_STORE_KEY, (result) => {
+    const store = { ...(result?.[CALIBRATION_STORE_KEY] ?? {}) };
+    if (participantId) store[participantId] = profile;
+    safeStorageSet({ [CALIBRATION_STORE_KEY]: store });
+  });
+  console.log(
+    profile.valid
+      ? `FrictionFlow: calibration complete for ${participantId} — WPM gate ${profile.thresholds.wpmGate}, idle ${JSON.stringify(profile.thresholds.idleSec)}.`
+      : `FrictionFlow: calibration REJECTED (${profile.failures.join(", ")}) — session will run on default thresholds.`
+  );
+  if (typeof sendResponse === "function") sendResponse({ profile });
+}
+
+
 //------------------ Messages from popup ------------------------//
 if (isExtensionContextValid()) {
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === "FF_START_TASK") {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "FF_CALIB_START") {
+      startCalibration();
+    } else if (message?.type === "FF_CALIB_SEGMENT") {
+      beginCalibrationSegment(message.phase);
+    } else if (message?.type === "FF_CALIB_FINISH") {
+      // Responds synchronously with the computed profile, so the results screen
+      // can show the participant their own numbers without a storage round-trip.
+      finishCalibration(message.participantId, sendResponse, message.testMode === true);
+    } else if (message?.type === "FF_CALIB_CANCEL") {
+      stopCalibration();
+    } else if (message?.type === "FF_FLUSH_TRACE") {
+      // Sent by the panel immediately before it reads storage at session end.
+      // The trace is persisted every ~10s to keep the periodic writes cheap, so
+      // without this the final few ticks — often the ones around the last
+      // distraction — would never reach the export.
+      flushTraceToStorage(() => sendResponse({ ok: true }));
+      return true; // async sendResponse
+    } else if (message?.type === "FF_START_TASK") {
       startTracking();
     } else if (message?.type === "FF_RESUME_TASK") {
       if (isTracking) {
@@ -1050,8 +1737,8 @@ if (isExtensionContextValid()) {
       } else {
         // Freshly injected script (isTracking starts false) — restore
         // counters from the last snapshot and restart tracking.
-        safeStorageGet(["ff_session", "ff_task"], (result) => {
-          resumeTracking(result?.ff_session, result?.ff_task, message.interruptedMs ?? 0);
+        safeStorageGet(["ff_session", "ff_task", "ff_trace"], (result) => {
+          resumeTracking(result?.ff_session, result?.ff_task, message.interruptedMs ?? 0, result?.ff_trace);
         });
       }
     } else if (message?.type === "FF_CANCEL_TASK") {

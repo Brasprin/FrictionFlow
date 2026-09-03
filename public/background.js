@@ -30,11 +30,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // reason "break" = sent by the side panel when a break starts (voluntary
     // or via the distraction prompt) — the summary must capture this exact
     // stopping point so the user can re-orient after the break.
-    // content.js additionally carries trigger + lastActivePhase on the message
-    // (see below) because reading them from ff_session would race its flush.
+    // content.js additionally carries the episode facts on the message (see
+    // below) because reading them from ff_session would race its flush.
     handleStuckCheck(message.reason === "break", {
       trigger: message.trigger,
-      lastActivePhase: message.lastActivePhase,
+      phase: message.phase,
+      families: message.families,
     });
   } else if (message.type === "FF_ENSURE_DOCS_AUTH") {
     // Sent by the side panel at session connect so the one-time Google
@@ -299,13 +300,13 @@ async function generateRecovery(session, task, docText, apiKey, isBreakRecovery 
   // lives at the end, and it keeps token cost bounded on long documents.
   const docExcerpt = docText ? docText.slice(-2000) : null;
 
-  // What the writer was doing when the interruption hit. session.currentPhase
-  // cannot answer this — generation fires AT distraction onset, so it reads
-  // "Distracted" (or, racing the flush, whatever preceded it). lastActivePhase
-  // is the last non-Distracted phase, which is what the prompt actually asks
-  // the model to describe.
-  const interruptedPhase = context.lastActivePhase ?? session.lastActivePhase ?? null;
-  // How the distraction began: tab-away | rapid-switch | idle. Materially
+  // What the writer was doing when the interruption hit. Under the two-label
+  // model the phase is simply KNOWN at onset — it is never overwritten by the
+  // distraction, and content.js freezes it for the duration of the episode.
+  // (This replaces the old lastActivePhase workaround, which existed only
+  // because a four-way classifier erased the phase the moment it flagged.)
+  const interruptedPhase = context.phase ?? session.activeDistraction?.phase ?? session.currentPhase ?? null;
+  // How the distraction began: tab-away | severe-stall | deviation. Materially
   // changes the guidance — leaving for another tab is a different re-entry
   // problem than stalling in place.
   const trigger = isBreakRecovery
@@ -313,8 +314,8 @@ async function generateRecovery(session, task, docText, apiKey, isBreakRecovery 
     : (context.trigger ?? session.activeDistraction?.trigger ?? null);
   const triggerLabel = {
     "tab-away": "left the document for another tab",
-    "rapid-switch": "switched tabs repeatedly while barely typing",
-    idle: "stopped typing and stayed idle in the document",
+    "severe-stall": "stopped interacting with the document entirely",
+    deviation: "slowed and drifted away from the work",
     break: "chose to take a break",
   }[trigger] ?? "unknown";
 
@@ -343,7 +344,6 @@ ${docExcerpt}
 BEHAVIORAL DATA:
 - Phase they were interrupted in: ${interruptedPhase ?? "unknown"}
 - How this interruption started: ${triggerLabel}
-- Current phase: ${session.currentPhase ?? "unknown"}
 - Current pause: ${session.currentPauseSec ?? 0} seconds
 - WPM (last 30s): ${session.wpm ?? 0}
 - Words written this session: ${session.typedWordCount ?? 0} typed (${session.wordCount ?? 0} net added to the document)
@@ -356,7 +356,7 @@ BEHAVIORAL DATA:
 - Tab switches: ${session.tabSwitchCount ?? 0}
 - Session time: ${Math.round((session.elapsedSeconds ?? 0) / 60)} minutes
 
-Phase meanings (Flower & Hayes cognitive process model) — tailor the guidance to the phase they were INTERRUPTED in, not to "Distracted":
+Phase meanings (Flower & Hayes cognitive process model) — tailor the guidance to the phase they were INTERRUPTED in:
 - Planning: organizing ideas and goals, little text produced yet → help them re-orient to the goal and name the next idea to commit to.
 - Translating: actively turning ideas into prose → point them back into the specific sentence or paragraph they were mid-way through.
 - Reviewing: rereading and revising existing text → remind them what they were revising and what to check next.

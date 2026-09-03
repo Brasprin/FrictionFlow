@@ -15,6 +15,10 @@
     #status { font-size: 12px; margin: 10px 0 0; color: #0F6E56; min-height: 16px; }
     .hint { font-size: 11px; color: #717182; line-height: 1.6; margin-top: 18px; border-top: 1px solid rgba(0,0,0,0.06); padding-top: 14px; }
     .hint a { color: #0F6E56; }
+    .checkrow { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: #030213; margin-bottom: 12px; line-height: 1.5; }
+    .checkrow input { width: auto; margin: 2px 0 0; }
+    .warn { font-size: 11px; line-height: 1.6; color: #92400E; background: #FFF8F0; border: 1px solid #FDDCB5; border-radius: 8px; padding: 9px 11px; margin: -4px 0 14px; }
+    .warn code { background: rgba(0,0,0,0.05); padding: 1px 4px; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -24,6 +28,18 @@
 
     <label for="geminiKey">Gemini API key</label>
     <input id="geminiKey" type="password" placeholder="AIza…" autocomplete="off" />
+
+    <label for="shortCalibration" style="margin-top:6px">Calibration length</label>
+    <div class="checkrow">
+      <input id="shortCalibration" type="checkbox" />
+      <span>Short calibration (30s per step) — for testing the flow only</span>
+    </div>
+    <p class="warn" id="shortWarning" hidden>
+      Profiles captured this way are stamped <code>testMode: true</code> and are always
+      rejected, so a session run after one uses the default thresholds. Turn this off
+      before running a participant.
+    </p>
+
     <button id="save">Save</button>
     <p id="status"></p>
 
