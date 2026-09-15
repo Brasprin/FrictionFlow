@@ -167,6 +167,11 @@ function readCalibrationStore(result) {
   return store;
 }
 
+// Storage written by the scheduled distraction task (background.js and the
+// game page). Cleared at every session boundary as one group, so a previous
+// session's distraction records can never leak into the next export.
+const DISTRACTION_KEYS = ["ff_distraction", "ff_distractions", "ff_game_logs", "ff_distraction_plan"];
+
 // The most recently captured profile, used to prefill the participant id field.
 function mostRecentProfile(store) {
   return Object.values(store).sort((a, b) => (b?.capturedAt ?? 0) - (a?.capturedAt ?? 0))[0] ?? null;
@@ -360,6 +365,69 @@ function buildSessionExport(s) {
     ? Math.round(adjustedList.reduce((a, b) => a + b, 0) / adjustedList.length)
     : 0;
 
+  // ── Scheduled distraction task (DISTRACTION_SPEC.md §7) ──
+  // One record per scheduled distraction, joining three sources: when
+  // background.js opened the game and saw the participant return, what the game
+  // logged (exposure end, engagement), and the detector's episode for that
+  // distraction (resumption, the H1 measure).
+  const dt = s.distractionTask ?? null;
+  const iso = (ms) => (typeof ms === "number" ? new Date(ms).toISOString() : null);
+  const distractionsOut = [1, 2, 3].map((n) => {
+    const rec = (dt?.records ?? []).find((r) => r.episode === n) ?? null;
+    if (!rec) return { episode: n, delivered: false };
+    const game = dt?.gameLogs?.[n] ?? dt?.gameLogs?.[String(n)] ?? null;
+    // The game's own banner time is authoritative; the scheduled offset is the
+    // fallback if the game log never arrived.
+    const timesUpMs = game?.timesUpAt
+      ? Date.parse(game.timesUpAt)
+      : rec.openedAt + (rec.exposureSec ?? 180) * 1000;
+    const returnedMs = typeof rec.returnedAt === "number" ? rec.returnedAt : null;
+    const closedMs = typeof rec.gameClosedAt === "number" ? rec.gameClosedAt : null;
+    const ep = episodesOut.find((e) => e.induced && e.inducedEpisode === n) ?? null;
+    const totals = game?.totals ?? null;
+    return {
+      episode: n,
+      delivered: true,
+      testMode: !!rec.testMode,
+      set: rec.set,
+      scheduledAt: iso(rec.scheduledAt),
+      openedAt: iso(rec.openedAt),
+      // Non-zero only when a break or interruption pushed it back.
+      deferredSec: sec(rec.deferredMs),
+      exposureSec: rec.exposureSec ?? 180,
+      timesUpAt: iso(timesUpMs),
+      returnedAt: iso(returnedMs),
+      // The "slipping off": how long they kept going after being told to stop.
+      // Negative means they came back before time was up.
+      overrunSec: returnedMs !== null ? Math.round((returnedMs - timesUpMs) / 1000) : null,
+      // Exposure not completed — returned or closed the game before time's up.
+      // Such an episode is not a standard exposure and should be flagged.
+      cutShort: (returnedMs !== null && returnedMs < timesUpMs) || (closedMs !== null && closedMs < timesUpMs),
+      flips: totals?.flips ?? null,
+      matches: totals?.matches ?? null,
+      mismatches: totals?.mismatches ?? null,
+      boardsCleared: totals?.boardsCleared ?? null,
+      flipsAfterTimesUp: totals?.flipsAfterTimesUp ?? null,
+      // Manipulation check: zero flips means the game was opened but not
+      // played, so this was not a distraction and should be excluded or
+      // analysed separately. null means the game log never arrived.
+      engaged: totals ? totals.flips > 0 : null,
+      // H1 for this specific distraction, straight from the detector's episode.
+      resumptionSec: ep ? sec(ep.resumptionMs) : null,
+      adjustedResumptionSec: ep && typeof ep.adjustedResumptionMs === "number" ? sec(ep.adjustedResumptionMs) : null,
+      // Every event the game logged — each flip, match, mismatch and board,
+      // with its time since the game opened. JSON only; the CSV carries the
+      // totals above. Kept so engagement can be examined in detail (e.g. did
+      // play slow down after "time's up"?) rather than only counted.
+      gameEvents: game?.events ?? null,
+    };
+  });
+  // A short-schedule test run. Any delivered distraction carrying the stamp
+  // marks the whole session, since its timing no longer matches the protocol.
+  const distractionTestMode = (dt?.records ?? []).some((r) => r.testMode);
+  const inducedEpisodeCount = episodesOut.filter((e) => e.induced).length;
+  const naturalEpisodeCount = episodesOut.filter((e) => !e.induced).length;
+
   const promptedBreaks = respCount("take_a_break");
   const voluntaryBreaks = events.filter((e) => e.type === "voluntary_break").length;
   const tally = s.suggestionTally ?? {};
@@ -476,6 +544,22 @@ function buildSessionExport(s) {
     // Also in the JSON so a single file is self-contained, with the column
     // names alongside the rows — the rows are positional arrays to avoid
     // repeating twelve field names ~1,500 times.
+    distractionTask: {
+      // One session per participant, so every participant plays the same set.
+      set: "A",
+      // true = run on the short test schedule: NOT study data.
+      testMode: distractionTestMode,
+      schedule: distractionTestMode
+        ? "TEST RUN: minutes 1, 3, 5; 70-second exposure each"
+        : "minutes 10, 25, 40; 3-minute exposure each",
+      distractions: distractionsOut,
+      // Every detected episode is tagged induced (the scheduled game) or
+      // natural (the writer drifted). Report detection agreement separately:
+      // leaving the tab is a categorical trigger, so the scheduled game is
+      // detected almost perfectly and pooling would inflate the kappa.
+      inducedEpisodes: inducedEpisodeCount,
+      naturalEpisodes: naturalEpisodeCount,
+    },
     decisionTrace: s.trace
       ? { columns: s.trace.columns ?? [], truncated: !!s.trace.truncated, rows: s.trace.rows ?? [] }
       : null,
@@ -551,6 +635,22 @@ function buildSessionExport(s) {
     ["distractionsRecovered", json.distractions.recovered],
     ["avgResumptionSec", json.distractions.avgResumptionSec],
     ["avgAdjustedResumptionSec", json.distractions.avgAdjustedResumptionSec],
+    // 1 = short-schedule test run. Exclude these rows from analysis.
+    ["distractionTestMode", distractionTestMode ? 1 : 0],
+    ["distractionSet", json.distractionTask.set],
+    ["distractionsDelivered", distractionsOut.filter((d) => d.delivered).length],
+    ["inducedEpisodes", inducedEpisodeCount],
+    ["naturalEpisodes", naturalEpisodeCount],
+    // Zero-flip distractions failed the manipulation check — see the JSON.
+    ["zeroFlipDistractions", distractionsOut.filter((d) => d.engaged === false).length],
+    ...distractionsOut.flatMap((d) => [
+      [`dist${d.episode}Delivered`, d.delivered ? 1 : 0],
+      [`dist${d.episode}CutShort`, d.delivered ? (d.cutShort ? 1 : 0) : ""],
+      [`dist${d.episode}OverrunSec`, d.overrunSec],
+      [`dist${d.episode}Flips`, d.flips],
+      [`dist${d.episode}ResumptionSec`, d.resumptionSec],
+      [`dist${d.episode}AdjResumptionSec`, d.adjustedResumptionSec],
+    ]),
     ["promptsShown", json.promptResponses.promptsShown],
     ["respGetBackToWork", json.promptResponses.getBackToWork],
     ["respTakeBreak", json.promptResponses.takeABreak], // prompt-driven breaks
@@ -676,6 +776,9 @@ function TaskInitScreen({ onStart, onCalibrate }) {
   // looks up the one matching the typed id — a profile is only ever usable for
   // the participant it was captured from.
   const [calibrationStore, setCalibrationStore] = useState({});
+  // Researcher testing option. Surfaced on this screen, where the session is
+  // started, because a participant session run with it on becomes a test run.
+  const [shortDistractions, setShortDistractions] = useState(false);
 
   // Self-contained senior high school writing prompts — opinion/reflection
   // based, so participants can write from their own knowledge without needing
@@ -688,7 +791,8 @@ function TaskInitScreen({ onStart, onCalibrate }) {
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
-      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary", CALIBRATION_STORE_KEY, "ff_calibration"], (result) => {
+      chrome.storage.local.get(["ff_task", "ff_interrupted", "ff_draft", "ff_lastSummary", CALIBRATION_STORE_KEY, "ff_calibration", "ff_settings"], (result) => {
+        setShortDistractions(!!result.ff_settings?.shortDistractions);
         // Read before the early return below — a recoverable previous session
         // matters just as much when a session is already active.
         setLastSummary(result.ff_lastSummary ?? null);
@@ -776,7 +880,7 @@ function TaskInitScreen({ onStart, onCalibrate }) {
           taskName,
           objective,
           condition,
-          sessionStartTime: Date.now(),
+          sessionStartTime: Date.now(), // background.js schedules the distractions from this
           tabId, // stored so background.js can detect if this specific tab closes
         };
 
@@ -788,6 +892,7 @@ function TaskInitScreen({ onStart, onCalibrate }) {
         chrome.storage.local.remove("ff_generating");
         chrome.storage.local.remove("ff_suggestion_choices"); // and neither must last session's choices
         chrome.storage.local.remove("ff_events"); // nor last session's intervention events
+        chrome.storage.local.remove(DISTRACTION_KEYS); // nor last session's distraction records
 
         // Navigate only after ff_task is persisted — ContextPrepScreen reads
         // it on mount, and navigating before the write landed made it show
@@ -832,6 +937,7 @@ function TaskInitScreen({ onStart, onCalibrate }) {
       chrome.storage.local.remove("ff_generating");
       chrome.storage.local.remove("ff_suggestion_choices");
       chrome.storage.local.remove("ff_events");
+      chrome.storage.local.remove(DISTRACTION_KEYS);
     }
 
     setParticipantId("");
@@ -963,6 +1069,15 @@ function TaskInitScreen({ onStart, onCalibrate }) {
             ? "No recovery prompts will appear — behavioral data is still logged."
             : "Recovery prompts appear when inactivity is detected."}
         </p>
+        {!isActive && shortDistractions && (
+          <div style={{ background: "#FFF8F0", border: "1px solid #FDDCB5", borderRadius: 10, padding: "10px 11px", marginBottom: 14 }}>
+            <p style={{ margin: "0 0 3px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Short distraction schedule is on</p>
+            <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
+              Distractions at minutes 1, 3 and 5 with 70-second games. The session is recorded as a test
+              run, not study data. Turn it off in the extension options before running a participant.
+            </p>
+          </div>
+        )}
         {!isActive && (
           <>
             <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Quick templates</p>
@@ -1098,10 +1213,11 @@ function ContextPrepScreen({ setScreen }) {
             ff_draft: { participantId: t.participantId ?? "", taskName: t.taskName ?? "", objective: t.objective ?? "", condition: t.condition ?? "intervention" },
           });
         }
-        chrome.storage.local.remove("ff_task");
+        chrome.storage.local.remove("ff_task"); // also cancels the scheduled distractions
         chrome.storage.local.remove("ff_session");
         chrome.storage.local.remove("ff_idle");
         chrome.storage.local.remove("ff_interrupted");
+        chrome.storage.local.remove(DISTRACTION_KEYS);
         setScreen("init");
       });
     } else {
@@ -1166,7 +1282,7 @@ const PROMPT_COOLDOWN_MS = 60000;
 // passed in as props — they must survive this component unmounting when
 // navigating to Recovery/Break and remounting on return, otherwise the
 // dismiss cooldown and last-seen episode would reset and re-trigger the modal.
-function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef }) {
+function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef, heldPromptRef }) {
   const [taskName, setTaskName] = useState("");
   const [objective, setObjective] = useState("");
   const [sessionStartTime, setSessionStartTime] = useState(null); // read once from ff_task
@@ -1223,7 +1339,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices"], (result) => {
+        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices", "ff_distraction"], (result) => {
           const s = result.ff_session;
           const t = result.ff_task;
 
@@ -1290,7 +1406,22 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
               newEpisode = true;
             }
             const cooldownElapsed = Date.now() >= promptSuppressUntilRef.current;
-            if (newEpisode || (isDistracted && cooldownElapsed)) {
+            const wantsPrompt = newEpisode || (isDistracted && cooldownElapsed);
+
+            // During the SCHEDULED distraction the reminder is held, not shown.
+            // The side panel stays visible across tabs, so showing it would put
+            // it beside the memory game and pull intervention participants
+            // back early — giving them shorter distractions than baseline
+            // participants, and turning H1 into a measure of distraction length
+            // rather than of the prompt. FrictionFlow supports recovery, not
+            // prevention: it should help on return, not stop the distraction.
+            // Natural distractions are unaffected.
+            const scheduledGameOpen = !!result.ff_distraction?.active;
+            if (scheduledGameOpen) {
+              if (wantsPrompt) heldPromptRef.current = true;
+            } else if (wantsPrompt || heldPromptRef.current) {
+              // Back on the document: deliver anything held during the game.
+              heldPromptRef.current = false;
               promptSuppressUntilRef.current = 0; // clear any spent cooldown
               setShowDistractionPrompt(true);
             }
@@ -1301,7 +1432,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     readStorage();
     const t = setInterval(readStorage, 2000);
     return () => clearInterval(t);
-  }, [promptSuppressUntilRef, lastDistractionOnsetRef, setShowDistractionPrompt]);
+  }, [promptSuppressUntilRef, lastDistractionOnsetRef, heldPromptRef, setShowDistractionPrompt]);
 
   const mins = String(Math.floor(elapsed/60)).padStart(2,"0");
   const secs = String(elapsed%60).padStart(2,"0");
@@ -1382,7 +1513,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
       : elapsed;
 
     // Read the last ff_session snapshot to grab session-lifetime data before we clear storage
-    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = [], calibrationProfile = null, trace = null) {
+    function buildAndNavigate(sessionSnapshot = {}, suggestionChoices = [], interventionEvents = [], calibrationProfile = null, trace = null, distractionTask = null) {
       // Finalize the suggestion tally. chosenIndex is the stance
       // (0 = goal-anchored, 1 = doc-driven, 2 = bridge); every remaining record
       // is a frozen per-episode choice, so summing by index gives the export
@@ -1440,15 +1571,18 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         calibrationProfileId: sessionSnapshot.calibrationProfileId ?? null,
         thresholds: sessionSnapshot.thresholds ?? null,
         // The whole profile, including the per-segment statistics every
-        // threshold was derived from. Carried in BOTH of a participant's
-        // session exports (spec §3): the profile is captured once and reused,
-        // so without this copy the second session's file would not record how
-        // its thresholds were produced.
+        // threshold was derived from. The profile is captured in a separate
+        // step before the session, so without this copy the session file would
+        // not record how its thresholds were produced.
         calibrationProfile,
         // Per-tick raw measurements plus the decision they produced. This is
         // what lets the session be re-classified under a different threshold
         // set during analysis — the classifier's inputs, not just its output.
         trace,
+        // The scheduled distraction task: which card set, and for each of the
+        // three distractions when it opened, when time was up, when the
+        // participant returned, and how much they actually played.
+        distractionTask,
         // distractionCount = occurrences (onset): matches the live tile and the
         // reminders, and includes any distraction still open at finish.
         // distractionsRecovered = episodes that closed on a resuming keystroke
@@ -1483,6 +1617,10 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         chrome.storage.local.remove("ff_generating");
         chrome.storage.local.remove("ff_suggestion_choices");
         chrome.storage.local.remove("ff_events");
+        chrome.storage.local.remove(DISTRACTION_KEYS);
+        // Finishing mid-distraction must not leave the game open behind the
+        // analytics screen.
+        if (distractionTask?.openGameTabId) chrome.tabs.remove(distractionTask.openGameTabId).catch(() => {});
       }
 
       setScreen("analytics");
@@ -1494,16 +1632,20 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
     // would otherwise be missing from the export. Failure is non-fatal; the
     // read proceeds either way rather than stranding the session.
     function readAndBuild() {
-      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events", "ff_trace", CALIBRATION_STORE_KEY, "ff_calibration"], (result) => {
+      chrome.storage.local.get(["ff_session", "ff_suggestion_choices", "ff_events", "ff_trace", CALIBRATION_STORE_KEY, "ff_calibration", "ff_task", ...DISTRACTION_KEYS], (result) => {
         buildAndNavigate(
           result.ff_session ?? {},
           result.ff_suggestion_choices ?? [],
           result.ff_events ?? [],
           // This participant's own profile, not merely the most recent one —
-          // another participant may have calibrated between this participant's
-          // two sessions.
+          // other participants may have been calibrated on this machine too.
           readCalibrationStore(result)[participantId] ?? null,
-          result.ff_trace ?? null
+          result.ff_trace ?? null,
+          {
+            records: result.ff_distractions ?? [],
+            gameLogs: result.ff_game_logs ?? {},
+            openGameTabId: result.ff_distraction?.active ? result.ff_distraction.gameTabId : null,
+          }
         );
       });
     }
@@ -1517,7 +1659,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           .catch(readAndBuild);
       });
     } else {
-      buildAndNavigate({}, [], [], null, null);
+      buildAndNavigate({}, [], [], null, null, null);
     }
   }
 
@@ -1912,10 +2054,12 @@ function BreakScreen({ setScreen, setHasRecoverySummary, breakOriginRef }) {
 }
 
 // ─── Calibration ─────────────────────────────────────────────────────────────
-// Runs ONCE PER PARTICIPANT, before their first session, and the resulting
-// profile is reused for both study arms. Re-calibrating between arms would give
-// the two conditions different baselines and weaken the paired comparison — the
-// only thing that should differ between them is the recovery prompt.
+// Runs ONCE PER PARTICIPANT, immediately before their single session. Each
+// participant takes part in one condition only (between-subjects), so
+// participants are compared with each other rather than with themselves — which
+// makes personalised thresholds matter more, not less: without them,
+// differences in typing speed between the two groups would leak into what the
+// detector counts as a distraction.
 //
 // The participant works in the real Google Doc throughout: Reviewing needs
 // genuine scroll behaviour off the Docs editor, and a baseline gathered through
@@ -2142,7 +2286,7 @@ function CalibrationScreen({ setScreen, participantId }) {
           )}
           <p style={{ margin: "0 0 12px", fontSize: 12, color: "#444", lineHeight: 1.6 }}>
             This measures how <strong>you</strong> write, so the system compares you against your own
-            baseline instead of an average. It runs once — both of your sessions will use it.
+            baseline instead of an average. It takes about 12 minutes, then your writing session starts.
           </p>
           <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Write about</p>
           <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
@@ -2246,8 +2390,7 @@ function CalibrationScreen({ setScreen, participantId }) {
               </div>
             ))}
             <p style={{ margin: "12px 0 0", fontSize: 11, color: "#717182", lineHeight: 1.6 }}>
-              Saved for {participantId}. Both sessions will use this profile — you will not need to
-              do this again.
+              Saved for {participantId}. Your writing session will use these numbers.
             </p>
           </>
         ) : (
@@ -2783,7 +2926,7 @@ function AnalyticsScreen({ setScreen, summary }) {
 
 // ─── Popup ────────────────────────────────────────────────────────────────────
 
-function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef, calibrationParticipantId, setCalibrationParticipantId }) {
+function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary, setHasRecoverySummary, showDistractionPrompt, setShowDistractionPrompt, promptSuppressUntilRef, lastDistractionOnsetRef, breakOriginRef, heldPromptRef, calibrationParticipantId, setCalibrationParticipantId }) {
   const screenMap = {
     init: <TaskInitScreen
       onCalibrate={(pid) => { setCalibrationParticipantId(pid); setScreen("calibration"); }}
@@ -2792,6 +2935,7 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       setShowDistractionPrompt(false);
       promptSuppressUntilRef.current = 0;
       lastDistractionOnsetRef.current = null;
+      heldPromptRef.current = false;
       if (mode === "resume") {
         // resumeTaskTracking reads ff_interrupted to measure the offline gap,
         // then clears it once resume is confirmed — so it must NOT be removed
@@ -2816,6 +2960,7 @@ function PopupView({ screen, setScreen, summary, setSummary, hasRecoverySummary,
       promptSuppressUntilRef={promptSuppressUntilRef}
       lastDistractionOnsetRef={lastDistractionOnsetRef}
       breakOriginRef={breakOriginRef}
+      heldPromptRef={heldPromptRef}
     />,
     recovery: <RecoveryScreen setScreen={setScreen} />,
     survey: <SurveyScreen
@@ -2861,6 +3006,10 @@ export default function App() {
   // episode re-arms the reminder exactly once. Null until the first storage read
   // establishes the baseline.
   const lastDistractionOnsetRef = useRef(null);
+  // A reminder that came due while the scheduled memory game was open, waiting
+  // to be shown once the participant is back on the document. Lives here with
+  // the other prompt refs so it survives the monitoring screen remounting.
+  const heldPromptRef = useRef(false);
   // How the current break was entered: "voluntary" (Take a break button) or
   // "prompt" (the distraction prompt's Take a Break option). Lifted here
   // because it's set in ActiveMonitoringScreen and read in BreakScreen —
@@ -2912,6 +3061,7 @@ export default function App() {
           promptSuppressUntilRef={promptSuppressUntilRef}
           lastDistractionOnsetRef={lastDistractionOnsetRef}
           breakOriginRef={breakOriginRef}
+          heldPromptRef={heldPromptRef}
           calibrationParticipantId={calibrationParticipantId}
           setCalibrationParticipantId={setCalibrationParticipantId}
         />

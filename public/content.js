@@ -49,10 +49,9 @@ const CALIB_MIN_TRANSLATING_KEYS = 100;   // less text than this: the whole prof
 
 // Profiles are stored as a MAP keyed by participant id, not as a single
 // profile. A single-profile key loses P01's baseline the moment P02
-// calibrates — and because the study is within-subjects, each participant runs
-// TWO sessions that may be days apart with other participants in between. The
-// second session would then quietly fall back to default thresholds while the
-// panel still showed the participant as calibrated.
+// calibrates, so if several participants were calibrated before their
+// sessions ran, the earlier ones would quietly fall back to default thresholds
+// while the panel still showed them as calibrated.
 const CALIBRATION_STORE_KEY = "ff_calibrations";
 
 // Per-participant thresholds, populated from the calibration profile at
@@ -192,6 +191,21 @@ let calibrationMode = false;
 let calibSegments = [];        // completed segments, each fully recorded
 let calibCurrent = null;       // the segment being recorded right now
 let calibSampleIntervalId = null;
+
+// ── Scheduled distraction ──
+// Mirror of ff_distraction (owned by background.js) so an episode can be
+// tagged INDUCED — the scheduled memory game — or NATURAL at the moment it
+// starts, synchronously. The scheduled game is detected almost perfectly
+// (leaving the tab is a categorical trigger), so pooling the two would inflate
+// detection agreement; the tag is what lets the analysis report them apart.
+// Holds no condition information: the distraction is identical in both arms.
+let scheduledDistraction = null;
+
+function refreshScheduledDistraction() {
+  safeStorageGet("ff_distraction", (result) => {
+    scheduledDistraction = result?.ff_distraction ?? null;
+  });
+}
 
 // ── Decision trace ──
 // One row per classifier tick holding the RAW MEASUREMENTS alongside the
@@ -690,11 +704,14 @@ function flushTraceToStorage(callback) {
 function startDistractionEpisode(now, trigger, phase, families) {
   if (activeDistraction) return;
   distractionOnsetCount++; // onset signal for the panel's per-episode re-arm
+  const induced = !!scheduledDistraction?.active;
   activeDistraction = {
     startedAt: now,
     trigger,   // "tab-away" | "severe-stall" | "deviation"
     phase,     // the phase this distraction interrupted — no longer inferred
     families,  // which signals fired, kept for analysis of the detection rule
+    induced,   // true = the scheduled memory game; false = the writer drifted
+    inducedEpisode: induced ? scheduledDistraction.episode : null,
     returnedAt: null,
   };
 
@@ -731,6 +748,8 @@ function finalizeDistractionEpisode(now) {
     trigger: ep.trigger,
     phase: ep.phase ?? null,        // what was interrupted
     families: ep.families ?? [],    // which signals fired, for auditing the rule
+    induced: !!ep.induced,          // scheduled game vs natural drift
+    inducedEpisode: ep.inducedEpisode ?? null,
     // For tab-away episodes measure from the moment they came back to the
     // doc; for stall and deviation episodes the user never left (or is
     // currently on the doc), so use the full episode.
@@ -1129,6 +1148,7 @@ function loadThresholds(callback) {
 
 function startTracking() {
   resetSessionState();
+  refreshScheduledDistraction();
   // Thresholds must be in place BEFORE the first classification, or the opening
   // seconds of the session would be judged against defaults and then silently
   // switch to the participant's profile mid-stream.
@@ -1152,6 +1172,9 @@ function startTracking() {
 // first — if tracking is already alive, resuming would be a data-losing reset.
 function resumeTracking(snapshot, task, interruptedMs = 0, trace = null) {
   resetSessionState();
+  // A reinjection can land mid-distraction; re-read so the episode about to be
+  // restored or opened is tagged correctly.
+  refreshScheduledDistraction();
 
   // Keep the original session anchor so elapsed time stays continuous.
   if (task?.sessionStartTime) sessionStartTime = task.sessionStartTime;
@@ -1272,6 +1295,14 @@ function startBreak() {
   // If a distraction episode led into this break, it ends here — the user
   // responded to it by taking a sanctioned break, not by disengaging further.
   finalizeDistractionEpisode(now);
+
+  // Persisted immediately rather than on the next flush: the phase interval is
+  // suspended during a break, so without this the scheduled distraction would
+  // never learn the participant is on one, and could open the game mid-break.
+  safeStorageGet("ff_session", (result) => {
+    const existing = (result && result.ff_session) ?? {};
+    safeStorageSet({ ff_session: { ...existing, isOnBreak: true } });
+  });
 }
 
 // Break accounting is decided by the side panel (it knows the break's origin
@@ -1308,7 +1339,7 @@ function endBreak(breakMs, countAsBreak = true, countAsPause = false) {
   // Persist immediately — the user may finish the session before typing again.
   safeStorageGet("ff_session", (result) => {
     const existing = (result && result.ff_session) ?? {};
-    safeStorageSet({ ff_session: { ...existing, totalBreakMs, totalPauses, longestPauseMs } });
+    safeStorageSet({ ff_session: { ...existing, totalBreakMs, totalPauses, longestPauseMs, isOnBreak: false } });
   });
 }
 
@@ -1400,6 +1431,11 @@ function startIntervals() {
       // Breaks & interruptions
       totalBreakMs,
       totalInterruptedMs,
+      // Must be in this payload, not only written by startBreak: this flush
+      // REPLACES ff_session wholesale, and it keeps running during a break
+      // (word-count syncs mark activity), so a flag held anywhere else would be
+      // wiped within seconds and the scheduler would open the game mid-break.
+      isOnBreak,
 
       lastUpdated: Date.now(),
     };
@@ -1708,6 +1744,14 @@ function finishCalibration(participantId, sendResponse, testMode = false) {
 
 //------------------ Messages from popup ------------------------//
 if (isExtensionContextValid()) {
+  // Keep the scheduled-distraction mirror current as background.js opens and
+  // closes the game.
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area === "local" && "ff_distraction" in changes) {
+      scheduledDistraction = changes.ff_distraction.newValue ?? null;
+    }
+  });
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "FF_CALIB_START") {
       startCalibration();

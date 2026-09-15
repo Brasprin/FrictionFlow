@@ -1,6 +1,7 @@
 # FrictionFlow — Calibration Specification
 
-**Status:** draft for review. Not yet implemented.
+**Status:** implemented and tested in simulation (`npm test`). Not yet run in
+Chrome against a real participant session.
 **Purpose:** define every threshold the system personalizes, where each number
 comes from, and the formula that produces it.
 
@@ -70,23 +71,34 @@ Rationale:
 
 ---
 
-## 3. Scope: per participant, once
+## 3. Scope: per participant, before their session
 
-Calibration runs **once per participant**, not once per session.
+Calibration runs **once per participant**, immediately before their single
+writing session.
 
-The study is within-subjects (baseline + intervention). Re-calibrating per
-session would give the two arms different baselines, weakening the paired
-comparison. One profile, reused across both sessions, keeps the thresholds
-identical and the only manipulated variable the recovery prompt itself.
+The study is **between-subjects**: each participant takes part in one condition
+only, baseline or intervention. Participants are therefore compared with *each
+other* rather than with themselves, so differences between people — in typing
+speed, in how long they pause — do not cancel out as they would in a
+within-subjects design. That makes personalised thresholds matter more, not
+less: with one fixed threshold for everyone, a group that happened to contain
+more slow typists would register more "distraction" regardless of condition.
+Calibration measures each participant against their own baseline, which keeps
+that difference out of the detector.
 
 Consequences:
 
 - The profile is keyed by participant ID and must survive every storage-clearing
-  path (`handleStartTask`, `handleCancelTask` currently bulk-remove keys).
-- The full profile must be embedded in **both** sessions' exports, or a session's
-  data will not record the thresholds it ran under.
+  path (`handleStartTask`, `handleCancelTask` currently bulk-remove keys), and one
+  participant's calibration must never overwrite another's.
+- The full profile is embedded in the session export, or the session's data
+  would not record the thresholds it ran under.
 - Re-calibration is a deliberate researcher action, not something a participant
   can trigger accidentally.
+- Participants must be **assigned to conditions at random** (or from a
+  pre-drawn balanced list), never by convenience — with only one session each,
+  anything that differs systematically between the two groups reads as an
+  effect of the condition.
 
 ---
 
@@ -155,10 +167,12 @@ that each phase is measured **in isolation**, while the main task presents them
 when they interleave; that is tested separately, against human-coded screen
 recordings. State this in the paper as a deliberate trade-off.
 
-**Main-task pairing.** Each participant writes two sessions from their
-coursework. The two assignments must be of comparable difficulty, and their
-order alternated across participants, or a harder assignment in one condition
-will read as an effect of the recovery prompt.
+**Main-task comparability.** Each participant writes one session from their own
+coursework, so the tasks differ between participants. The baseline and
+intervention groups must receive coursework of comparable difficulty overall —
+balance it when assigning conditions — or a harder mix of assignments in one
+group will read as an effect of the recovery prompt. Record the course and
+assignment for each participant so the balance can be checked.
 
 **Environment: inside the Google Doc**, using the live content script — not a
 side-panel text box. Reasons:

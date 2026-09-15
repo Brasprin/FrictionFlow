@@ -10,7 +10,8 @@
     "activeTab",
     "scripting",
     "sidePanel",
-    "identity"
+    "identity",
+    "alarms"
   ],
   "host_permissions": [
     "https://docs.google.com/*",

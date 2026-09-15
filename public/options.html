@@ -40,6 +40,18 @@
       before running a participant.
     </p>
 
+    <label for="shortDistractions" style="margin-top:6px">Distraction schedule</label>
+    <div class="checkrow">
+      <input id="shortDistractions" type="checkbox" />
+      <span>Short schedule (minutes 1, 3, 5; 70-second games) — for testing the flow only</span>
+    </div>
+    <p class="warn" id="shortDistractionsWarning" hidden>
+      Sessions started with this on are stamped <code>testMode: true</code> in the export
+      and are not study data. The games last 70 seconds rather than 20 because a
+      distraction is only detected after 60 seconds away. Turn this off before running a
+      participant.
+    </p>
+
     <button id="save">Save</button>
     <p id="status"></p>
 

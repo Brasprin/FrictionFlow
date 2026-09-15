@@ -1,0 +1,167 @@
+<!doctype html>
+<!--
+  FrictionFlow — standardised distraction task: memory card matching.
+  Design and rationale: DISTRACTION_SPEC.md.
+
+  Two modes. Inside the extension, background.js opens this page in a new tab
+  at the scheduled minutes and the log is saved to chrome.storage for the
+  export. Opened directly as a file it runs standalone, with nothing saved —
+  useful for trying it out.
+
+  Why build this instead of using an existing app: every existing memory game
+  shuffles the cards, so each participant would face a different problem. Here
+  every layout is FIXED IN ADVANCE — board 2 of set A, episode 1 is identical for
+  every participant on every machine.
+
+  The game's code is in memory.js, not inline here: extension pages run under a
+  Content Security Policy that blocks inline scripts. Keep it that way.
+
+  URL parameters
+    set      A | B      card set. Every participant plays A (one session each);
+                        B exists should a second session per participant return
+    episode  1 | 2 | 3  which of the session's three distractions this is; each
+                        has its own boards, so a later distraction never repeats
+                        an earlier one
+    seconds  number     exposure before "time's up" (default 180)
+    debug    1          show the researcher log panel
+
+  e.g. memory.html?set=A&episode=1&seconds=20&debug=1
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Memory Match</title>
+<style>
+  :root {
+    --bg: #F4F5FA;
+    --ink: #1E2233;
+    --muted: #6B7089;
+    --card-back: #3F4C9A;
+    --card-back-2: #5263C4;
+    --card-face: #FFFFFF;
+    --matched: #E7F6EE;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* Deliberately NOT FrictionFlow's teal: this should feel like another app the
+     participant has wandered into, not part of the writing tool. */
+  header {
+    width: 100%;
+    max-width: 640px;
+    padding: 20px 16px 8px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -0.3px; }
+  .status { font-size: 13px; color: var(--muted); }
+  .status strong { color: var(--ink); }
+  .hint { width: 100%; max-width: 640px; padding: 0 16px 12px; margin: 0; font-size: 13px; color: var(--muted); }
+
+  /* Shown when the exposure time ends. It does NOT block the game: whether the
+     participant goes straight back or keeps playing is exactly the "slipping
+     off" the study wants to observe, and it is logged. */
+  #timesUp {
+    width: calc(100% - 32px);
+    max-width: 608px;
+    margin: 0 0 12px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: #FFF4E5;
+    border: 1px solid #F5C98A;
+    color: #7A4A0A;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  #board {
+    display: grid;
+    gap: 10px;
+    padding: 0 16px 24px;
+    width: 100%;
+  }
+  .card {
+    appearance: none;
+    display: block;
+    width: 100%;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    aspect-ratio: 1;
+    border-radius: 12px;
+    perspective: 600px;
+    background: none;
+  }
+  .card:focus-visible { outline: 3px solid #F5C98A; outline-offset: 2px; }
+  /* Must be block-level: the card's markup uses <span>s (valid inside a
+     <button>), and an inline span ignores width/height — the absolutely
+     positioned faces then collapse to zero size and the card draws nothing. */
+  .inner {
+    display: block;
+    position: relative;
+    width: 100%;
+    height: 100%;
+    transform-style: preserve-3d;
+    transition: transform 0.3s ease;
+  }
+  .card.up .inner, .card.matched .inner { transform: rotateY(180deg); }
+  .face {
+    position: absolute;
+    inset: 0;
+    border-radius: 12px;
+    backface-visibility: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .back {
+    background: linear-gradient(145deg, var(--card-back), var(--card-back-2));
+    box-shadow: 0 2px 6px rgba(30, 34, 51, 0.18);
+  }
+  .front {
+    background: var(--card-face);
+    transform: rotateY(180deg);
+    box-shadow: 0 2px 6px rgba(30, 34, 51, 0.12);
+  }
+  .card.matched .front { background: var(--matched); }
+  .front svg { width: 62%; height: 62%; }
+
+  @media (prefers-reduced-motion: reduce) { .inner { transition: none; } }
+
+  #debug {
+    width: calc(100% - 32px);
+    max-width: 608px;
+    margin: 0 0 24px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: #1E2233;
+    color: #C9CEE8;
+    font: 12px/1.6 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Memory Match</h1>
+    <div class="status">Board <strong id="boardNo">1</strong> · Pairs found <strong id="pairs">0</strong></div>
+  </header>
+  <p class="hint">Flip two cards at a time and find the matching pairs.</p>
+  <div id="timesUp" hidden>Time's up — please go back to your writing.</div>
+  <div id="board" role="grid" aria-label="Memory cards"></div>
+  <div id="debug" hidden></div>
+
+<script src="memory.js"></script>
+</body>
+</html>

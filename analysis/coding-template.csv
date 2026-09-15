@@ -1,0 +1,6 @@
+start,end,phase,attention
+0:00,3:20,Planning,Focused
+3:20,5:45,Translating,Focused
+5:45,6:10,Translating,Distracted
+6:10,9:30,Translating,Focused
+9:30,11:00,Reviewing,Focused

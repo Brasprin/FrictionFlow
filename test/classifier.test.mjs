@@ -458,10 +458,9 @@ console.log("\n17. Calibrated profile changes behaviour");
 }
 
 // ── 18. profiles are kept per participant ──────────────────────────────────
-// The study is within-subjects: each participant runs two sessions that may be
-// days apart, with other participants calibrated in between. A single-profile
-// key would drop the earlier participant onto default thresholds for their
-// second session while still reporting them as calibrated.
+// Several participants may be calibrated on one machine before their sessions
+// run. A single-profile key would drop the earlier participant onto default
+// thresholds for their session while still reporting them as calibrated.
 console.log("\n18. One profile per participant");
 {
   const ctx = makeContext();
@@ -479,11 +478,11 @@ console.log("\n18. One profile per participant");
   check("P01 survived P02 calibrating", store.P01.valid, true);
   check("profiles are not the same object", store.P01.capturedAt !== store.P02.capturedAt, true);
 
-  // P01 returns for their second session.
+  // P01's session starts after P02 was calibrated.
   ctx.__stored.ff_task = { participantId: "P01" };
   ctx.startTracking();
   tick(ctx);
-  check("P01 second session uses P01's profile", session(ctx).calibrationProfileId, "P01");
+  check("P01's session uses P01's profile", session(ctx).calibrationProfileId, "P01");
   check("and it is still valid", session(ctx).calibrationValid, true);
   check("with P01's own gate", session(ctx).thresholds.wpmGate, store.P01.thresholds.wpmGate);
 }
@@ -607,6 +606,59 @@ console.log("\n23. Breaks are not traced");
   ctx.flushTraceToStorage();
   check("no rows recorded during a sanctioned break",
         ctx.__stored.ff_trace.rows.length, before);
+}
+
+
+// ── 24. scheduled distractions are tagged induced ──────────────────────────
+// The scheduled game is detected almost perfectly (leaving the tab is
+// categorical), so the analysis must be able to separate it from natural
+// drifting or the attention kappa is inflated.
+console.log("\n24. Induced versus natural episodes");
+{
+  const ctx = makeContext();
+  ctx.__stored.ff_distraction = { active: true, episode: 2 };
+  ctx.startTracking();
+  typeChars(ctx, 100, 150);
+  tick(ctx);
+  tabSwitch(ctx, 90_000);          // off to the memory game
+  const ep = session(ctx).activeDistraction;
+  check("tagged induced", ep.induced, true);
+  check("linked to scheduled distraction 2", ep.inducedEpisode, 2);
+  typeChars(ctx, 1, 100);          // resumes writing
+  tick(ctx);
+  check("the closed episode keeps the tag", session(ctx).distractionEpisodes[0].induced, true);
+}
+{
+  const ctx = makeContext();       // no scheduled distraction in progress
+  ctx.startTracking();
+  typeChars(ctx, 100, 150);
+  tick(ctx);
+  tabSwitch(ctx, 90_000);
+  check("drifting off on your own is natural", session(ctx).activeDistraction.induced, false);
+  check("with no linked distraction", session(ctx).activeDistraction.inducedEpisode, null);
+}
+
+// ── 25. the break flag survives the periodic save ──────────────────────────
+// The scheduler reads isOnBreak to avoid opening the game mid-break. The
+// periodic flush REPLACES the saved session wholesale, so a flag written only
+// by startBreak would be wiped within seconds.
+console.log("\n25. Break flag is reported and kept");
+{
+  const ctx = start();
+  typeChars(ctx, 50, 150);
+  tick(ctx);
+  ctx.startBreak();
+  check("on break is saved", session(ctx).isOnBreak, true);
+  ctx.flushPhaseToStorage();       // the merge-style save
+  check("kept by the merge save", session(ctx).isOnBreak, true);
+  // The periodic save that REPLACES ff_session — the one that would have wiped
+  // the flag. It is the first interval startTracking registers, and it only
+  // writes after activity, so a keystroke during the break arms it.
+  typeChars(ctx, 1, 100);
+  ctx.__intervals[0].fn();
+  check("kept by the wholesale periodic save", session(ctx).isOnBreak, true);
+  ctx.endBreak(40_000, true, true);
+  check("cleared when the break ends", session(ctx).isOnBreak, false);
 }
 
 console.log(`

@@ -425,3 +425,207 @@ Field guidance:
     generatedAt: Date.now(),
   };
 }
+
+//------------------ Scheduled Distraction Task -------------------//
+// The standardised secondary task (DISTRACTION_SPEC.md). At fixed minutes into
+// the session a memory-match game opens in a new tab; this section schedules
+// it, defers it when it cannot fairly be delivered, and records when the
+// participant returns to the document.
+//
+// Condition-blind by construction: nothing here reads ff_task.condition. The
+// distraction must be identical in both arms so that the recovery prompt is the
+// only thing that differs between them.
+
+const DISTRACTION_SCHEDULE_MIN = [10, 25, 40];
+const DISTRACTION_EXPOSURE_SEC = 180;
+// Researcher testing only (Options → "Short schedule"), so the whole flow can
+// be checked in about six minutes instead of forty-three. Exposure is 70 s, not
+// shorter, because a distraction is only detected after 60 s off the tab — a
+// shorter game would end before the held reminder, the part most worth
+// checking, could ever appear. Sessions run this way are stamped testMode.
+const TEST_SCHEDULE_MIN = [1, 3, 5];
+const TEST_EXPOSURE_SEC = 70;
+// chrome.alarms will not fire sooner than 30s in MV3, which also sets how
+// finely a deferred distraction can be retried.
+const DISTRACTION_RETRY_MS = 30000;
+const DISTRACTION_ALARM_PREFIX = "ff_distraction_";
+
+// Alarms rather than setTimeout: MV3 puts this service worker to sleep after
+// ~30s idle, which silently kills plain timers. Alarms survive that.
+// The schedule is decided ONCE, at session start, and saved as the session's
+// plan. Delivery reads the plan rather than the live setting, so toggling the
+// option mid-session cannot turn a real session partly into a test run.
+async function scheduleDistractions(sessionStartTime) {
+  const { ff_settings: settings } = await chrome.storage.local.get("ff_settings");
+  const testMode = !!settings?.shortDistractions;
+  const plan = {
+    testMode,
+    scheduleMin: testMode ? TEST_SCHEDULE_MIN : DISTRACTION_SCHEDULE_MIN,
+    exposureSec: testMode ? TEST_EXPOSURE_SEC : DISTRACTION_EXPOSURE_SEC,
+    sessionStartTime,
+  };
+  await chrome.storage.local.set({ ff_distraction_plan: plan });
+  plan.scheduleMin.forEach((minute, i) => {
+    chrome.alarms.create(`${DISTRACTION_ALARM_PREFIX}${i + 1}`, { when: sessionStartTime + minute * 60000 });
+  });
+  if (testMode) console.log("FrictionFlow: SHORT distraction schedule — this session is a test run.");
+}
+
+function clearDistractions() {
+  DISTRACTION_SCHEDULE_MIN.forEach((_, i) => chrome.alarms.clear(`${DISTRACTION_ALARM_PREFIX}${i + 1}`));
+}
+
+// Every participant plays set A. Each takes part in one session only
+// (between-subjects), so nobody can meet a layout twice, and giving everyone
+// the identical boards is what keeps the distraction the same across the two
+// groups. The game still supports set B (?set=B) should a second session per
+// participant ever be reintroduced.
+function distractionSetFor() {
+  return "A";
+}
+
+// Every read-modify-write of the distraction records runs through this queue.
+// Closing the game tab and switching back to the document fire separate events
+// at almost the same moment; run concurrently, the second write would clobber
+// the first.
+let distractionQueue = Promise.resolve();
+function serialDistraction(fn) {
+  distractionQueue = distractionQueue.then(fn, fn).catch((err) =>
+    console.error("FrictionFlow: distraction task error", err)
+  );
+  return distractionQueue;
+}
+
+// Driven by storage rather than by a message from the panel, so the schedule
+// follows the session itself: a new sessionStartTime means a new session; the
+// task disappearing means it finished, was cancelled, or never connected.
+// A tabId update on resume keeps the same sessionStartTime and reschedules
+// nothing.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.ff_task) return;
+  const before = changes.ff_task.oldValue;
+  const after = changes.ff_task.newValue;
+  if (!after) {
+    clearDistractions();
+    return;
+  }
+  if (after.sessionStartTime && after.sessionStartTime !== before?.sessionStartTime) {
+    clearDistractions();
+    serialDistraction(() => scheduleDistractions(after.sessionStartTime));
+  }
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm.name.startsWith(DISTRACTION_ALARM_PREFIX)) return;
+  const episode = Number(alarm.name.slice(DISTRACTION_ALARM_PREFIX.length));
+  serialDistraction(() => deliverDistraction(episode));
+});
+
+async function deliverDistraction(episode) {
+  const got = await chrome.storage.local.get([
+    "ff_task", "ff_session", "ff_interrupted", "ff_distraction", "ff_distractions", "ff_distraction_plan",
+  ]);
+  const task = got.ff_task;
+  if (!task) return; // session over — nothing to interrupt
+  // Falls back to the real schedule if the plan is missing — never silently to
+  // the test one.
+  const plan = got.ff_distraction_plan?.sessionStartTime === task.sessionStartTime
+    ? got.ff_distraction_plan
+    : { testMode: false, scheduleMin: DISTRACTION_SCHEDULE_MIN, exposureSec: DISTRACTION_EXPOSURE_SEC };
+
+  const retry = (why) => {
+    console.log(`FrictionFlow: distraction ${episode} deferred — ${why}.`);
+    chrome.alarms.create(`${DISTRACTION_ALARM_PREFIX}${episode}`, { when: Date.now() + DISTRACTION_RETRY_MS });
+  };
+
+  // Deferred, never skipped: a distraction delivered during a sanctioned break
+  // or an interruption would not be a comparable exposure, but dropping it
+  // would leave that participant with fewer episodes than everyone else.
+  if (got.ff_interrupted) return retry("session interrupted");
+  if (got.ff_session?.isOnBreak) return retry("participant on a break");
+  if (got.ff_distraction?.active) return retry("previous distraction still open");
+
+  let docsTab;
+  try {
+    docsTab = await chrome.tabs.get(task.tabId);
+  } catch (e) {
+    return retry("session tab not found");
+  }
+
+  const set = distractionSetFor(task);
+  const url = chrome.runtime.getURL(
+    `distraction/memory.html?set=${set}&episode=${episode}&seconds=${plan.exposureSec}`
+  );
+  const gameTab = await chrome.tabs.create({ url, windowId: docsTab.windowId, active: true });
+
+  const scheduledAt = task.sessionStartTime + plan.scheduleMin[episode - 1] * 60000;
+  const openedAt = Date.now();
+  const record = {
+    episode,
+    set,
+    scheduledAt,
+    openedAt,
+    // How late it landed relative to the schedule. Normally ~0; non-zero means
+    // it was deferred by a break or interruption.
+    deferredMs: Math.max(0, openedAt - scheduledAt),
+    exposureSec: plan.exposureSec,
+    // A short-schedule test run, never study data. Carried on every record so
+    // it cannot be separated from the data it describes.
+    testMode: !!plan.testMode,
+    gameTabId: gameTab.id,
+    returnedAt: null,
+    gameClosedAt: null,
+  };
+  const list = (got.ff_distractions ?? []).filter((d) => d.episode !== episode);
+  await chrome.storage.local.set({
+    ff_distraction: { active: true, ...record },
+    ff_distractions: [...list, record],
+  });
+  console.log(`FrictionFlow: distraction ${episode} delivered (set ${set}).`);
+}
+
+// The return to the document. Recorded here, in one place, rather than in
+// content.js, so a single owner writes the distraction records.
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  serialDistraction(() => recordDistractionReturn(tabId));
+});
+
+async function recordDistractionReturn(tabId) {
+  const got = await chrome.storage.local.get(["ff_task", "ff_distraction", "ff_distractions"]);
+  const current = got.ff_distraction;
+  if (!current?.active || !got.ff_task || tabId !== got.ff_task.tabId) return;
+
+  const returnedAt = Date.now();
+  const list = (got.ff_distractions ?? []).map((d) =>
+    d.episode === current.episode ? { ...d, returnedAt } : d
+  );
+  await chrome.storage.local.set({
+    ff_distraction: { ...current, active: false, returnedAt },
+    ff_distractions: list,
+  });
+
+  // One exposure, one return: close the game so it cannot become a standing
+  // second distraction. Whether they came back before or after "time's up" is
+  // already captured by returnedAt against the game log.
+  chrome.tabs.remove(current.gameTabId).catch(() => {});
+}
+
+// The participant closed the game themselves. Chrome then activates a
+// neighbouring tab; if that is the document, the handler above records the
+// return. Either way the closure is logged, because closing before "time's up"
+// means the exposure was cut short.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  serialDistraction(async () => {
+    const got = await chrome.storage.local.get(["ff_distraction", "ff_distractions"]);
+    const current = got.ff_distraction;
+    if (!current || tabId !== current.gameTabId || current.gameClosedAt) return;
+    const gameClosedAt = Date.now();
+    const list = (got.ff_distractions ?? []).map((d) =>
+      d.episode === current.episode ? { ...d, gameClosedAt } : d
+    );
+    await chrome.storage.local.set({
+      ff_distraction: { ...current, gameClosedAt },
+      ff_distractions: list,
+    });
+  });
+});
