@@ -105,15 +105,29 @@ explicitly when to switch. This is what makes the behavioural data **labelled**.
 **Ordering is fixed and non-arbitrary:** reviewing requires text to review, which
 requires writing first. State this in the paper — it looks arbitrary otherwise.
 
-**Task:** *"Should class attendance be optional at university? Take a position
-and give at least two reasons."*
+**Task:** *"Should class attendance be optional at university? Take a position,
+give at least two reasons, and respond to one argument someone on the other side
+might make."*
 
 The same prompt for every participant, so differences between profiles reflect
-the writer rather than the topic. Requirements it meets:
+the writer rather than the topic.
 
-- **easy but requires thinking** — no subject knowledge needed, yet taking a
-  position and finding two reasons produces genuine Planning pauses (a prompt
-  too trivial to think about yields too few pauses and falls back to defaults)
+**What the task is for.** The instructed segments *guarantee* that all three
+phases occur — the participant is told which one to be in. The topic's job is to
+make each phase **genuine**, as it would be in the real task, rather than acted.
+Requirements it meets:
+
+- **genuine Planning** — the phase that matters most, since it is where false
+  positives occur. Attendance alone was too familiar: most students hold a
+  ready-made opinion, which leaves little to plan, so the Planning step becomes
+  waiting and yields too few pauses (`idle-fallback:Planning`, already observed
+  in testing). The counterargument clause fixes this — an opposing argument
+  cannot be recalled, it has to be imagined and weighed.
+- **genuine Translating** — a position, two reasons and a rebuttal fill five
+  minutes of drafting
+- **genuine Reviewing** — participants are told to draft for ideas rather than
+  correctness, so the draft carries real flaws worth revising
+- **easy** — no subject knowledge needed
 - **self-contained** — no outside research, so tab-switching is not induced
 - **knowledge-neutral across courses** — a campus-life question every student
   has lived equally
@@ -131,6 +145,15 @@ pausing may run longer than the calibrated baseline. The two-family rule and the
 3× severe tier absorb part of this; the rest is measured in the pilot by
 comparing calibration pauses with pauses during Focused stretches of the session.
 Report it as a limitation.
+
+**Separated versus interleaved phases.** In real writing the three processes
+interleave — Flower & Hayes describe them as recursive: a writer plans a little,
+drafts a sentence, rereads, drafts again. Calibration separates them
+deliberately, because separation is what yields clean labels. The consequence is
+that each phase is measured **in isolation**, while the main task presents them
+**mixed**. Calibration cannot show that the classifier recognises the phases
+when they interleave; that is tested separately, against human-coded screen
+recordings. State this in the paper as a deliberate trade-off.
 
 **Main-task pairing.** Each participant writes two sessions from their
 coursework. The two assignments must be of comparable difficulty, and their

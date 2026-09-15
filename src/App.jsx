@@ -1960,8 +1960,15 @@ const CALIBRATION_TEST_SECONDS = 30;
 // about generative AI, which gave CS and IT students a knowledge advantage the
 // calibration is meant to exclude — and the main task is drawn from each
 // participant's own coursework, so the calibration must stay outside all of it.
+//
+// The counterargument clause exists for the Planning segment. Attendance is a
+// topic most students already hold an opinion on, and a ready-made opinion
+// leaves little to plan — the Planning step turns into waiting, which yields
+// too few pause observations and falls back to default thresholds. A
+// counterargument cannot be recalled; it has to be imagined and weighed, which
+// is the genuine planning the real coursework demands.
 const CALIBRATION_TASK =
-  "Should class attendance be optional at university? Take a position and give at least two reasons.";
+  "Should class attendance be optional at university? Take a position, give at least two reasons, and respond to one argument someone on the other side might make.";
 
 // Matches CALIB_WARMUP_MS in content.js. Surfaced to the participant because a
 // step that visibly ignores its own first half-minute is otherwise confusing.
