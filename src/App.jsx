@@ -1954,8 +1954,14 @@ const CALIBRATION_TOTAL_MIN = Math.round(
 // costs a re-run, never a corrupted participant.
 const CALIBRATION_TEST_SECONDS = 30;
 
+// Same prompt for every participant, so differences between profiles reflect
+// the writer rather than the topic. Deliberately a campus-life question: every
+// student has lived it equally, whatever their course. The previous prompt was
+// about generative AI, which gave CS and IT students a knowledge advantage the
+// calibration is meant to exclude — and the main task is drawn from each
+// participant's own coursework, so the calibration must stay outside all of it.
 const CALIBRATION_TASK =
-  "Should university students be allowed to use generative AI tools for academic work? Explain your position and give at least two reasons.";
+  "Should class attendance be optional at university? Take a position and give at least two reasons.";
 
 // Matches CALIB_WARMUP_MS in content.js. Surfaced to the participant because a
 // step that visibly ignores its own first half-minute is otherwise confusing.
