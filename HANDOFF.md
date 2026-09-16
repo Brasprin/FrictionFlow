@@ -126,7 +126,7 @@ recorded as the *overrun* — the "slipping off" the study wants to observe.
 
 ## 3. Current state
 
-**Working and tested** (`npm test` — 152 checks across four files): two-label
+**Working and tested** (`npm test` — 172 checks across five files): two-label
 classifier, calibration capture and profile maths, calibration UI, per-participant
 profile storage, decision trace, the scheduled distraction task, export, and
 the analysis script.
@@ -169,21 +169,30 @@ Assume more of that class remains.
 6. **Second coder on ~20% of recordings**, for inter-rater kappa. Agreement with
    a coder means nothing if the coder is unreliable, and it is the first thing a
    panel asks about ground truth.
-7. **The design changed to between-subjects (one session per participant).**
+7. **The session writing task changed, and the topic is not final.** The pilot
+   used each participant's own coursework; participants left the document to
+   look things up, and any tab-away over 60 s is recorded as distraction, so
+   those episodes were not distraction. The study now uses one standardised
+   prompt with three conflicting source excerpts supplied **inside** the
+   document, which keeps the memory load high without sending anyone out of the
+   tab. **Still to do:** confirm the topic and write the three sources with
+   checked citations — `study-materials/session-document-template.md`. The
+   prompt in the extension is provisional and must match that document.
+8. **The design changed to between-subjects (one session per participant).**
    Everything written still describes two sessions per participant: thesis §4.1
    (*"within-subject … each participant completes two writing sessions"*), the
    analysis plan in §4.4–4.5 (paired t-tests), conference paper §4.3 and §4.5,
    and the ethics documents (*"The study will involve two writing sessions"*).
    All need revising, and **the ethics committee may need to approve the change**
    before data collection.
-8. **Statistics for H1–H4 change.** Paired t-test / Wilcoxon signed-rank become
+9. **Statistics for H1–H4 change.** Paired t-test / Wilcoxon signed-rank become
    **independent-samples t-test / Mann–Whitney U**, baseline group against
    intervention group. (The calibrated-versus-fixed threshold comparison in
    `analysis/` stays paired — both scores come from the same session.)
-9. **Sample size.** A between-subjects comparison needs roughly **twice as many
+10. **Sample size.** A between-subjects comparison needs roughly **twice as many
    participants** for the same sensitivity, because differences between people
    no longer cancel out. Plan recruitment accordingly.
-10. **Assignment and balance.** Assign conditions at random or from a pre-drawn
+11. **Assignment and balance.** Assign conditions at random or from a pre-drawn
     balanced list, and balance the difficulty of the coursework tasks across the
     two groups. Record each participant's course and assignment so the balance
     can be checked.
@@ -232,7 +241,7 @@ design decisions. The recording validation is what tests those.
 ```bash
 npm install
 npm run build      # compiles the panel and copies public/ into dist/
-npm test           # 152 checks
+npm test           # 172 checks
 npm run lint       # ~120 pre-existing errors: eslint has no webextension globals
 ```
 
@@ -266,7 +275,7 @@ rather than a corrupted participant.
 public/content.js     the sensor — classifier, calibration capture, trace
 public/background.js  watchdog, Docs API, Gemini recovery summaries
 src/App.jsx           the side panel — all screens, and the export builder
-test/                 152 checks: content script, analysis replay, distraction scheduler
+test/                 172 checks: content script, analysis replay, distraction scheduler
 analysis/             threshold-comparison script + coding template
 CALIBRATION_SPEC.md   every calibration decision and formula, with rationale
 DISTRACTION_SPEC.md   the scheduled memory-game distraction task

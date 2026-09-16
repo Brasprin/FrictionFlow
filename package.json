@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node test/classifier.test.mjs && node test/replay.test.mjs && node test/distraction.test.mjs && node test/extension-pages.test.mjs",
+    "test": "node test/classifier.test.mjs && node test/replay.test.mjs && node test/distraction.test.mjs && node test/extension-pages.test.mjs && node test/docs-auth.test.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

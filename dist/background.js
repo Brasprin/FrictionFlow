@@ -38,21 +38,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       families: message.families,
     });
   } else if (message.type === "FF_ENSURE_DOCS_AUTH") {
-    // Sent by the side panel at session connect so the one-time Google
-    // consent popup happens at start, never mid-writing. Failure is fine —
-    // doc reading degrades to keystroke approximation everywhere.
-    getDocsAuthToken(true)
-      .then(() => sendResponse({ ok: true }))
-      .catch((err) => {
-        console.warn("FrictionFlow: Docs API auth unavailable —", err.message);
-        sendResponse({ ok: false });
-      });
+    // Sent by the side panel at session connect so the one-time Google consent
+    // popup happens at start, never mid-writing, and by the Connect button.
+    // Failure is fine — doc reading degrades to keystroke approximation — but
+    // the reason is reported back so the panel can say what went wrong.
+    ensureDocsAuth(message.force === true)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, reason: err?.message ?? "unknown" }));
     return true; // async sendResponse
   } else if (message.type === "FF_SYNC_WORD_COUNT") {
     // content.js asks for the real word count. Only the count (a number)
     // leaves this function — the document text stays ephemeral in here.
     getTaskDocText()
-      .then((text) => sendResponse({ wordCount: text === null ? null : countWords(text) }))
+      .then((text) => sendResponse({
+        wordCount: text === null ? null : countWords(text),
+        transient: text === null && docsFailureWasTransient(),
+      }))
       .catch(() => sendResponse({ wordCount: null }));
     return true; // async sendResponse
   }
@@ -122,6 +123,84 @@ function countWords(text) {
   return text.trim().split(/\s+/).filter(Boolean).length;
 }
 
+// Records why document reading last failed, so the panel can show something
+// better than "not connected" and the service-worker console names the cause.
+// Without this every failure path returned null and they were indistinguishable:
+// no consent, the wrong tab, or a document the signed-in account cannot open.
+function setDocsStatus(ok, reason) {
+  chrome.storage.local.set({ ff_docs_status: { ok, reason: reason ?? null, at: Date.now() } });
+  if (!ok) console.warn(`FrictionFlow: Docs API unavailable — ${reason}`);
+}
+
+// Chrome hands back its CACHED token even when interactive is true, so a
+// revoked or expired grant cannot be repaired by asking again — the same dead
+// token comes back and the panel keeps saying "not connected". Clearing the
+// cache first is what forces a real consent prompt.
+async function ensureDocsAuth(force) {
+  if (force) {
+    try {
+      const stale = await getDocsAuthToken(false);
+      if (stale) await removeCachedToken(stale);
+    } catch (e) {
+      // Nothing cached — the interactive request below prompts anyway.
+    }
+  }
+  let token;
+  try {
+    token = await getDocsAuthToken(true);
+  } catch (err) {
+    setDocsStatus(false, `sign-in failed: ${err.message}`);
+    return { ok: false, reason: `sign-in failed: ${err.message}` };
+  }
+  // A token is not proof of access: the document may belong to another Google
+  // account, or the API may be disabled. Verify with a real read before
+  // telling the panel it is connected.
+  const { ff_task: task } = await chrome.storage.local.get("ff_task");
+  if (!task?.tabId) {
+    setDocsStatus(true, null);
+    return { ok: true, reason: "signed in; no session document to verify against" };
+  }
+  try {
+    const text = await getTaskDocText();
+    if (text === null) {
+      const { ff_docs_status: st } = await chrome.storage.local.get("ff_docs_status");
+      return { ok: false, reason: st?.reason ?? "could not read the document" };
+    }
+    setDocsStatus(true, null);
+    return { ok: true };
+  } catch (err) {
+    setDocsStatus(false, err.message);
+    return { ok: false, reason: err.message };
+  }
+}
+
+// Google returns a JSON body explaining why it refused. Reading it turns
+// "access refused" into the actual fix: SERVICE_DISABLED means the Docs API is
+// switched off in the Cloud project, ACCESS_TOKEN_SCOPE_INSUFFICIENT means the
+// granted scope is too narrow (re-consent after a manifest scope change).
+// Never let this throw: it runs while reporting another failure.
+async function googleErrorDetail(res) {
+  try {
+    const body = await res.json();
+    const err = body?.error;
+    if (!err) return null;
+    const code = err.details?.find((d) => d.reason)?.reason ?? err.status;
+    const known = {
+      SERVICE_DISABLED: "the Google Docs API is not enabled for this extension's Cloud project",
+      ACCESS_TOKEN_SCOPE_INSUFFICIENT: "the sign-in did not grant permission to read documents",
+      ACCESS_TOKEN_EXPIRED: "the access token expired",
+      RATE_LIMIT_EXCEEDED: "too many requests to the Docs API — this clears by itself",
+      USER_RATE_LIMIT_EXCEEDED: "too many requests to the Docs API — this clears by itself",
+      RESOURCE_EXHAUSTED: "too many requests to the Docs API — this clears by itself",
+      rateLimitExceeded: "too many requests to the Docs API — this clears by itself",
+      userRateLimitExceeded: "too many requests to the Docs API — this clears by itself",
+    }[code];
+    return known ?? err.message ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchDocText(docId) {
   const docsGet = (token) =>
     fetch(`https://docs.googleapis.com/v1/documents/${docId}?fields=body`, {
@@ -138,7 +217,28 @@ async function fetchDocText(docId) {
     res = await docsGet(token);
   }
 
-  if (!res.ok) throw new Error(`Docs API error: ${res.status}`);
+  if (!res.ok) {
+    // Named causes, because these need different fixes. 401 after the retry
+    // means the grant is gone and only an interactive reconnect restores it;
+    // 403 usually means the Docs API is disabled or the scope was refused;
+    // 404 most often means the document belongs to a different Google account
+    // than the one Chrome is signed in as — common on a shared study machine.
+    const reason = {
+      401: "Google sign-in expired — click Connect to sign in again",
+      403: "access refused (Docs API disabled, or permission not granted)",
+      404: "document not found for the signed-in Google account",
+    }[res.status] ?? `Docs API error ${res.status}`;
+    // Google explains its own refusals, and 403 has several distinct causes
+    // that need different fixes. Prefer its answer to our guess.
+    const detail = await googleErrorDetail(res);
+    const err = new Error(detail ? `${reason} — ${detail}` : reason);
+    // Google answers an exceeded quota with 403 as often as 429, and a quota
+    // clears on its own. Treating it as a broken connection would put a
+    // "not connected" banner in front of a participant mid-session for
+    // something that needs no action at all.
+    err.transient = res.status === 429 || (res.status === 403 && /too many requests/.test(err.message));
+    throw err;
+  }
   const doc = await res.json();
   return extractTextFromStructuralElements(doc.body?.content ?? []);
 }
@@ -146,23 +246,39 @@ async function fetchDocText(docId) {
 // Resolves the session doc from ff_task.tabId and returns its full text,
 // or null on any failure (no task, tab gone, no auth, API error) so every
 // caller degrades gracefully instead of blocking the writing session.
+// Set by the last getTaskDocText call: true when the failure was a rate limit
+// or server blip, so callers can back off instead of reporting a lost connection.
+let lastDocsFailureTransient = false;
+function docsFailureWasTransient() { return lastDocsFailureTransient; }
+
 async function getTaskDocText() {
   const { ff_task: task } = await chrome.storage.local.get("ff_task");
-  if (!task?.tabId) return null;
+  if (!task?.tabId) return null; // no session — not a failure worth reporting
 
   let tab;
   try {
     tab = await chrome.tabs.get(task.tabId);
   } catch (e) {
+    setDocsStatus(false, "the session tab is gone — reopen the document and resume");
     return null;
   }
 
   const docId = extractDocId(tab?.url);
-  if (!docId) return null;
+  if (!docId) {
+    setDocsStatus(false, "the session tab is not a Google Doc");
+    return null;
+  }
 
   try {
-    return await fetchDocText(docId);
+    const text = await fetchDocText(docId);
+    lastDocsFailureTransient = false;
+    setDocsStatus(true, null);
+    return text;
   } catch (e) {
+    lastDocsFailureTransient = e.transient === true;
+    // A transient failure leaves the recorded status alone: the connection is
+    // not broken, so the panel should go on saying what it said before.
+    if (!e.transient) setDocsStatus(false, e.message);
     return null;
   }
 }
@@ -295,10 +411,32 @@ async function handleStuckCheck(isBreakRecovery = false, context = {}) {
 // Provider details are isolated in this one function so swapping providers
 // (e.g. to Claude) is a contained change. The API key is researcher-entered
 // via the options page (ff_settings) — never hardcoded.
+// The session document's divider, from study-materials/session-document-template.md.
+// Everything above it is researcher-supplied: the prompt and the three sources.
+const ESSAY_DIVIDER = "WRITE YOUR ESSAY BELOW THIS LINE";
+
+// Returns only what the participant wrote, or null when they have not started.
+// Falls back to the whole document if the divider is missing — a participant
+// may delete it, and a degraded excerpt beats no summary.
+function essayTextOnly(docText) {
+  if (!docText) return null;
+  const i = docText.lastIndexOf(ESSAY_DIVIDER);
+  if (i === -1) return docText.trim() || null;
+  // Skip the divider line itself and the rule of box characters under it.
+  const below = docText.slice(i + ESSAY_DIVIDER.length).replace(/^[^A-Za-z0-9]+/, "");
+  return below.trim() || null;
+}
+
 async function generateRecovery(session, task, docText, apiKey, isBreakRecovery = false, context = {}) {
-  // Only the tail of the doc goes into the prompt — "where you left off"
-  // lives at the end, and it keeps token cost bounded on long documents.
-  const docExcerpt = docText ? docText.slice(-2000) : null;
+  // Only the participant's own writing goes into the prompt. The session
+  // document arrives holding the task prompt and three source passages (~2,900
+  // characters), so a plain tail-slice of a barely-started essay is mostly
+  // source material — and the summary would quote a source back at the writer
+  // as "where you left off", which is worse than no summary at all. Everything
+  // above the divider is stripped first; the tail-slice then bounds token cost
+  // on a long essay.
+  const essay = essayTextOnly(docText);
+  const docExcerpt = essay ? essay.slice(-2000) : null;
 
   // What the writer was doing when the interruption hit. Under the two-label
   // model the phase is simply KNOWN at onset — it is never overwritten by the

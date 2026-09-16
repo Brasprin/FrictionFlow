@@ -780,14 +780,23 @@ function TaskInitScreen({ onStart, onCalibrate }) {
   // started, because a participant session run with it on becomes a test run.
   const [shortDistractions, setShortDistractions] = useState(false);
 
-  // Self-contained senior high school writing prompts — opinion/reflection
-  // based, so participants can write from their own knowledge without needing
-  // to leave the doc to research (tab-switching would register as distraction).
-  const templates = [
-    { name: "Position Paper", obj: "Argue for or against allowing students to use AI tools for schoolwork. Take a clear stance and support it with at least three reasons." },
-    { name: "Reflective Essay", obj: "Reflect on a challenge you faced this school year and what it taught you about yourself as a student." },
-    { name: "Argumentative Essay", obj: "Should senior high school students be required to wear uniforms? Defend your position with clear arguments." },
-  ];
+  // One standardised task for every participant, replacing the three older
+  // quick-fill prompts. Two reasons it is a single prompt and not a choice:
+  //
+  //  - Participants writing their own coursework left the document to look
+  //    things up, and any tab-away over 60 s is recorded as distraction. The
+  //    sources now sit inside the document instead (study-materials/).
+  //  - Each participant does one session in one condition, so any difference
+  //    between the tasks people write lands unevenly between the two groups and
+  //    reads as an effect of the recovery prompt.
+  //
+  // The matching document — prompt, three conflicting sources, then the writing
+  // area — is study-materials/session-document-template.md. The topic below is
+  // PROVISIONAL and must match that document.
+  const studyTask = {
+    name: "Argumentative Essay",
+    obj: "Should universities replace final exams with projects? Write at least 500 words: take a clear position, give at least three reasons, use at least two of the three sources in the document, respond to the strongest argument against you, and end with a conclusion.",
+  };
 
   useEffect(() => {
     if (typeof chrome !== "undefined" && chrome.storage) {
@@ -1080,16 +1089,18 @@ function TaskInitScreen({ onStart, onCalibrate }) {
         )}
         {!isActive && (
           <>
-            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Quick templates</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
-              {templates.map(t => (
-                <button key={t.name} onClick={() => { setTaskName(t.name); setObjective(t.obj); }}
-                  style={{ textAlign: "left", background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>
-                  <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{t.name}</p>
-                  <p style={{ margin: 0, fontSize: 11, color: "#717182", marginTop: 2, lineHeight: 1.4 }}>{t.obj.slice(0, 50)}…</p>
-                </button>
-              ))}
-            </div>
+            <p style={{ fontSize: 11, fontWeight: 600, color: "#717182", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Study task</p>
+            <button
+              onClick={() => { setTaskName(studyTask.name); setObjective(studyTask.obj); setNameError(false); setObjectiveError(false); }}
+              style={{ textAlign: "left", width: "100%", background: "#F7FAF9", border: `1px solid ${TEAL[100]}`, borderRadius: 8, padding: "8px 10px", cursor: "pointer", marginBottom: 8 }}>
+              <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>Use the standard prompt</p>
+              <p style={{ margin: "2px 0 0", fontSize: 11, color: "#717182", lineHeight: 1.4 }}>{studyTask.obj.slice(0, 64)}…</p>
+            </button>
+            {/* Every participant must get the same task, so typing a different
+                one each session is the mistake worth guarding against. */}
+            <p style={{ margin: "0 0 14px", fontSize: 11, color: "#717182", lineHeight: 1.5 }}>
+              Same task for every participant. The document must already contain this prompt and its three sources.
+            </p>
           </>
         )}
         {isActive && !isInterrupted && (
@@ -1289,7 +1300,6 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   const [elapsed, setElapsed] = useState(0);                      // calculated locally every second
   const [wpm, setWpm] = useState(0);
   const [words, setWords] = useState(0);
-  const [totalDocWords, setTotalDocWords] = useState(0);
   const [totalPauses, setTotalPauses] = useState(0);
   const [longestPause, setLongestPause] = useState(0);
   const [scrollFrequency, setScrollFrequency] = useState(0);
@@ -1307,6 +1317,13 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   // and the panel offers a manual reconnect.
   const [docsConnected, setDocsConnected] = useState(false);
   const [docsConnecting, setDocsConnecting] = useState(false);
+  // Why the last connection attempt failed, straight from background.js.
+  const [docsError, setDocsError] = useState("");
+  // When Connect was last pressed. The poll only adopts a stored failure that
+  // is NEWER than this, so a reason recorded before the attempt cannot
+  // overwrite the result of the attempt itself. A ref, not state: the poll's
+  // closure is created once and would never see a state value change.
+  const lastConnectAttemptRef = useRef(0);
   // The next-step the participant chose for the CURRENT recovery episode, shown
   // between the phase and the active context. Null once a new episode generates
   // (its generatedAt no longer matches any choice) until they pick again.
@@ -1339,7 +1356,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   useEffect(() => {
     function readStorage() {
       if (typeof chrome !== "undefined" && chrome.storage) {
-        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices", "ff_distraction"], (result) => {
+        chrome.storage.local.get(["ff_session", "ff_task", "ff_recovery", "ff_suggestion_choices", "ff_distraction", "ff_docs_status"], (result) => {
           const s = result.ff_session;
           const t = result.ff_task;
 
@@ -1372,9 +1389,16 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
           // the moment a distraction begins (matching the reminder), instead of
           // lagging until the resuming keystroke closes the episode.
           setDistractionCount(s.distractionOnsetCount ?? 0);
-          setTotalDocWords(s.totalDocWords ?? 0);
-          if (s.docsConnected) { setDocsConnected(true); setDocsConnecting(false); }
-          else setDocsConnected(false);
+          if (s.docsConnected) { setDocsConnected(true); setDocsConnecting(false); setDocsError(""); }
+          else {
+            setDocsConnected(false);
+            // background.js records why reading the document last failed;
+            // showing it beats a bare "not connected".
+            const st = result.ff_docs_status;
+            if (st && st.ok === false && st.reason && (st.at ?? 0) > lastConnectAttemptRef.current) {
+              setDocsError(st.reason);
+            }
+          }
 
           // Auto-trigger the distraction prompt. Two independent triggers, so a
           // dismiss silences the current instance without disabling detection:
@@ -1495,15 +1519,24 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
   function handleConnectDocs() {
     if (typeof chrome === "undefined" || !chrome.runtime) return;
     setDocsConnecting(true);
+    setDocsError("");
+    lastConnectAttemptRef.current = Date.now();
     try {
-      chrome.runtime.sendMessage({ type: "FF_ENSURE_DOCS_AUTH" }, () => {
-        void chrome.runtime.lastError; // ignore; the poll reflects the real result
-        // Leave "connecting" until a sync confirms; time-box it so a
-        // dismissed popup doesn't spin forever.
-        setTimeout(() => setDocsConnecting(false), 8000);
+      // force:true clears Chrome's cached token first. Without it, asking again
+      // returns the same dead token instead of prompting, so a revoked or
+      // expired sign-in could never be repaired from here — the button appeared
+      // to work and the banner stayed.
+      chrome.runtime.sendMessage({ type: "FF_ENSURE_DOCS_AUTH", force: true }, (result) => {
+        void chrome.runtime.lastError;
+        setDocsConnecting(false);
+        // Say what happened. Previously this waited 8 s in silence and left the
+        // researcher guessing whether anything had been tried.
+        if (result?.ok) setDocsError("");
+        else setDocsError(result?.reason ?? "could not reach the extension — reload it and try again");
       });
     } catch (e) {
       setDocsConnecting(false);
+      setDocsError("could not reach the extension — reload it and try again");
     }
   }
 
@@ -1671,9 +1704,13 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
           {[
             { label: "Time", value: `${mins}:${secs}` },
-            // Doc total comes from the Docs API; without OAuth it stays 0,
-            // so fall back to the session's (keystroke-tracked) word count.
-            { label: "Words", value: totalDocWords > 0 ? totalDocWords : words },
+            // Words the participant has ADDED this session, not the whole
+            // document. The session document arrives pre-loaded with the prompt
+            // and three source passages (~450 words), so a whole-document count
+            // would start at ~450 and never show how much they had written.
+            // content.js already subtracts the starting text; this just stops
+            // the panel from showing the wrong one of the two numbers.
+            { label: "Words written", value: words },
             { label: "WPM", value: wpm },
             { label: "Pauses", value: totalPauses },
             { label: "Longest Pause", value: longestPauseLabel },
@@ -1694,7 +1731,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
             <div style={{ flex: 1 }}>
               <p style={{ margin: "0 0 2px", fontSize: 11, fontWeight: 700, color: "#B45309" }}>Google Docs not connected</p>
               <p style={{ margin: 0, fontSize: 11, color: "#92400E", lineHeight: 1.5 }}>
-                Word count is approximate and won't include pasted text. Connect to enable the exact count.
+                {docsError || "Word count is approximate and won't include pasted text. Connect to enable the exact count."}
               </p>
             </div>
             <Btn variant="outline" style={{ fontSize: 12, padding: "7px 12px", flexShrink: 0 }} onClick={handleConnectDocs}>
@@ -1739,7 +1776,7 @@ function ActiveMonitoringScreen({ setScreen, setSummary, hasRecoverySummary, set
         <div style={{ background: TEAL[50], borderRadius: 10, padding: "10px 12px", border: `1px solid ${TEAL[100]}`, marginBottom: 14 }}>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: TEAL[800] }}>{taskName}</p>
           <p style={{ margin: "4px 0 0", fontSize: 11, color: TEAL[600], lineHeight: 1.5 }}>
-            {objective} {totalDocWords > 0 ? `· ${totalDocWords} words` : ""} </p>
+            {objective} {words > 0 ? `· ${words} words written` : ""} </p>
         </div>
       </div>
       <div style={{ padding: 16, borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", flexDirection: "column", gap: 10 }}>
@@ -2593,7 +2630,11 @@ function AnalyticsScreen({ setScreen, summary }) {
   // Whole-document word count from the Docs API — matches the monitoring
   // "Words" tile. Falls back to the session-added keystroke count if the API
   // wasn't connected (totalDocWords stays 0 without OAuth).
-  const docWords = (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : (s.wordCount ?? 0);
+  // Words added this session. The whole-document count includes the prompt and
+  // the source passages the document starts with, so it is the wrong headline —
+  // it is kept in the breakdown below.
+  const addedWords = s.wordCount ?? 0;
+  const wholeDocWords = (s.totalDocWords ?? 0) > 0 ? s.totalDocWords : addedWords;
   const typedWords = s.typedWordCount ?? 0; // keystroke-typed words (excludes paste)
 
   // WPM denominators are deliberately independent of writingSecs (which now
@@ -2645,10 +2686,15 @@ function AnalyticsScreen({ setScreen, summary }) {
         ],
         note: "On-task only — distracted time inside each phase is excluded here and counted under Distractions.",
       } },
-    // No hover: the whole-document count speaks for itself, and its parts
-    // (prompt vs added) overlapped the Typed words tile. Renders as a plain,
-    // non-interactive tile.
-    { label: "Doc words", value: docWords, icon: "📝" },
+    { label: "Words written", value: addedWords, icon: "📝",
+      detail: {
+        rows: [
+          // What the document holds in total, including the prompt and the
+          // three source passages it started with.
+          { label: "Whole document", value: wholeDocWords },
+          { label: "Started with", value: Math.max(0, wholeDocWords - addedWords) },
+        ],
+      } },
     { label: "Typed words", value: typedWords, icon: "⌨️",
       detail: {
         rows: [

@@ -53,7 +53,20 @@ function makeContext() {
         id: "test",
         lastError: null,
         onMessage: { addListener() {} },
-        sendMessage: (msg, cb) => { ctx.__messages.push(msg); if (cb) cb(); },
+        sendMessage: (msg, cb) => {
+          ctx.__messages.push(msg);
+          // Answer word-count requests with whatever the fake Docs API holds,
+          // so the pre-loaded-document baseline can be exercised.
+          if (msg?.type === "FF_SYNC_WORD_COUNT" && ctx.__docTransient) {
+            if (cb) cb({ wordCount: null, transient: true });
+            return;
+          }
+          if (msg?.type === "FF_SYNC_WORD_COUNT" && ctx.__docWords !== null) {
+            if (cb) cb({ wordCount: ctx.__docWords });
+            return;
+          }
+          if (cb) cb();
+        },
       },
       storage: {
         local: {
@@ -66,6 +79,8 @@ function makeContext() {
         },
       },
     },
+    __docWords: null,   // whole-document word count the fake Docs API reports
+    __docTransient: false, // when true the fake Docs API reports a rate limit
     __intervals: [],
     __messages: [],
     __handlers: handlers,
@@ -659,6 +674,121 @@ console.log("\n25. Break flag is reported and kept");
   check("kept by the wholesale periodic save", session(ctx).isOnBreak, true);
   ctx.endBreak(40_000, true, true);
   check("cleared when the break ends", session(ctx).isOnBreak, false);
+}
+
+
+// ── 26. a pre-loaded document does not count as the participant's words ────
+// The session document arrives holding the prompt and three source passages
+// (~450 words). Those must not be credited to the participant: "words added"
+// has to start at zero and count only what they write.
+console.log("\n26. Pre-loaded document baseline");
+{
+  const ctx = makeContext();
+  ctx.__docWords = 443;            // the document already holds the prompt + sources
+  ctx.startTracking();
+  ctx.syncWordCount();             // first Docs API sync of the session
+  ctx.__intervals[0].fn();         // the periodic save
+  check("starts at zero words written", session(ctx).wordCount, 0);
+  check("the whole document is still recorded", session(ctx).totalDocWords, 443);
+  check("the starting size is remembered", session(ctx).docWordBaseline, 443);
+
+  typeChars(ctx, 250, 120);        // the participant writes ~50 words
+  ctx.__docWords = 493;
+  ctx.syncWordCount();
+  ctx.__intervals[0].fn();
+  check("counts only what they wrote", session(ctx).wordCount, 50);
+  check("whole document grew too", session(ctx).totalDocWords, 493);
+}
+
+// ── 27. the baseline survives a mid-session refresh ────────────────────────
+// A refresh re-injects the content script. Without the stored baseline it would
+// re-measure the document and credit the participant with the whole thing.
+console.log("\n27. Baseline survives reinjection");
+{
+  const ctx = makeContext();
+  ctx.__docWords = 443;
+  ctx.startTracking();
+  ctx.syncWordCount();
+  typeChars(ctx, 250, 120);
+  ctx.__docWords = 493;
+  ctx.syncWordCount();
+  ctx.__intervals[0].fn();
+  const before = session(ctx).wordCount;
+
+  // The tab is refreshed: a fresh script resumes from the stored snapshot.
+  const resumed = makeContext();
+  resumed.__docWords = 493;
+  resumed.__stored.ff_session = { ...session(ctx) };
+  resumed.__stored.ff_task = { participantId: "P01", sessionStartTime: clock - 60000 };
+  resumed.resumeTracking(resumed.__stored.ff_session, resumed.__stored.ff_task, 0, null);
+  resumed.syncWordCount();
+  resumed.__intervals[0].fn();
+  check("word count is not restarted from the document", session(resumed).wordCount, before);
+  check("and the document is not credited to them", session(resumed).wordCount < 100, true);
+}
+
+// -- 28. an unchanged document does not cost a Docs API request ------------
+// The word-count poll ticks every 2s for the whole session. Calling the API on
+// every tick is 30 reads/min against a 60/min per-user quota, and Google
+// answers an exceeded quota with 403 - which is what the panel reported as
+// "access refused". A tick may only spend a request if the count can have moved.
+console.log("\n28. The word-count poll does not ask when nothing was typed");
+{
+  const ctx = makeContext();
+  ctx.__docWords = 443;
+  ctx.startTracking();
+  ctx.syncWordCount();                       // first sync: establishes the baseline
+  const afterFirst = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  check("the first sync always runs", afterFirst, 1);
+
+  for (let i = 0; i < 10; i++) { advance(2000); ctx.syncWordCount(); }
+  const idle = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  check("20s of reading costs no further requests", idle, 1);
+
+  typeChars(ctx, 40, 120);                   // the participant writes again
+  advance(2000); ctx.syncWordCount();
+  const typed = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  check("typing makes the next tick sync", typed, 2);
+}
+
+// -- 29. but the document is still re-read periodically --------------------
+// Not every edit produces keystrokes we count: paste, undo, voice typing. The
+// throttle must not let the displayed count freeze for the rest of a session.
+console.log("\n29. A quiet document is still re-read on a floor interval");
+{
+  const ctx = makeContext();
+  ctx.__docWords = 443;
+  ctx.startTracking();
+  ctx.syncWordCount();
+  advance(31000);                            // past WORD_SYNC_MAX_GAP_MS
+  ctx.syncWordCount();
+  const n = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  check("syncs again after the max gap, with nothing typed", n, 2);
+}
+
+// -- 30. a rate limit is not a lost connection -----------------------------
+// A quota clears by itself. Showing "Google Docs not connected" for it puts a
+// broken-looking banner in front of a participant mid-session over nothing.
+console.log("\n30. Rate limiting does not claim the connection is lost");
+{
+  const ctx = makeContext();
+  ctx.__docWords = 443;
+  ctx.startTracking();
+  ctx.syncWordCount();                       // connects normally
+  ctx.__intervals[0].fn();
+  check("connected", session(ctx).docsConnected !== false, true);
+
+  ctx.__docTransient = true;
+  typeChars(ctx, 40, 120);
+  advance(2000); ctx.syncWordCount();
+  ctx.__intervals[0].fn();
+  check("still reported as connected", session(ctx).docsConnected !== false, true);
+
+  const before = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  typeChars(ctx, 40, 120);
+  advance(2000); ctx.syncWordCount();
+  const after = ctx.__messages.filter((m) => m?.type === "FF_SYNC_WORD_COUNT").length;
+  check("and backs off instead of hammering the quota", after, before);
 }
 
 console.log(`

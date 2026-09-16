@@ -7,10 +7,17 @@ const STORAGE_FLUSH_MS = 2000;            // 2s interval to write to storage
 const CHARS_PER_WORD = 5;                 // Standard WPM definition
 const BURST_END_THRESHOLD_MS = 10000;     // 10s of inactivity ends a typing burst
 const BURST_MIN_DURATION_MS = 10000;      // Minimum 10s of activity to consider a burst
-const WORD_SYNC_INTERVAL_MS = 2000;       // 2s cadence so the displayed count tracks the exact
+const WORD_SYNC_INTERVAL_MS = 2000;       // 2s tick so the displayed count tracks the exact
                                           // Google Docs API word count in near-real time. An
                                           // in-flight guard (wordSyncInFlight) prevents requests
-                                          // from stacking if a fetch runs slow.
+                                          // from stacking if a fetch runs slow. A tick only calls
+                                          // the API if the document can actually have changed --
+                                          // see syncWordCount. A flat 2s poll is 30 reads/min for
+                                          // a whole session, against a 60/min per-user Docs quota,
+                                          // and Google answers an exceeded quota with 403.
+const WORD_SYNC_MAX_GAP_MS = 30000;       // ...but sync at least this often even with no keystrokes,
+                                          // so edits we cannot see (paste, undo, voice) still land.
+const WORD_SYNC_BACKOFF_MS = 60000;       // after a rate-limited read, stop asking for a minute.
 const TAB_SWITCH_WINDOW_MS = 60000;       // rolling window for switch-frequency classification
 const RAPID_SWITCH_THRESHOLD = 3;         // >= this many switches in the window = Distracted
                                           // (a switch every ~20s — attention residue never
@@ -147,6 +154,8 @@ let netCharsAtSync = 0;       // netChars at that moment, for the live delta
 let docWordBaseline = null;
 let totalDocWords = 0;        // total words in the doc (baseline + written) — for display only
 let wordSyncInFlight = false; // true while a Docs API word-count request is pending
+let lastWordSyncAt = 0;       // when the last API read was issued, for the max-gap floor
+let wordSyncBackoffUntil = 0; // set when Google rate-limits us; no reads until it passes
 // True once a Docs API word-count sync has actually returned a number this
 // session — i.e. OAuth is working. Stays false (or flips back) when syncs
 // return null (no/failed auth), which the panel surfaces so the researcher
@@ -411,6 +420,20 @@ function syncWordCount() {
   if (!isTracking) return;
   if (!isExtensionContextValid()) { stopAllTracking(); return; }
   if (wordSyncInFlight) return; // a request is still pending — don't stack another
+
+  const now = Date.now();
+  if (now < wordSyncBackoffUntil) return; // rate-limited; wait it out
+
+  // Don't spend a request when the document cannot have changed. The count only
+  // moves when the participant types, so an unchanged netChars means an
+  // unchanged document — during reading, idling, a distraction episode or a
+  // tab-away, that is the whole session. The first sync always runs (it
+  // establishes the baseline), and the max-gap floor still catches edits that
+  // produce no keystrokes.
+  const nothingTyped = docWordBaseline !== null && netChars === netCharsAtSync;
+  if (nothingTyped && now - lastWordSyncAt < WORD_SYNC_MAX_GAP_MS) return;
+
+  lastWordSyncAt = now;
   wordSyncInFlight = true;
   try {
     chrome.runtime.sendMessage({ type: "FF_SYNC_WORD_COUNT" }, (response) => {
@@ -427,6 +450,10 @@ function syncWordCount() {
         netCharsAtSync = netChars;
         totalDocWords = response.wordCount;
         isTyping = true; // make the next flush write the corrected count
+      } else if (response && response.transient) {
+        // Rate-limited or a server blip. The connection is fine and the banner
+        // must not claim otherwise — just stop asking for a while.
+        wordSyncBackoffUntil = Date.now() + WORD_SYNC_BACKOFF_MS;
       } else {
         // Response arrived but no number → Docs API unavailable (no/failed
         // OAuth, tab gone). Surface it so the panel can offer a reconnect.

@@ -12,6 +12,7 @@ Detection thresholds are **calibrated per participant** from a short instructed 
 | [`CALIBRATION_SPEC.md`](CALIBRATION_SPEC.md) | the two-label model, every calibrated threshold and its formula |
 | [`DISTRACTION_SPEC.md`](DISTRACTION_SPEC.md) | the scheduled memory-game distraction task |
 | [`analysis/README.md`](analysis/README.md) | validating detection against screen recordings |
+| [`study-materials/`](study-materials/session-document-template.md) | the session document: the writing prompt and its source excerpts |
 
 ---
 
@@ -60,6 +61,8 @@ The extension reads the actual document text through the official **Google Docs 
 5. A client ID is **already configured** in `public/manifest.json` → `oauth2.client_id`. You only need to replace it if you create a new OAuth client (e.g. a different Google Cloud project); rebuild and reload the extension afterwards.
 6. On the first session start, Chrome shows a one-time Google consent popup (read-only Docs scope). Approve it once; later sessions are silent.
 
+> **If the panel says "Google Docs not connected":** press **Connect** — it clears Chrome's cached token and forces a real sign-in, and the banner then shows the actual reason if it still fails. Common causes: the OAuth consent screen is in *Testing* status, where Google expires a test user's grant after **7 days**, so sessions stop working roughly a week after consent; or the document belongs to a different Google account than the one Chrome is signed in as. The service-worker console (`chrome://extensions` → FrictionFlow → *service worker*) logs the cause of every failure.
+
 > The extension ID is **pinned** via the `key` field in `manifest.json`, so it is `ikgpicdfmeeicjffigdodgbfgppopppc` on every machine and path — one OAuth client serves the whole team. The Google Cloud OAuth client must be registered to that ID. (The private key `extension-key.pem` is gitignored and only needed if the extension is ever packed as a `.crx`.)
 
 ### 5. Researcher settings (Options page)
@@ -78,7 +81,7 @@ Right-click the extension icon → **Options** (or `chrome://extensions` → Fri
 
 **Once per participant — calibration (12 minutes)**
 
-1. Open a Google Doc and click the FrictionFlow icon — the side panel opens beside it
+1. Open the participant's copy of the session document (see `study-materials/session-document-template.md`) and click the FrictionFlow icon — the side panel opens beside it
 2. Enter the **participant ID**, then **Run calibration**
 3. The participant writes in the document through three timed steps — **Plan** (3 min), **Write** (5 min), **Review** (4 min) — on one standard prompt
 4. The panel shows them their own numbers (writing speed, reviewing speed, typical pause). The profile is saved under their ID
@@ -88,7 +91,7 @@ Right-click the extension icon → **Options** (or `chrome://extensions` → Fri
 Each participant takes part in **one condition only** — baseline or intervention (between-subjects). Assign conditions **at random**, or from a balanced list drawn up in advance; never by convenience.
 
 1. Enter the participant ID — the setup card should read **Calibrated ✓**
-2. Enter a task name and objective from their own coursework, choose the **condition** (Baseline / Intervention), then **Start Task**
+2. Press **Use the standard prompt** to fill the task name and objective — the same task for everyone — then choose the **condition** (Baseline / Intervention) and **Start Task**
 3. They write. At minutes **10, 25 and 40** a memory card game opens in a new tab for three minutes; they return to the document when told time is up
 4. **Finish session** → analytics summary (hover or click any tile for its breakdown)
 5. Complete the **questionnaire** (NASA-TLX, FSS, UEQ-S), then **Download session data** — the export embeds the questionnaire responses, so do it in that order
@@ -116,7 +119,7 @@ Which reload you need depends on what changed:
 npm test
 ```
 
-152 checks across four suites. The first three drive the real extension code in a Node vm with a controllable clock:
+172 checks across five suites. Most drive the real extension code in a Node vm with a controllable clock:
 
 | Suite | Covers |
 |---|---|
@@ -124,6 +127,7 @@ npm test
 | `test/replay.test.mjs` | the analysis script reproduces the extension's decisions row for row |
 | `test/distraction.test.mjs` | the distraction scheduler: timing, deferral, the return to the document, test mode |
 | `test/extension-pages.test.mjs` | every extension page obeys Chrome's Content Security Policy: no inline scripts or event handlers, and every referenced script exists |
+| `test/docs-auth.test.mjs` | the Google Docs connection: forced reconnect clears a dead token, and each failure reports its cause |
 
 These prove the logic, not the Chrome integration — several bugs have only ever surfaced by clicking through the real extension.
 
@@ -186,6 +190,7 @@ One asymmetry is inherent rather than a code issue: `resumptionMs` runs return-t
 | `ff_distractions` | background.js | Every scheduled distraction this session: when it opened, deferrals, when the participant returned |
 | `ff_game_logs` | distraction game | The memory game's own log per distraction: flips, matches, boards, and when "time's up" appeared |
 | `ff_distraction_plan` | background.js | The distraction schedule fixed at session start, including whether it is a short-schedule test run |
+| `ff_docs_status` | background.js | Why document reading last succeeded or failed, so the panel can show the cause |
 
 > `ff_events` and `ff_suggestion_choices` are **panel-owned and deliberately kept out of `ff_session`** — content.js read-modify-writes that key continuously, so anything the panel wrote there would be clobbered.
 

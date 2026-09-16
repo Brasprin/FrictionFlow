@@ -149,14 +149,19 @@ generative AI tools for academic work?"*) was replaced because it failed the las
 requirement: CS and IT students know far more about generative AI than students
 in other programmes, which is a head start the calibration exists to exclude.
 
-**Relationship to the main task.** The main writing task is drawn from each
-participant's own coursework, for ecological validity. Calibration therefore
-deliberately sits outside every course domain. The cost: coursework is harder
-than a campus-life question, and harder tasks lengthen pauses, so session
-pausing may run longer than the calibrated baseline. The two-family rule and the
-3× severe tier absorb part of this; the rest is measured in the pilot by
-comparing calibration pauses with pauses during Focused stretches of the session.
-Report it as a limitation.
+**Relationship to the main task.** The main task is a single standardised
+argumentative essay with three source excerpts supplied inside the document
+(`study-materials/session-document-template.md`). The pilot used each
+participant's own coursework; participants left the document to consult sources,
+and any tab-away over 60 s is recorded as distraction, so those episodes were
+not distraction at all.
+
+The session task is still harder than a campus-life question — it requires
+integrating conflicting sources and answering a counterargument — and harder
+tasks lengthen pauses, so session pausing may run longer than the calibrated
+baseline. The two-family rule and the 3× severe tier absorb part of this; the
+rest is measured in the pilot by comparing calibration pauses with pauses during
+Focused stretches of the session. Report it as a limitation.
 
 **Separated versus interleaved phases.** In real writing the three processes
 interleave — Flower & Hayes describe them as recursive: a writer plans a little,
@@ -167,12 +172,16 @@ that each phase is measured **in isolation**, while the main task presents them
 when they interleave; that is tested separately, against human-coded screen
 recordings. State this in the paper as a deliberate trade-off.
 
-**Main-task comparability.** Each participant writes one session from their own
-coursework, so the tasks differ between participants. The baseline and
-intervention groups must receive coursework of comparable difficulty overall —
-balance it when assigning conditions — or a harder mix of assignments in one
-group will read as an effect of the recovery prompt. Record the course and
-assignment for each participant so the balance can be checked.
+**Main-task comparability.** Every participant writes the same prompt from the
+same document, so nothing about the task differs between the two groups. This is
+what a between-subjects design needs: with one session each, any difference
+between the tasks people write lands unevenly across the groups and reads as an
+effect of the recovery prompt.
+
+The cost is ecological validity — participants write a set prompt rather than
+work that counts towards their grade. State it as a limitation, together with
+the reason: course tasks required sources, and the system cannot tell
+reference-checking from disengagement.
 
 **Environment: inside the Google Doc**, using the live content script — not a
 side-panel text box. Reasons:
