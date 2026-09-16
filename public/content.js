@@ -37,6 +37,9 @@ const ACTIVITY_WINDOW_MS = 60000;         // rolling window for the interaction-
 // be normal while Planning and a stall while Translating.
 const DEVIATION_FAMILIES_REQUIRED = 2;    // families that must fire together to enter Distracted
 const SEVERE_STALL_MULTIPLIER = 3;        // inactivity beyond this x IDLE_<phase> stands alone
+const ACTIVE_RECENCY_MS = 10000;          // a tick counts as "still working" if they interacted within
+                                          // this long. Used only to remember which phase a distraction
+                                          // interrupted -- see lastActivePhase.
 const RATE_DEVIATION_FRACTION = 0.25;     // interaction rate below this x the phase baseline = deviation
 
 // ─── Calibration capture (see CALIBRATION_SPEC.md §5-§6) ───────────────────
@@ -97,6 +100,21 @@ let totalPauses = 0;
 let longestPauseMs = 0;
 let lastPauseMs = 0;
 let isTyping = false;               // when state change since last flush
+// The phase as of the last tick where the writer was actually doing something.
+//
+// Detection needs a stall before it will flag a distraction, and a stall is
+// also what makes classifyPhase return Planning -- so by the time an episode
+// opens, the live phase has already decayed to Planning and the freeze below
+// holds that. Across the first three sessions this recorded Planning for all
+// ten episodes, while the trace showed the writer had been Translating or
+// Reviewing 30s earlier. This remembers what they were actually interrupted
+// out of.
+//
+// It is a LABEL ONLY. It is deliberately not fed back into currentTrackedPhase,
+// because the frozen phase selects idleSec[phase] and would therefore change
+// when attention clears -- changing detection itself, mid-study, between the
+// baseline and intervention groups.
+let lastActivePhase = null;
 let isTracking = false;             // whether tracking is currently active
 let listenerAttached = false;       // whether event listeners have been attached
 
@@ -677,12 +695,17 @@ function updateState() {
   currentTrackedPhase = phase;
   attentionFamilies = assessment.families;
 
+  // Remember the phase while they are demonstrably still working, so an episode
+  // can say what it interrupted rather than what the silence looked like.
+  if (now - lastActivityTime <= ACTIVE_RECENCY_MS) lastActivePhase = phase;
+
   recordTraceRow(now, phase, assessment);
 
   if (assessment.distracted && currentAttention === "Focused") {
     currentAttention = "Distracted";
     attentionTrigger = assessment.trigger;
-    startDistractionEpisode(now, assessment.trigger, phase, assessment.families);
+    // The label, not the live phase: see lastActivePhase.
+    startDistractionEpisode(now, assessment.trigger, lastActivePhase ?? phase, assessment.families);
   } else if (!assessment.distracted && currentAttention === "Distracted") {
     // The attention state clears as soon as the signals do, but the distraction
     // EPISODE stays open until the first writing keystroke (see the keydown
@@ -1024,7 +1047,7 @@ function attachTabSwitchListener() {
           currentAttention = "Distracted";
           attentionTrigger = "tab-away";
           attentionFamilies = ["tab-away"];
-          startDistractionEpisode(flipAt, "tab-away", currentTrackedPhase, ["tab-away"]);
+          startDistractionEpisode(flipAt, "tab-away", lastActivePhase ?? currentTrackedPhase, ["tab-away"]);
         }
       }
       if (tabHiddenAt !== null) {
