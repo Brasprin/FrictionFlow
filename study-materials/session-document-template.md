@@ -108,9 +108,15 @@ needing clearer rubrics and staged deadlines before the change works.
 ─────────────────────────────────────────────────────────────
 WRITE YOUR ESSAY BELOW THIS LINE
 ─────────────────────────────────────────────────────────────
-
-[leave empty]
 ```
+
+**Stop the paste at the line above.** Leave the space beneath it genuinely
+empty — no placeholder, no "[leave empty]", no instruction to the participant.
+
+Anything sitting below the divider is read as the participant's own writing.
+A placeholder left in would make the first recovery summary tell them they left
+off at "leave empty" — worse than no summary, because an empty space correctly
+falls back to estimating their position from timing and phase instead.
 
 ---
 
@@ -168,6 +174,8 @@ or design-asset creation.
 - [ ] Master document saved read-only, so no session edits it
 - [ ] Per participant: *File → Make a copy*, named by participant ID, writing
       area empty
+- [ ] **Nothing at all below the divider** — click beneath it and confirm the
+      cursor sits on a blank line with no placeholder text
 - [ ] **The document is ready before you press Start Task.** The extension
       measures the document once at session start and treats whatever is there
       as the starting point. Paste the prompt and sources *after* starting and

@@ -238,7 +238,10 @@ console.log("\n11. A genuine refusal is not mistaken for a rate limit");
 console.log("\n12. Only the participant text reaches the prompt");
 {
   const md = fs.readFileSync(new URL("../study-materials/session-document-template.md", import.meta.url), "utf8");
-  const preloaded = md.split("```")[1].replace("[leave empty]", "").trim();
+  // Taken raw, with nothing removed: the template itself must leave the space
+  // below the divider empty. A placeholder there ("[leave empty]") would be read
+  // as the participant's writing and the first summary would be built on it.
+  const preloaded = md.split("```")[1].trim();
   const { ctx } = makeBackground({ cachedToken: "good-token" });
 
   check("the template still carries the divider the code looks for",
@@ -251,7 +254,7 @@ console.log("\n12. Only the participant text reaches the prompt");
   check("no source text leaks in", /Final examinations|Examinations have|SOURCE [ABC]/.test(essay), false);
 
   // Nothing written yet: better to estimate from timing than to quote a source.
-  check("an untouched document yields nothing", ctx.essayTextOnly(preloaded), null);
+  check("the template leaves nothing below the divider", ctx.essayTextOnly(preloaded), null);
 
   // The old behaviour, for contrast: a tail-slice of the same document.
   check("a plain tail-slice would have been mostly sources",
