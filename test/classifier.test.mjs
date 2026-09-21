@@ -791,6 +791,79 @@ console.log("\n30. Rate limiting does not claim the connection is lost");
   check("and backs off instead of hammering the quota", after, before);
 }
 
+// -- 31. an episode records the phase it interrupted, not the silence -------
+// Detection needs a stall, and a stall is also what makes classifyPhase say
+// Planning - so the live phase has already decayed by the time an episode
+// opens. The first three sessions recorded Planning for all ten episodes while
+// the trace showed Translating or Reviewing 30s earlier. The episode must
+// carry what they were actually interrupted out of, or the recovery prompt
+// tells a writer stopped mid-sentence that they were planning.
+console.log("\n31. The interrupted phase is the one they were working in");
+{
+  const ctx = start();
+  typeChars(ctx, 200, 150);          // sustained typing -> Translating
+  tick(ctx);
+  check("drafting before the interruption", session(ctx).currentPhase, "Translating");
+
+  advance(125_000);                  // they leave; the stall builds
+  tick(ctx);
+  const open = session(ctx).activeDistraction;
+  check("an episode opened", open !== null, true);
+  check("and it says Translating, not Planning", open.phase, "Translating");
+
+  advance(3_000);
+  typeChars(ctx, 1, 100);            // they come back
+  tick(ctx);
+  check("the closed episode keeps it", session(ctx).distractionEpisodes[0].phase, "Translating");
+}
+
+// -- 32. the fix is a label, and must not move detection --------------------
+// The frozen phase selects idleSec[phase], so feeding the corrected phase back
+// into currentTrackedPhase would change when attention clears - altering
+// detection itself, mid-study, between the baseline and intervention groups.
+console.log("\n32. Correcting the label leaves detection alone");
+{
+  const ctx = start();
+  typeChars(ctx, 200, 150);
+  tick(ctx);                         // the 2s tick that runs while they work
+  advance(125_000);
+  tick(ctx);
+  const s = session(ctx);
+  check("the live phase still decayed to Planning", s.currentPhase, "Planning");
+  check("while the episode label is corrected", s.activeDistraction.phase, "Translating");
+  check("detection fired as before", s.currentAttention, "Distracted");
+}
+
+// -- 33. two columns logged for analysis, deciding nothing ------------------
+// Added before P04 so candidate phase rules can be tested afterwards: a 10s
+// typing-speed window (does it catch the start of writing sooner than the 30s
+// one?) and text selections (do they signal Reviewing now scroll does not?).
+// Appended, so every earlier column keeps its index and old traces still parse.
+console.log("\n33. Logged-only trace columns");
+{
+  const ctx = start();
+  typeChars(ctx, 100, 150);          // 15s of typing
+  tick(ctx);
+  ctx.flushTraceToStorage();
+  let t = ctx.__stored.ff_trace;
+  const col = (n) => t.columns.indexOf(n);
+  let row = t.rows[t.rows.length - 1];
+  check("appended at the end", t.columns.slice(-2), ["wpm10", "selectPerMin"]);
+  check("earlier columns keep their place", col("families"), 11);
+  check("every row is as wide as the header", t.rows.every((r) => r.length === t.columns.length), true);
+  check("10s speed registers typing", row[col("wpm10")] > 0, true);
+
+  advance(12_000); tick(ctx); ctx.flushTraceToStorage();
+  t = ctx.__stored.ff_trace; row = t.rows[t.rows.length - 1];
+  check("10s speed drops to 0 after 12s quiet", row[col("wpm10")], 0);
+  check("while the 30s one still holds the burst", row[col("wpm")] > 0, true);
+
+  ctx.pushSelectionSignal(clock); advance(2_000); ctx.pushSelectionSignal(clock);
+  tick(ctx); ctx.flushTraceToStorage();
+  t = ctx.__stored.ff_trace; row = t.rows[t.rows.length - 1];
+  check("selections are counted", row[col("selectPerMin")], 2);
+}
+
 console.log(`
 ${pass} passed, ${fail} failed
 `);

@@ -46,10 +46,6 @@ source.
 
 ## Paste this into the document
 
-> **TO FINALISE:** the topic is provisional until the group confirms it. If it
-> changes, the three passages below must be rewritten to match, and so must
-> `studyTask` in `src/App.jsx`.
-
 ```
 Should universities replace final exams with projects?
 
@@ -161,8 +157,11 @@ or design-asset creation.
 
 ## Before you run anyone
 
-- [ ] Topic confirmed by the group, and **different from the calibration topic**
-      (class attendance), or they arrive having already argued their case
+- [x] Topic confirmed by the group on 16 Sep 2026, and different from the
+      calibration topic (class attendance), so nobody arrives having already
+      argued this case. If it is ever changed, the three passages must be
+      rewritten to match and so must `studyTask` in `src/App.jsx` —
+      `test/extension-pages.test.mjs` fails if the two drift apart.
 - [ ] The three passages read well to your group, and match the topic
 - [ ] The researcher-prepared note is present, and no passage carries a fake
       citation or an invented statistic

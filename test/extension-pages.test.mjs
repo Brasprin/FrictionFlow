@@ -56,5 +56,29 @@ for (const file of pages) {
   }
 }
 
+// The essay question lives in two places that must agree: the Google Doc the
+// participant writes in, and studyTask in src/App.jsx, which fills the panel's
+// task fields and feeds every recovery summary's sense of the objective. If they
+// drift, the summaries steer people toward a question their document never
+// asked. Both are edited by hand, months apart, by different people.
+console.log("\nThe session question matches between the document and the panel");
+{
+  const md = fs.readFileSync(new URL("../study-materials/session-document-template.md", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+
+  const docQuestion = md.split("```")[1].trim().split("\n")[0].trim();
+  const objMatch = app.match(/obj:\s*"([^"]+)"/);
+  check("studyTask.obj found in App.jsx", !!objMatch);
+  const panelQuestion = (objMatch?.[1] ?? "").split("?")[0].trim() + "?";
+
+  check(`the document asks: ${docQuestion}`, docQuestion.endsWith("?"));
+  check("and the panel asks the same question", panelQuestion === docQuestion);
+
+  // The calibration topic must stay different, or participants arrive having
+  // already argued the session's case and it is no longer fresh writing.
+  check("the session question is not the calibration topic",
+    !/class attendance/i.test(docQuestion));
+}
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

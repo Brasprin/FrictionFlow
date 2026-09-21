@@ -259,6 +259,11 @@ const TRACE_COLUMNS = [
   "tabSwitchesPerMin",
   "hidden",             // 1 while the tab is not visible
   "families",           // deviation families firing, "+"-joined
+  // Logged only, added 21 Sep 2026 before P04. Nothing below decides anything;
+  // they exist so candidate phase rules can be tested in analysis on sessions
+  // recorded from here on. Appended, so every earlier column keeps its index.
+  "wpm10",              // WPM over the last 10s - does a faster window catch writing sooner?
+  "selectPerMin",       // text selections in the last minute - do they signal Reviewing?
 ];
 const TRACE_FLUSH_EVERY_TICKS = 5;   // persist every ~10s rather than every tick
 const TRACE_MAX_ROWS = 6000;         // ~3.3h; guards memory if a session is left running
@@ -338,6 +343,18 @@ function rollingDeleteFrequency() {
     deleteTimeStamps.shift();
   }
   return deleteTimeStamps.length;
+}
+
+// WPM over the last 10s. Logged in the trace only - no decision reads it. The
+// 30s window that classification uses is slow to register the start of a
+// writing burst; this records what a faster window would have seen, so that
+// can be tested afterwards. Counts without trimming: rollingWPM() owns the
+// buffer, and 10s sits inside its 30s window.
+function rollingWPM10() {
+  const cutOff = Date.now() - 10000;
+  let n = 0;
+  for (let i = keyStrokeTimeStamps.length - 1; i >= 0 && keyStrokeTimeStamps[i] >= cutOff; i--) n++;
+  return Math.round((n / CHARS_PER_WORD) * (60000 / 10000));
 }
 
 function rollingSelectionFrequency() {
@@ -735,6 +752,8 @@ function recordTraceRow(now, phase, assessment) {
     rollingTabSwitchFrequency(),
     document.hidden ? 1 : 0,
     assessment.families.join("+"),
+    rollingWPM10(),
+    rollingSelectionFrequency(),
   ]);
 
   // Persisted on its own key and on a slower cadence: ff_session is

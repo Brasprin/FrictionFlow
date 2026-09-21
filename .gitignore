@@ -26,3 +26,36 @@ dist-ssr
 # Extension ID pinning — private key stays out of the repo (public key lives in manifest.json)
 extension-key.pem
 pubkey.b64
+
+# Participant data — never commit. Session exports, decision traces, corrected
+# exports and the coder's labels are research records: they belong in your
+# study's own storage under whatever your ethics approval specifies, not in the
+# code repository and certainly not pushed to GitHub. The exports hold no
+# document text by design, but they are still per-participant records.
+#
+# Covers everything the panel downloads (P01_baseline_2026-09-16.json / .csv /
+# _trace.csv), what the analysis writes (_corrected.json), and coding files,
+# including coders' working copies.
+P[0-9]*_*.json
+P[0-9]*_*.csv
+P[0-9]*.csv
+P_*.csv
+*_coding.csv
+*_trace.csv
+*_corrected.json
+
+# Excel's lock file, created beside any spreadsheet while it is open
+~$*
+
+# Throwaway analysis scripts
+analysis/_tmp_*
+
+# Local Claude Code settings
+.claude/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Keys of any kind
+*.pem

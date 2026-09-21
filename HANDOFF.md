@@ -175,16 +175,21 @@ Assume more of that class remains.
    those episodes were not distraction. The study now uses one standardised
    prompt with three conflicting source excerpts supplied **inside** the
    document, which keeps the memory load high without sending anyone out of the
-   tab. **Still to do:** confirm the topic and write the three sources with
-   checked citations — `study-materials/session-document-template.md`. The
-   prompt in the extension is provisional and must match that document.
+   tab. **Settled 16 Sep 2026:** the topic is *Should universities replace final
+   exams with projects?*, and the three researcher-prepared passages are written
+   — `study-materials/session-document-template.md`. They carry no invented
+   citations or statistics, and the document says plainly that the researchers
+   wrote them; the AI assistance used in drafting belongs in the usage
+   declaration. Changing the topic now means rewriting all three passages and
+   `studyTask` in `src/App.jsx`.
 8. **The design changed to between-subjects (one session per participant).**
    Everything written still describes two sessions per participant: thesis §4.1
    (*"within-subject … each participant completes two writing sessions"*), the
    analysis plan in §4.4–4.5 (paired t-tests), conference paper §4.3 and §4.5,
    and the ethics documents (*"The study will involve two writing sessions"*).
-   All need revising, and **the ethics committee may need to approve the change**
-   before data collection.
+   All need revising. **Ethics is settled** — confirmed 16 Sep 2026 that one
+   session per participant is covered, so data collection is not blocked. The
+   written documents still describe two sessions and still need correcting.
 9. **Statistics for H1–H4 change.** Paired t-test / Wilcoxon signed-rank become
    **independent-samples t-test / Mann–Whitney U**, baseline group against
    intervention group. (The calibrated-versus-fixed threshold comparison in
