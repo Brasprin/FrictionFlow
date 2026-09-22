@@ -864,6 +864,47 @@ console.log("\n33. Logged-only trace columns");
   check("selections are counted", row[col("selectPerMin")], 2);
 }
 
+// -- 34. resumption runs from the return, whatever caught the distraction ---
+// H1's measure. With calibrated idle thresholds a scheduled game is usually
+// caught as a severe stall ~45s in, before the 60s tab-away rule. Timing
+// those from detection counted the rest of the game as 'resumption': 144-154s
+// recorded against 4-15s return-to-keystroke across P01-P03.
+console.log("\n34. Resumption is measured from the return to the document");
+{
+  const ctx = makeContext();
+  ctx.__stored.ff_task = { participantId: "P01" };
+  ctx.__stored.ff_calibrations = { P01: { valid: true, participantId: "P01", thresholds: {
+    wpmGate: 10, burstMinSec: 10, deleteGate: 5, scrollGate: 5,
+    idleSec: { Planning: 15, Translating: 15, Reviewing: 15 },
+    activityRate: { Planning: null, Translating: null, Reviewing: null } } } };
+  ctx.startTracking();
+  typeChars(ctx, 200, 150); tick(ctx);
+
+  ctx.document.hidden = true; ctx.__handlers.visibility();   // the game opens
+  for (let s = 0; s < 50; s += 2) { advance(2000); tick(ctx); }
+  const open = session(ctx).activeDistraction;
+  check("caught as a stall, before the 60s tab-away rule", open && open.trigger, "severe-stall");
+
+  advance(130_000);                                          // the rest of the game
+  ctx.document.hidden = false; ctx.__handlers.visibility();  // back at the doc
+  advance(8_000);
+  typeChars(ctx, 1, 100); tick(ctx);                         // first keystroke
+  const ep = session(ctx).distractionEpisodes[0];
+  check("resumption is return-to-keystroke (~8s)", Math.round(ep.resumptionMs / 1000), 8);
+  check("not detection-to-keystroke (~2.5 min)", ep.resumptionMs < 20_000, true);
+}
+
+// -- 35. a stall without leaving is timed in full --------------------------
+console.log("\n35. A stall with the document visible has no return");
+{
+  const ctx = start();
+  typeChars(ctx, 100, 150);
+  advance(125_000); tick(ctx);                               // sat still, never left
+  advance(3_000); typeChars(ctx, 1, 100); tick(ctx);
+  const ep = session(ctx).distractionEpisodes[0];
+  check("whole episode counts", ep.resumptionMs, ep.durationMs);
+}
+
 console.log(`
 ${pass} passed, ${fail} failed
 `);

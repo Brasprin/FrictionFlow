@@ -819,10 +819,10 @@ function finalizeDistractionEpisode(now) {
     families: ep.families ?? [],    // which signals fired, for auditing the rule
     induced: !!ep.induced,          // scheduled game vs natural drift
     inducedEpisode: ep.inducedEpisode ?? null,
-    // For tab-away episodes measure from the moment they came back to the
-    // doc; for stall and deviation episodes the user never left (or is
-    // currently on the doc), so use the full episode.
-    resumptionMs: ep.trigger === "tab-away" && ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
+    // Resumption runs from the moment they came back to the doc, whatever
+    // the trigger. Only when they never left (a stall with the doc visible
+    // throughout) is there no return, and the whole episode is the delay.
+    resumptionMs: ep.returnedAt ? now - ep.returnedAt : now - ep.startedAt,
   });
   activeDistraction = null;
 }
@@ -1077,7 +1077,16 @@ function attachTabSwitchListener() {
       // user bounces away and back several times without typing, it's all one
       // open episode, and resumptionMs should measure from the final return
       // before writing resumed.
-      if (activeDistraction && activeDistraction.trigger === "tab-away") {
+      //
+      // For EVERY open episode, not only tab-away ones. With calibrated idle
+      // thresholds a scheduled game is usually caught as a severe stall about
+      // 45s in, before the 60s tab-away rule fires. Stamping only tab-away
+      // episodes meant those were timed from detection, so their "resumption"
+      // included the remaining two-plus minutes of the game: 144-154s recorded
+      // against 4-15s from return to first keystroke across P01-P03. That was
+      // H1's measure, and which way a game was detected - a matter of
+      // thresholds and timer throttling - decided whether it was right.
+      if (activeDistraction) {
         activeDistraction.returnedAt = Date.now();
       }
       // Force the next flush to write, but deliberately do NOT call

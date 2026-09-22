@@ -22,6 +22,37 @@ import { breakWindows } from "./compare-thresholds.mjs";
 // ACTIVE_RECENCY_MS in public/content.js so live and retroactive agree.
 const ACTIVE_RECENCY_SEC = 10;
 
+// When did the participant actually come back to the document?
+//
+// Sessions before the 22 Sep 2026 fix stamped a return only on tab-away
+// episodes, so a game caught as a severe stall (the usual case with calibrated
+// idle thresholds) was timed from DETECTION - its resumption included the rest
+// of the game. The true return is still in the data:
+//   - scheduled games: background.js recorded returnedAt for each one
+//   - anything else the participant left for: the first trace row back on the
+//     document (hidden 1 -> 0) before the episode closed
+// An episode with the document visible throughout has no return, and its
+// whole duration is the delay - as the extension has always measured it.
+function trueReturns(x) {
+  const t0 = Date.parse(x.session?.startedAt ?? "");
+  const cols = x.decisionTrace?.columns ?? [], rows = x.decisionTrace?.rows ?? [];
+  const T = cols.indexOf("tMs"), H = cols.indexOf("hidden");
+  const games = {};
+  for (const d of x.distractionTask?.distractions ?? []) if (d.returnedAt) games[d.episode] = Date.parse(d.returnedAt);
+  return (x.distractions?.episodes ?? []).map((e) => {
+    if (e.induced && games[e.inducedEpisode]) return games[e.inducedEpisode];
+    let back = null, wasHidden = false;
+    for (const r of rows) {
+      const at = t0 + Number(r[T]);
+      if (at < e.startedAt - 60000) continue;
+      if (at > e.endedAt) break;
+      if (Number(r[H]) === 1) wasHidden = true;
+      else if (wasHidden) { back = at; wasHidden = false; }
+    }
+    return back;
+  });
+}
+
 function corrected(x, recencySec) {
   const cols = x.decisionTrace?.columns ?? [];
   const rows = x.decisionTrace?.rows ?? [];
@@ -95,6 +126,14 @@ for (const file of files) {
                 `${String(e.recorded).padEnd(12)}  ${e.corrected}`);
   }
   console.log(`  ${changed} of ${c.episodes.length} episodes corrected`);
+  {
+    const rs = trueReturns(x);
+    const lines = (x.distractions?.episodes ?? []).map((e, i) => {
+      const back = rs[i]; const fromReturn = back && back <= e.endedAt ? e.endedAt - back : null;
+      return `@${Math.round((e.startedAt - Date.parse(x.session.startedAt)) / 60000)}min ${Math.round(e.resumptionMs / 1000)}s -> ${fromReturn !== null && fromReturn < e.resumptionMs ? Math.round(fromReturn / 1000) + "s" : "unchanged"}`;
+    });
+    console.log(`  resumption (recorded -> from return): ${lines.join(", ")}`);
+  }
 
   const asRecorded = x.distractedMs ?? {};
   const recPhases = x.phasesMs ?? {};
@@ -174,14 +213,56 @@ for (const file of files) {
     fixed.phasesMsRecorded = x.phasesMs ?? null;
     fixed.phasesMs = c.phasesMs;
 
-    fixed.distractions = {
-      ...x.distractions,
-      episodes: (x.distractions?.episodes ?? []).map((e, i) => ({
+    // Resumption, timed from the true return. Baseline participants saw no
+    // prompt, so their adjusted resumption equals it. Intervention sessions are
+    // left as recorded here: from 22 Sep 2026 the extension times them from the
+    // return itself, and none were recorded before that.
+    const returns = trueReturns(x);
+    const isBaseline = x.condition === "baseline";
+    const episodes = (x.distractions?.episodes ?? []).map((e, i) => {
+      const back = returns[i];
+      const fromReturn = back && back <= e.endedAt ? e.endedAt - back : null;
+      const fix = fromReturn !== null && isBaseline && fromReturn < e.resumptionMs;
+      return {
         ...e,
         phase: c.episodes[i]?.corrected ?? e.phase,
         phaseRecorded: e.phase,
-      })),
+        resumptionMs: fix ? fromReturn : e.resumptionMs,
+        resumptionMsRecorded: e.resumptionMs,
+        adjustedResumptionMs: fix ? fromReturn : e.adjustedResumptionMs,
+        adjustedResumptionMsRecorded: e.adjustedResumptionMs,
+        returnedAt: fix ? back : e.returnedAt,
+      };
+    });
+    const avgSec = (k) => {
+      const v = episodes.map((e) => e[k]).filter((n) => typeof n === "number");
+      return v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length / 1000) : 0;
     };
+    fixed.distractions = {
+      ...x.distractions,
+      avgResumptionSec: avgSec("resumptionMs"),
+      avgResumptionSecRecorded: x.distractions?.avgResumptionSec ?? null,
+      avgAdjustedResumptionSec: avgSec("adjustedResumptionMs"),
+      avgAdjustedResumptionSecRecorded: x.distractions?.avgAdjustedResumptionSec ?? null,
+      episodes,
+    };
+    if (fixed.distractionTask?.distractions) {
+      fixed.distractionTask = {
+        ...fixed.distractionTask,
+        distractions: fixed.distractionTask.distractions.map((d) => {
+          const ep = episodes.find((e) => e.induced && e.inducedEpisode === d.episode);
+          if (!ep) return d;
+          return {
+            ...d,
+            resumptionSec: Math.round(ep.resumptionMs / 1000),
+            resumptionSecRecorded: d.resumptionSec,
+            adjustedResumptionSec: typeof ep.adjustedResumptionMs === "number" ? Math.round(ep.adjustedResumptionMs / 1000) : d.adjustedResumptionSec,
+            adjustedResumptionSecRecorded: d.adjustedResumptionSec,
+          };
+        }),
+      };
+    }
+    fixed.correction.resumption = "Timed from the participant's return to the document (background.js returnedAt for scheduled games, the trace's hidden->visible transition otherwise) to the first writing keystroke. Before 22 Sep 2026 the extension timed stall-detected episodes from detection, which included the rest of the game. Originals kept under *Recorded.";
 
     fs.writeFileSync(out, JSON.stringify(fixed, null, 2));
     console.log(`  wrote ${path.basename(out)} — full export, corrected`);

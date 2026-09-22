@@ -304,3 +304,30 @@ rule using them must be declared before the sessions it is tested on.
 boundaries - since any alternative scoring would be designed after seeing these
 three sessions.
 
+---
+
+## Resumption time (H1) - fixed 22 Sep 2026
+
+**What it should measure:** from the participant's return to the document until
+their first writing keystroke.
+
+**What it measured before:** that, for tab-away episodes only. An episode caught
+as a severe stall was timed from *detection*, so its resumption included the rest
+of the game. With calibrated idle thresholds a scheduled game is usually caught
+as a stall about 45s in - five of the seven games in P01-P03 - so their recorded
+resumption was 144-154s against 4-15s from return to first keystroke.
+
+**Fixed in the extension:** every open episode is stamped with the latest return
+to the document, and resumption runs from it whenever there is one. An episode
+with the document visible throughout still counts in full.
+
+**Fixed for P01-P03:** `fix-onset-phase.mjs --write` recomputes resumption from
+the true return - background.js's `returnedAt` for scheduled games, the trace's
+hidden-to-visible transition otherwise - and keeps the recorded values under
+`*Recorded`.
+
+**For H1, use the scheduled games only.** The per-session average also includes
+natural episodes, some of which the coder judged to be focused thinking rather
+than distraction (e.g. P01 at 16:27 and 29:13). Their "resumption" is the length
+of a pause, not a recovery.
+
